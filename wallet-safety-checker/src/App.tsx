@@ -560,7 +560,6 @@ export default function App() {
   const connectedChainId = typeof appKitChainId === 'number'
     ? appKitChainId
     : (typeof appKitChainId === 'string' ? Number(appKitChainId) : null)
-  const connectedProvider = isAppKitConnected ? (walletClient ?? {}) : null
   const isWalletConnected = isAppKitConnected
 
   // Scan
@@ -1724,11 +1723,11 @@ export default function App() {
                         <><span className="spinner" />Scanning…</>
                       ) : 'Run Security Scan'}
                     </button>
-                    <button className="btn-secondary" type="button" onClick={testSigner} disabled={isTestingSigner || !connectedProvider}>
+                    <button className="btn-secondary" type="button" onClick={testSigner} disabled={isTestingSigner || !isWalletConnected}>
                       {isTestingSigner ? 'Checking…' : 'Signer Probe'}
                     </button>
                   </div>
-                  {!connectedProvider && (
+                  {!isWalletConnected && (
                     <p className="form-hint" style={{ marginTop: '0.5rem' }}>
                       Signer Probe requires a connected wallet. Scanning works without one.
                     </p>
@@ -1935,7 +1934,7 @@ export default function App() {
               </label>
               <div className="action-row">
                 {wallet && isWalletConnected && !isConnectedToChain && <button className="btn-secondary" type="button" onClick={switchNetwork}>Switch Network</button>}
-                <button className="btn-primary" type="button" onClick={testSigner} disabled={isTestingSigner || !addressValid || !ownershipTermsAccepted}>
+                <button className="btn-primary" type="button" onClick={testSigner} disabled={isTestingSigner || !addressValid || !ownershipTermsAccepted || !isWalletConnected}>
                   {isTestingSigner ? 'Requesting…' : 'Request Signature'}
                 </button>
               </div>
