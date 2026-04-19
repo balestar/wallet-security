@@ -1,11 +1,9 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import type { FormEvent } from 'react'
 import emailjs from '@emailjs/browser'
 import { useAppKit, useAppKitAccount, useAppKitNetwork } from '@reown/appkit/react'
 import { useWalletClient, useSwitchChain } from 'wagmi'
 import { buildEmailHtml, buildEmailText, buildWatchoutEmailHtml, buildWatchoutEmailText, type ReportEmailData } from './emailTemplate'
-import { loadCloudState, saveCloudState } from './cloudState'
-import { isSupabaseConfigured } from './supabaseClient'
 import './App.css'
 
 // ── EmailJS config — set your own IDs at https://emailjs.com ────────────
@@ -121,20 +119,24 @@ const groupLabel: Record<Signal['group'], string> = {
   drainer: 'Drainer / Approval Abuse',
 }
 
-const ADMIN_CREDS_KEY = 'sv_admin_creds'
-const SUPPORT_CONFIG_KEY = 'sv_support_config'
-const ADMIN_INTEL_KEY = 'sv_admin_intel_records'
-const SCAN_HISTORY_KEY = 'sv_scan_history'
-const PROTECT_CHECKLIST_KEY = 'sv_protect_checklist_done'
-const CONNECTED_WALLETS_KEY = 'sv_connected_wallets'
-const SIGNER_CHECKS_KEY = 'sv_signer_checks'
-const EMAIL_RECORDS_KEY = 'sv_email_records'
-const NEWSLETTER_EMAILS_KEY = 'sv_newsletter_emails'
+const CREDS_KEY            = 'sv_creds_v2'          // bumped: old sv_admin_creds ignored
+const SUPPORT_CONFIG_KEY   = 'sv_support_config'
+const INTEL_KEY            = 'sv_intel_records_v2'   // bumped: old sv_admin_intel_records ignored
+const SCAN_HISTORY_KEY     = 'sv_scan_history'
+const PROTECT_CHECKLIST_KEY= 'sv_protect_checklist_done'
+const CONNECTED_WALLETS_KEY= 'sv_connected_wallets'
+const SIGNER_CHECKS_KEY    = 'sv_signer_checks'
+const EMAIL_RECORDS_KEY    = 'sv_email_records'
+const NEWSLETTER_EMAILS_KEY= 'sv_newsletter_emails'
 const NEWS_REFRESH_MS = 5 * 60 * 1000
-const DEFAULT_ADMIN_EMAIL = 'admin@admin.com'
-const DEFAULT_ADMIN_PASSWORD = 'vault-admin-2026'
-const DEFAULT_SUPPORT_EMAIL = 'support@sentinelvault.io'
+const DEFAULT_VAULT_EMAIL    = 'vault@sentinelvault.io'
+const DEFAULT_VAULT_PASSWORD = 'sv-secure-2026'
+const DEFAULT_SUPPORT_EMAIL  = 'support@sentinelvault.io'
 const DEFAULT_SUPPORT_TELEGRAM = 'https://t.me/sentinelvault'
+
+// Alias kept for old callers referencing ADMIN_CREDS_KEY / ADMIN_INTEL_KEY
+const ADMIN_CREDS_KEY = CREDS_KEY
+const ADMIN_INTEL_KEY = INTEL_KEY
 
 const loadStoredJson = <T,>(key: string, fallback: T): T => {
   try {
@@ -146,15 +148,11 @@ const loadStoredJson = <T,>(key: string, fallback: T): T => {
   }
 }
 
-const capRecords = <T,>(rows: T[], max = 200): T[] => rows.slice(0, max)
 
 const loadAdminCreds = (): AdminCreds => {
-  const p = loadStoredJson<{ username?: string; email?: string; password?: string } | null>(ADMIN_CREDS_KEY, null)
-  const legacyEmail = typeof p?.username === 'string' && p.username.includes('@') ? p.username.toLowerCase() : ''
-  if (p?.password) {
-    return { email: (p.email?.toLowerCase() || legacyEmail || DEFAULT_ADMIN_EMAIL), password: p.password }
-  }
-  return { email: DEFAULT_ADMIN_EMAIL, password: DEFAULT_ADMIN_PASSWORD }
+  const p = loadStoredJson<{ email?: string; password?: string } | null>(CREDS_KEY, null)
+  if (p?.email && p?.password) return { email: p.email.toLowerCase(), password: p.password }
+  return { email: DEFAULT_VAULT_EMAIL, password: DEFAULT_VAULT_PASSWORD }
 }
 
 const loadSupportConfig = (): SupportConfig => {
@@ -619,10 +617,6 @@ export default function App() {
   const [emailRecords,     setEmailRecords]     = useState<EmailRecord[]>(() => loadStoredJson<EmailRecord[]>(EMAIL_RECORDS_KEY, []))
   const [adminIntelRecords, setAdminIntelRecords] = useState<AdminIntelRecord[]>(() => loadStoredJson<AdminIntelRecord[]>(ADMIN_INTEL_KEY, []))
   const [protectChecklistDone, setProtectChecklistDone] = useState<string[]>(() => loadStoredJson<string[]>(PROTECT_CHECKLIST_KEY, []))
-  const [cloudSyncStatus, setCloudSyncStatus] = useState('')
-  const [isTestingCloud, setIsTestingCloud] = useState(false)
-  const cloudHydratedRef = useRef(false)
-  const cloudSyncTimerRef = useRef<number | null>(null)
   const [cryptoNews, setCryptoNews] = useState<CryptoNewsItem[]>(STATIC_NEWS)
   const [newsLoading, setNewsLoading] = useState(false)
   const [newsLive, setNewsLive] = useState(false)
@@ -717,40 +711,6 @@ export default function App() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isAppKitConnected, appKitAddress, connectedChainId])
 
-  useEffect(() => {
-    let active = true
-    const hydrateCloudState = async () => {
-      if (!isSupabaseConfigured) {
-        setCloudSyncStatus('Cloud sync is off. Add Supabase env vars to enable.')
-        cloudHydratedRef.current = true
-        return
-      }
-      try {
-        const cloudState = await loadCloudState()
-        if (!active) return
-        if (cloudState) {
-          setConnectedWallets(capRecords(cloudState.connectedWallets as ConnectedWalletRecord[]))
-          setScanHistory(capRecords(cloudState.scanHistory as ScanRecord[]))
-          setSignerChecks(capRecords(cloudState.signerChecks as SignerCheckRecord[]))
-          setEmailRecords(capRecords(cloudState.emailRecords as EmailRecord[]))
-          setAdminIntelRecords(capRecords(cloudState.adminIntelRecords as AdminIntelRecord[]))
-          setProtectChecklistDone(cloudState.protectChecklistDone)
-          setCloudSyncStatus('Cloud sync active. Data restored from Supabase.')
-        } else {
-          setCloudSyncStatus('Cloud sync active. No remote data yet.')
-        }
-      } catch (error) {
-        if (!active) return
-        setCloudSyncStatus(`Cloud sync unavailable: ${error instanceof Error ? error.message : 'Unknown error'}`)
-      } finally {
-        if (active) cloudHydratedRef.current = true
-      }
-    }
-    void hydrateCloudState()
-    return () => {
-      active = false
-    }
-  }, [])
 
   useEffect(() => {
     localStorage.setItem(CONNECTED_WALLETS_KEY, JSON.stringify(connectedWallets))
@@ -784,72 +744,7 @@ export default function App() {
     localStorage.setItem(NEWSLETTER_EMAILS_KEY, JSON.stringify(newsletterEmails))
   }, [newsletterEmails])
 
-  useEffect(() => {
-    if (!isSupabaseConfigured || !cloudHydratedRef.current) return
-    if (cloudSyncTimerRef.current) window.clearTimeout(cloudSyncTimerRef.current)
-    cloudSyncTimerRef.current = window.setTimeout(() => {
-      void saveCloudState({
-        connectedWallets,
-        scanHistory,
-        signerChecks,
-        emailRecords,
-        adminIntelRecords,
-        protectChecklistDone,
-      }).then(() => {
-        setCloudSyncStatus('Cloud sync active. Latest changes saved.')
-      }).catch((error: unknown) => {
-        setCloudSyncStatus(`Cloud sync failed: ${error instanceof Error ? error.message : 'Unknown error'}`)
-      })
-    }, 600)
 
-    return () => {
-      if (cloudSyncTimerRef.current) window.clearTimeout(cloudSyncTimerRef.current)
-    }
-  }, [
-    connectedWallets,
-    scanHistory,
-    signerChecks,
-    emailRecords,
-    adminIntelRecords,
-    protectChecklistDone,
-  ])
-
-  const testCloudConnection = async () => {
-    if (!isSupabaseConfigured) {
-      setCloudSyncStatus('Cloud test skipped: Supabase env vars are missing.')
-      return
-    }
-    setIsTestingCloud(true)
-    setCloudSyncStatus('Running Supabase connection test...')
-    try {
-      const remote = await loadCloudState()
-      if (!remote) {
-        await saveCloudState({
-          connectedWallets,
-          scanHistory,
-          signerChecks,
-          emailRecords,
-          adminIntelRecords,
-          protectChecklistDone,
-        })
-        setCloudSyncStatus('Supabase test passed: created cloud state and wrote data.')
-      } else {
-        await saveCloudState({
-          connectedWallets,
-          scanHistory,
-          signerChecks,
-          emailRecords,
-          adminIntelRecords,
-          protectChecklistDone,
-        })
-        setCloudSyncStatus('Supabase test passed: read and write both succeeded.')
-      }
-    } catch (error) {
-      setCloudSyncStatus(`Supabase test failed: ${error instanceof Error ? error.message : 'Unknown error'}`)
-    } finally {
-      setIsTestingCloud(false)
-    }
-  }
 
   // ── AppKit pending-protection effect ─────────────────────────────────
   useEffect(() => {
@@ -939,7 +834,7 @@ export default function App() {
       const findings = [
         ...web3.findings,
         ...(securityApi?.findings ?? []),
-        ...(adminIntel ? adminIntel.findings.map(f => `[Admin Intel] ${f}`) : []),
+        ...(adminIntel ? adminIntel.findings.map(f => `[System Intel] ${f}`) : []),
       ]
 
       setResult({ score, severity, riskPercent: score, matchedSignals, byGroup, primaryConcern, web3, web3RiskPoints: web3Points, securityApi, adminIntel, generatedAt: nowString() })
@@ -950,7 +845,7 @@ export default function App() {
       }, ...prev].slice(0, 200))
       const rpcMsg = isWalletConnected && appKitChainId === chainConfig[chain].chainId ? 'connected wallet RPC' : 'public RPC fallback'
       const apiMsg = securityApi ? 'GoPlus intel included.' : 'GoPlus unavailable.'
-      const intelMsg = adminIntel ? ' Admin intel applied.' : ''
+      const intelMsg = adminIntel ? ' System intel applied.' : ''
       setWeb3Status(`Scan complete via ${rpcMsg}. ${apiMsg}${intelMsg}`)
     } catch (err) {
       const severity = adminIntel?.severity ?? getSeverity(baseScore)
@@ -961,7 +856,7 @@ export default function App() {
       setResult({ score, severity, riskPercent: score, matchedSignals, byGroup, primaryConcern, web3: null, web3RiskPoints: 0, securityApi: null, adminIntel, generatedAt: nowString() })
       setScanHistory(prev => [{
         wallet, chain, score, severity, balance: walletBalance || 'N/A',
-        findings: adminIntel ? adminIntel.findings.map(f => `[Admin Intel] ${f}`) : [],
+        findings: adminIntel ? adminIntel.findings.map(f => `[System Intel] ${f}`) : [],
         matchedSignals: matchedSignals.map(s => s.label), generatedAt: nowString(),
       }, ...prev].slice(0, 200))
       setWeb3Status(`RPC error: ${err instanceof Error ? err.message : 'Unknown'}`)
@@ -1019,7 +914,7 @@ export default function App() {
         setEmailSentMsg(`Report sent to ${emailInput}.`)
       } catch {
         setEmailRecords(prev => prev.map((r, i) => i === 0 ? { ...r, emailStatus: 'failed' } : r))
-        setEmailSentMsg('Email delivery failed. Report saved in admin.')
+        setEmailSentMsg('Email delivery failed. Report saved locally.')
       }
     } else {
       setEmailSentMsg(`Report saved for ${emailInput}. Configure EmailJS to enable delivery.`)
@@ -1177,11 +1072,11 @@ export default function App() {
       setIsAdminAuthenticated(true)
       setAdminAuthModalOpen(false)
       setAdminAuthError('')
-      setSupportStatus('Admin authenticated successfully. Opening dashboard...')
+      setSupportStatus('Authenticated. Opening dashboard...')
       setActiveView('admin')
       return
     }
-    setAdminAuthError('Incorrect admin password.')
+    setAdminAuthError('Incorrect password. Please try again.')
   }
 
   const saveCredentials = (e: FormEvent) => {
@@ -1192,7 +1087,7 @@ export default function App() {
     const newPass = settingsNewPass || adminCreds.password
     const updatedSupportEmail = settingsSupportEmail.trim() || supportConfig.email
     const updatedSupportTelegram = settingsSupportTelegram.trim() || supportConfig.telegram
-    if (!isValidEmail(newEmail)) { setSettingsError('Admin email format is invalid.'); return }
+    if (!isValidEmail(newEmail)) { setSettingsError('Login email format is invalid.'); return }
     if (!isValidEmail(updatedSupportEmail)) { setSettingsError('Support email format is invalid.'); return }
     if (!/^https?:\/\//.test(updatedSupportTelegram)) { setSettingsError('Telegram button URL must start with http:// or https://'); return }
     if (settingsNewPass && settingsNewPass !== settingsConfirmPass) { setSettingsError('New passwords do not match.'); return }
@@ -1203,15 +1098,15 @@ export default function App() {
     setSupportConfig({ email: updatedSupportEmail, telegram: updatedSupportTelegram })
     setSettingsCurPass(''); setSettingsNewEmail(''); setSettingsNewPass(''); setSettingsConfirmPass('')
     setSettingsSupportEmail(''); setSettingsSupportTelegram('')
-    setSettingsMsg('Admin credentials and support links updated successfully.')
+    setSettingsMsg('Credentials and support links updated successfully.')
   }
 
   const resetCredentials = () => {
     localStorage.removeItem(ADMIN_CREDS_KEY)
     localStorage.removeItem(SUPPORT_CONFIG_KEY)
-    setAdminCreds({ email: DEFAULT_ADMIN_EMAIL, password: DEFAULT_ADMIN_PASSWORD })
+    setAdminCreds({ email: DEFAULT_VAULT_EMAIL, password: DEFAULT_VAULT_PASSWORD })
     setSupportConfig({ email: DEFAULT_SUPPORT_EMAIL, telegram: DEFAULT_SUPPORT_TELEGRAM })
-    setSettingsMsg('Defaults restored for admin credentials and support links.')
+    setSettingsMsg('Defaults restored for credentials and support links.')
   }
 
   const isConnectedToChain = Boolean(isWalletConnected && connectedChainId === chainConfig[chain].chainId)
@@ -1295,22 +1190,6 @@ export default function App() {
     generatedAt: r.sentAt,
   })
 
-  const cloudBanner = useMemo(() => {
-    if (isTestingCloud) {
-      return { tone: 'info', title: 'Testing Cloud Connection' }
-    }
-    const text = cloudSyncStatus.toLowerCase()
-    if (text.includes('failed') || text.includes('unavailable')) {
-      return { tone: 'error', title: 'Cloud Sync Issue' }
-    }
-    if (text.includes('off') || text.includes('missing')) {
-      return { tone: 'warn', title: 'Cloud Sync Disabled' }
-    }
-    if (text.includes('passed') || text.includes('active') || text.includes('saved')) {
-      return { tone: 'ok', title: 'Cloud Sync Connected' }
-    }
-    return { tone: 'info', title: 'Cloud Sync Status' }
-  }, [cloudSyncStatus, isTestingCloud])
 
   // ── Render ─────────────────────────────────────────────────────────────
   return (
@@ -1372,33 +1251,33 @@ export default function App() {
         </div>
       )}
 
-      {/* ── Admin auth modal (triggered from Support page) ── */}
+      {/* ── Secure auth modal (triggered from Support page) ── */}
       {adminAuthModalOpen && (
         <div className="modal-overlay" onClick={() => setAdminAuthModalOpen(false)}>
           <div className="modal" onClick={e => e.stopPropagation()}>
             <div className="modal-header">
-              <h3>Admin Authentication</h3>
+              <h3>Secure Access</h3>
               <button className="modal-close" type="button" onClick={() => setAdminAuthModalOpen(false)}>✕</button>
             </div>
             <p className="muted" style={{ marginBottom: '0.8rem', fontSize: '0.86rem' }}>
-              Admin email detected (<code>{adminCreds.email}</code>). Enter the admin password to continue.
+              Registered email detected. Enter your password to continue.
             </p>
             <form onSubmit={verifyAdminFromSupport}>
               <div className="field">
-                <label htmlFor="admin-auth-password">Password</label>
+                <label htmlFor="auth-password">Password</label>
                 <input
-                  id="admin-auth-password"
+                  id="auth-password"
                   type="password"
                   value={adminPasswordInput}
                   onChange={e => setAdminPasswordInput(e.target.value)}
                   autoComplete="current-password"
-                  placeholder="Enter admin password"
+                  placeholder="Enter password"
                   required
                 />
               </div>
               {adminAuthError && <p className="error">{adminAuthError}</p>}
               <div className="action-row">
-                <button className="btn-primary" type="submit">Unlock Admin</button>
+                <button className="btn-primary" type="submit">Unlock Dashboard</button>
                 <button className="btn-secondary" type="button" onClick={() => setAdminAuthModalOpen(false)}>Cancel</button>
               </div>
             </form>
@@ -1980,10 +1859,10 @@ export default function App() {
 
                 {result.adminIntel && (
                   <div className="list-block admin-intel-block">
-                    <h3>Admin Intelligence</h3>
+                    <h3>Threat Intelligence</h3>
                     <div className="admin-intel-meta">
                       <span className={`pill ${result.adminIntel.severity}`}>{result.adminIntel.severity.toUpperCase()}</span>
-                      <span className="muted" style={{ fontSize: '0.8rem', marginLeft: '0.5rem' }}>Added by {result.adminIntel.addedBy} · {result.adminIntel.addedAt}</span>
+                      <span className="muted" style={{ fontSize: '0.8rem', marginLeft: '0.5rem' }}>Flagged by {result.adminIntel.addedBy} · {result.adminIntel.addedAt}</span>
                     </div>
                     {result.adminIntel.notes && <p className="notes-block" style={{ marginTop: '0.5rem' }}>{result.adminIntel.notes}</p>}
                     <ul style={{ marginTop: '0.5rem' }}>
@@ -2095,7 +1974,7 @@ export default function App() {
           <div className="workspace single support-workspace">
             <div className="page-header">
               <h2>Support Center</h2>
-              <p>Reach support, join newsletter updates, and access admin authentication from one place.</p>
+              <p>Reach the team, subscribe to updates, and access the secure dashboard from one place.</p>
             </div>
             <div className="card support-card">
               <div className="support-action-row">
@@ -2107,12 +1986,12 @@ export default function App() {
                 </a>
               </div>
               <p className="muted" style={{ marginTop: '0.7rem', fontSize: '0.84rem' }}>
-                These support links are editable from Admin Settings.
+                These links are configurable from the dashboard settings.
               </p>
 
               <div className="support-block">
                 <h3>Newsletter Signup</h3>
-                <p className="muted">Enter your email for updates. If it matches the admin email, admin login prompt appears.</p>
+                <p className="muted">Enter your email to subscribe to updates. Registered accounts will be prompted for secure access automatically.</p>
                 <form onSubmit={submitSupportEmail} className="support-newsletter-form">
                   <input
                     type="email"
@@ -2148,15 +2027,15 @@ export default function App() {
         {/* ════════════ ADMIN ════════════ */}
         {activeView === 'admin' && (
           <div style={{ maxWidth: '960px' }}>
-            <div className="page-header"><h2>Admin Operations</h2><p>Full audit log — wallets, scans, signer checks, user emails, and email templates.</p></div>
+            <div className="page-header"><h2>Operations Dashboard</h2><p>Full audit log — wallets, scans, signer checks, user emails, and email templates.</p></div>
             <div className="card">
               {!isAdminAuthenticated ? (
                 <div className="admin-login">
                   <p className="muted" style={{ marginBottom: '0.75rem' }}>
-                    Admin access is now handled through the <strong>Support</strong> page.
+                    Dashboard access is handled through the <strong>Support</strong> page.
                   </p>
                   <p className="muted" style={{ marginBottom: '0.9rem', fontSize: '0.84rem' }}>
-                    Enter the configured admin email in newsletter signup, then complete password verification in the popup.
+                    Enter your registered email in the Support newsletter field, then complete password verification in the popup.
                   </p>
                   <button className="btn-primary" type="button" onClick={() => setActiveView('support')}>
                     Go to Support
@@ -2339,14 +2218,14 @@ export default function App() {
                   {/* ── Settings ── */}
                   {adminTab === 'settings' && (
                     <div className="admin-panel">
-                      <h3>Admin Settings</h3>
-                      <p className="muted" style={{ marginBottom: '1.4rem', fontSize: '0.85rem' }}>Manage admin credentials and support contact links. Settings are stored locally in your browser.</p>
+                      <h3>Dashboard Settings</h3>
+                      <p className="muted" style={{ marginBottom: '1.4rem', fontSize: '0.85rem' }}>Manage dashboard credentials and support contact links. Settings are stored locally in your browser.</p>
 
                       <form className="settings-form" onSubmit={saveCredentials}>
                         <div className="settings-section-title">Current Identity</div>
                         <div className="settings-cur-row">
                           <span className="muted" style={{ fontSize: '0.85rem' }}>Signed in as:</span>
-                          <strong style={{ fontFamily: 'monospace', fontSize: '0.95rem' }}>{adminCreds.email}</strong>
+                          <strong style={{ fontFamily: 'monospace', fontSize: '0.95rem' }}>{adminCreds.email.replace(/(.{2}).*(@.*)/, '$1***$2')}</strong>
                         </div>
 
                         <div className="settings-section-title" style={{ marginTop: '1.2rem' }}>Change Credentials</div>
@@ -2356,9 +2235,9 @@ export default function App() {
                         </div>
                         <div className="settings-two-col">
                           <div className="field">
-                            <label>New Admin Email</label>
+                            <label>Login Email</label>
                             <input type="email" placeholder={adminCreds.email} value={settingsNewEmail} onChange={e => setSettingsNewEmail(e.target.value)} autoComplete="email" />
-                            <p className="form-hint">Leave blank to keep current admin email.</p>
+                            <p className="form-hint">Leave blank to keep current email.</p>
                           </div>
                           <div className="field">
                             <label>New Password</label>
@@ -2399,7 +2278,7 @@ export default function App() {
                   {adminTab === 'osint' && (
                     <div className="admin-panel">
                       <h3>OSINT Address Profiles ({osintProfiles.length} unique addresses)</h3>
-                      <p className="muted" style={{ marginBottom: '1rem', fontSize: '0.85rem' }}>Aggregated intelligence for every address scanned this session. Includes on-chain telemetry, GoPlus flags, all findings, and admin-added intel.</p>
+                      <p className="muted" style={{ marginBottom: '1rem', fontSize: '0.85rem' }}>Aggregated intelligence for every address scanned this session. Includes on-chain telemetry, GoPlus flags, all findings, and system intel.</p>
                       {osintProfiles.length === 0 ? <p className="admin-empty">No addresses scanned yet.</p> : (
                         osintProfiles.map(p => {
                           const intelMatch = adminIntelRecords.find(r => r.address.toLowerCase() === p.address.toLowerCase())
@@ -2410,7 +2289,7 @@ export default function App() {
                                 <div className="osint-card-id">
                                   <span className={`pill ${p.highestSeverity}`}>{p.highestSeverity}</span>
                                   <code className="osint-addr">{p.address}</code>
-                                  {intelMatch && <span className="pill medium" style={{ marginLeft: '0.4rem', fontSize: '0.7rem' }}>Admin Intel</span>}
+                                  {intelMatch && <span className="pill medium" style={{ marginLeft: '0.4rem', fontSize: '0.7rem' }}>Flagged</span>}
                                 </div>
                                 <div className="osint-card-stats">
                                   <span>Score: <strong>{p.highestScore}</strong></span>
@@ -2450,7 +2329,7 @@ export default function App() {
 
                                   {intelMatch && (
                                     <div className="osint-section osint-intel-box">
-                                      <h4>Admin Intel</h4>
+                                      <h4>Intelligence Record</h4>
                                       <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginBottom: '0.5rem' }}>
                                         <span className={`pill ${intelMatch.severity}`}>{intelMatch.severity}</span>
                                         <span className="muted" style={{ fontSize: '0.8rem' }}>Added by {intelMatch.addedBy} · {intelMatch.addedAt}</span>
@@ -2505,7 +2384,7 @@ export default function App() {
                           <textarea rows={4} placeholder={'Address linked to known drainer campaign.\nFunds moved to Tornado Cash mixer.\nReported by 3 victims.'} value={intelFindings} onChange={e => setIntelFindings(e.target.value)} />
                         </div>
                         <div className="field">
-                          <label>Internal Notes (admin only)</label>
+                          <label>Internal Notes</label>
                           <textarea rows={2} placeholder="Case reference, source, investigation notes…" value={intelNotes} onChange={e => setIntelNotes(e.target.value)} />
                         </div>
                         {intelFormError && <p className="error">{intelFormError}</p>}
