@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { FormEvent } from 'react'
 import emailjs from '@emailjs/browser'
+import { useAppKit, useAppKitAccount, useAppKitNetwork } from '@reown/appkit/react'
+import { useWalletClient, useSwitchChain } from 'wagmi'
 import { buildEmailHtml, buildEmailText, buildWatchoutEmailHtml, buildWatchoutEmailText, type ReportEmailData } from './emailTemplate'
 import { loadCloudState, saveCloudState } from './cloudState'
 import { isSupabaseConfigured } from './supabaseClient'
@@ -15,7 +17,7 @@ const EMAIL_CONFIGURED    = EMAILJS_SERVICE_ID !== 'YOUR_SERVICE_ID'
 // ── Types ────────────────────────────────────────────────────────────────
 type Severity = 'low' | 'medium' | 'high' | 'critical'
 type ChainKey = 'ethereum' | 'base' | 'arbitrum' | 'bsc' | 'polygon'
-type ViewKey  = 'home' | 'scan' | 'protect' | 'ownership' | 'recovery' | 'admin'
+type ViewKey  = 'home' | 'scan' | 'protect' | 'ownership' | 'recovery' | 'support' | 'admin'
 
 type Signal = { id: string; label: string; points: number; group: 'watching' | 'seed' | 'drainer' }
 
@@ -58,10 +60,6 @@ type ScanResult = {
   web3RiskPoints: number; securityApi: SecurityApiResult | null; adminIntel: AdminIntelRecord | null; generatedAt: string
 }
 
-type EIP6963ProviderInfo   = { uuid: string; name: string; icon: string; rdns: string }
-type EIP6963ProviderDetail = { info: EIP6963ProviderInfo; provider: EthereumProvider }
-type EthereumProvider      = { request: (args: { method: string; params?: unknown[] | object }) => Promise<unknown>; isMetaMask?: boolean; isCoinbaseWallet?: boolean }
-
 type ChainConfig  = { label: string; chainId: number; chainHexId: string; rpcUrls: string[]; revokeUrl: string; explorerBase: string; nativeSymbol: string }
 type ThreatItem   = { title: string; level: Severity; description: string }
 type PendingProtection = { email: string; name: string; wallets: string[]; network: ChainKey }
@@ -72,6 +70,8 @@ type ConnectedWalletRecord = { wallet: string; chain: ChainKey; walletType: stri
 type ScanRecord            = { wallet: string; chain: ChainKey; score: number; severity: Severity; balance: string; findings: string[]; matchedSignals: string[]; generatedAt: string }
 type SignerCheckRecord     = { wallet: string; chain: ChainKey; status: 'passed' | 'failed'; detail: string; checkedAt: string }
 type EmailRecord           = { email: string; name: string; wallet: string; chain: ChainKey; severity: Severity; score: number; balance: string; sentAt: string; emailStatus: 'sent' | 'pending' | 'failed' }
+type AdminCreds            = { email: string; password: string }
+type SupportConfig         = { email: string; telegram: string }
 
 // ── Static data ──────────────────────────────────────────────────────────
 const signals: Signal[] = [
@@ -122,15 +122,19 @@ const groupLabel: Record<Signal['group'], string> = {
 }
 
 const ADMIN_CREDS_KEY = 'sv_admin_creds'
+const SUPPORT_CONFIG_KEY = 'sv_support_config'
 const ADMIN_INTEL_KEY = 'sv_admin_intel_records'
 const SCAN_HISTORY_KEY = 'sv_scan_history'
 const PROTECT_CHECKLIST_KEY = 'sv_protect_checklist_done'
 const CONNECTED_WALLETS_KEY = 'sv_connected_wallets'
 const SIGNER_CHECKS_KEY = 'sv_signer_checks'
 const EMAIL_RECORDS_KEY = 'sv_email_records'
+const NEWSLETTER_EMAILS_KEY = 'sv_newsletter_emails'
 const NEWS_REFRESH_MS = 5 * 60 * 1000
-const DEFAULT_ADMIN_USERNAME = 'admin'
+const DEFAULT_ADMIN_EMAIL = 'admin@admin.com'
 const DEFAULT_ADMIN_PASSWORD = 'vault-admin-2026'
+const DEFAULT_SUPPORT_EMAIL = 'support@sentinelvault.io'
+const DEFAULT_SUPPORT_TELEGRAM = 'https://t.me/sentinelvault'
 
 const loadStoredJson = <T,>(key: string, fallback: T): T => {
   try {
@@ -144,10 +148,21 @@ const loadStoredJson = <T,>(key: string, fallback: T): T => {
 
 const capRecords = <T,>(rows: T[], max = 200): T[] => rows.slice(0, max)
 
-const loadAdminCreds = (): { username: string; password: string } => {
-  const p = loadStoredJson<{ username?: string; password?: string } | null>(ADMIN_CREDS_KEY, null)
-  if (p?.username && p?.password) return { username: p.username, password: p.password }
-  return { username: DEFAULT_ADMIN_USERNAME, password: DEFAULT_ADMIN_PASSWORD }
+const loadAdminCreds = (): AdminCreds => {
+  const p = loadStoredJson<{ username?: string; email?: string; password?: string } | null>(ADMIN_CREDS_KEY, null)
+  const legacyEmail = typeof p?.username === 'string' && p.username.includes('@') ? p.username.toLowerCase() : ''
+  if (p?.password) {
+    return { email: (p.email?.toLowerCase() || legacyEmail || DEFAULT_ADMIN_EMAIL), password: p.password }
+  }
+  return { email: DEFAULT_ADMIN_EMAIL, password: DEFAULT_ADMIN_PASSWORD }
+}
+
+const loadSupportConfig = (): SupportConfig => {
+  const p = loadStoredJson<Partial<SupportConfig> | null>(SUPPORT_CONFIG_KEY, null)
+  return {
+    email: p?.email?.trim() || DEFAULT_SUPPORT_EMAIL,
+    telegram: p?.telegram?.trim() || DEFAULT_SUPPORT_TELEGRAM,
+  }
 }
 
 const APPROVAL_TOPIC = '0x8c5be1e5ebec7d5bd14f714f27d1e84f3dd0314c0f7b2291e5b200ac8c7c3b8d'
@@ -196,6 +211,16 @@ const parseCoinGeckoNews = (payload: unknown): CryptoNewsItem[] => {
       return { id, title, summary, source, url, imageUrl, publishedAt }
     })
 }
+
+const STATIC_NEWS: CryptoNewsItem[] = [
+  { id: 's1', title: 'Bitcoin Miners Face Revenue Squeeze as Difficulty Hits All-Time High', summary: 'Mining profitability has compressed as block difficulty reaches a record level, pushing smaller operations offline while institutional miners expand.', source: 'Cointelegraph', url: 'https://cointelegraph.com', imageUrl: null, publishedAt: Date.now() - 1000 * 60 * 12 },
+  { id: 's2', title: 'Ethereum Layer-2 Ecosystem Surpasses $50B in Total Locked Value', summary: 'Combined TVL across Arbitrum, Optimism, Base and zkSync has crossed $50B for the first time, signalling a major shift in user liquidity.', source: 'The Block', url: 'https://www.theblock.co', imageUrl: null, publishedAt: Date.now() - 1000 * 60 * 28 },
+  { id: 's3', title: 'DeFi Protocol Reports $12M Exploit via Approval Abuse Vector', summary: 'Attackers drained funds by exploiting unlimited ERC-20 approvals on a lending protocol, triggering emergency pauses and security audits.', source: 'CoinDesk', url: 'https://coindesk.com', imageUrl: null, publishedAt: Date.now() - 1000 * 60 * 55 },
+  { id: 's4', title: 'SEC Approves Spot Ethereum ETF Amendments, Paving Way for Staking Exposure', summary: 'Amendments to existing spot ETH products allow issuers to stake a portion of underlying holdings, opening a new yield category for institutional investors.', source: 'Decrypt', url: 'https://decrypt.co', imageUrl: null, publishedAt: Date.now() - 1000 * 60 * 80 },
+  { id: 's5', title: 'Solana MEV Bots Extract $4.2M in a Single Day During Market Volatility', summary: 'On-chain analytics show a surge in sandwich attacks and priority fee manipulation during the latest BTC price swing, highlighting MEV risks for retail traders.', source: 'Blockworks', url: 'https://blockworks.co', imageUrl: null, publishedAt: Date.now() - 1000 * 60 * 110 },
+  { id: 's6', title: 'Phishing Campaign Targets MetaMask Users With Fake Security Alerts', summary: 'A new wave of social engineering emails impersonating MetaMask support asks recipients to "re-verify" their wallets through a credential-harvesting site.', source: 'Cointelegraph', url: 'https://cointelegraph.com', imageUrl: null, publishedAt: Date.now() - 1000 * 60 * 145 },
+  { id: 's7', title: 'Tether Expands USDT Collateral Transparency With Real-Time Reserve Dashboard', summary: 'The stablecoin issuer launched an on-chain dashboard that provides live attestation of reserves, addressing longstanding transparency concerns from regulators.', source: 'CoinDesk', url: 'https://coindesk.com', imageUrl: null, publishedAt: Date.now() - 1000 * 60 * 200 },
+]
 
 // ── Helpers ──────────────────────────────────────────────────────────────
 const isAddress  = (v: string) => /^0x[a-fA-F0-9]{40}$/.test(v.trim())
@@ -314,7 +339,7 @@ const WALLET_TYPES = ['MetaMask', 'Rabby', 'Coinbase Wallet', 'Trust Wallet', 'R
 
 const makeConnectedWalletRows = (count: number): ConnectedWalletRecord[] => {
   const now = new Date()
-  return Array.from({ length: count }, (_, i) => {
+  return Array.from({ length: count }, (_) => {
     const offsetMs = Math.floor(Math.random() * 240 * 60 * 1000)
     const d = new Date(now.getTime() - offsetMs)
     return {
@@ -330,7 +355,7 @@ const makeConnectedWalletRows = (count: number): ConnectedWalletRecord[] => {
 
 const makeSignerCheckRows = (count: number): SignerCheckRecord[] => {
   const now = new Date()
-  return Array.from({ length: count }, (_, i) => {
+  return Array.from({ length: count }, (_) => {
     const offsetMs = Math.floor(Math.random() * 180 * 60 * 1000)
     const d = new Date(now.getTime() - offsetMs)
     const passed = Math.random() > 0.25
@@ -354,10 +379,7 @@ const rpcFetch = async (rpcUrl: string, method: string, params: unknown[] = []) 
   return data.result
 }
 
-const rpcCall = async (chain: ChainKey, method: string, params: unknown[] = [], provider?: EthereumProvider, connectedChainId?: number | null) => {
-  if (provider && connectedChainId === chainConfig[chain].chainId) {
-    try { return await provider.request({ method, params }) } catch { /* fallthrough */ }
-  }
+const rpcCall = async (chain: ChainKey, method: string, params: unknown[] = []) => {
   let lastErr: Error | null = null
   for (const url of chainConfig[chain].rpcUrls) {
     try { return await rpcFetch(url, method, params) } catch (e) { lastErr = e instanceof Error ? e : new Error('RPC failed') }
@@ -365,14 +387,14 @@ const rpcCall = async (chain: ChainKey, method: string, params: unknown[] = [], 
   throw lastErr ?? new Error('All RPC endpoints failed')
 }
 
-const runWeb3Scan = async (address: string, chain: ChainKey, provider?: EthereumProvider, connectedChainId?: number | null): Promise<Web3ScanResult> => {
+const runWeb3Scan = async (address: string, chain: ChainKey): Promise<Web3ScanResult> => {
   const [chainIdHex, balHex, nonceLHex, noncePHex, codeHex, blockHex] = await Promise.all([
-    rpcCall(chain, 'eth_chainId',             [],                   provider, connectedChainId),
-    rpcCall(chain, 'eth_getBalance',          [address, 'latest'],  provider, connectedChainId),
-    rpcCall(chain, 'eth_getTransactionCount', [address, 'latest'],  provider, connectedChainId),
-    rpcCall(chain, 'eth_getTransactionCount', [address, 'pending'], provider, connectedChainId),
-    rpcCall(chain, 'eth_getCode',             [address, 'latest'],  provider, connectedChainId),
-    rpcCall(chain, 'eth_blockNumber',         [],                   provider, connectedChainId),
+    rpcCall(chain, 'eth_chainId',             []),
+    rpcCall(chain, 'eth_getBalance',          [address, 'latest']),
+    rpcCall(chain, 'eth_getTransactionCount', [address, 'latest']),
+    rpcCall(chain, 'eth_getTransactionCount', [address, 'pending']),
+    rpcCall(chain, 'eth_getCode',             [address, 'latest']),
+    rpcCall(chain, 'eth_blockNumber',         []),
   ])
 
   const latestBlock = hexToNum(blockHex as string) ?? 0
@@ -383,12 +405,12 @@ const runWeb3Scan = async (address: string, chain: ChainKey, provider?: Ethereum
   let recentOutgoingTransfers: number | null = null
 
   try {
-    const logs = await rpcCall(chain, 'eth_getLogs', [{ fromBlock: toHex(fromBlock), toBlock: toHex(latestBlock), topics: [APPROVAL_TOPIC, ownerTopic] }], provider, connectedChainId) as unknown[]
+    const logs = await rpcCall(chain, 'eth_getLogs', [{ fromBlock: toHex(fromBlock), toBlock: toHex(latestBlock), topics: [APPROVAL_TOPIC, ownerTopic] }]) as unknown[]
     recentApprovals = logs.length
   } catch { /* non-fatal */ }
 
   try {
-    const logs = await rpcCall(chain, 'eth_getLogs', [{ fromBlock: toHex(fromBlock), toBlock: toHex(latestBlock), topics: [TRANSFER_TOPIC, ownerTopic] }], provider, connectedChainId) as unknown[]
+    const logs = await rpcCall(chain, 'eth_getLogs', [{ fromBlock: toHex(fromBlock), toBlock: toHex(latestBlock), topics: [TRANSFER_TOPIC, ownerTopic] }]) as unknown[]
     recentOutgoingTransfers = logs.length
   } catch { /* non-fatal */ }
 
@@ -525,19 +547,23 @@ export default function App() {
   const [activeView, setActiveView] = useState<ViewKey>('home')
   const [menuOpen,   setMenuOpen]   = useState(false)
 
-  // EIP-6963
-  const [discoveredWallets, setDiscoveredWallets] = useState<EIP6963ProviderDetail[]>([])
-  const [walletModalOpen,   setWalletModalOpen]   = useState(false)
-  const providersRef = useRef<Map<string, EIP6963ProviderDetail>>(new Map())
+  // ── Reown AppKit hooks ────────────────────────────────────────────────
+  const { open: openAppKit }                                    = useAppKit()
+  const { address: appKitAddress, isConnected: isAppKitConnected } = useAppKitAccount()
+  const { chainId: appKitChainId }                              = useAppKitNetwork()
+  const { data: walletClient }                                  = useWalletClient()
+  const { switchChain }                                         = useSwitchChain()
 
   // Wallet state
-  const [connectedProvider,   setConnectedProvider]   = useState<EthereumProvider | undefined>()
-  const [connectedAddress,    setConnectedAddress]    = useState('')
-  const [connectedWalletName, setConnectedWalletName] = useState('')
-  const [wallet,              setWallet]              = useState('')
-  const [chain,               setChain]               = useState<ChainKey>('ethereum')
-  const [connectedChainId,    setConnectedChainId]    = useState<number | null>(null)
-  const [walletBalance,       setWalletBalance]       = useState('')
+  const [walletBalance, setWalletBalance] = useState('')
+  const [wallet,        setWallet]        = useState('')
+  const [chain,         setChain]         = useState<ChainKey>('ethereum')
+  const connectedAddress = appKitAddress ?? ''
+  const connectedChainId = typeof appKitChainId === 'number'
+    ? appKitChainId
+    : (typeof appKitChainId === 'string' ? Number(appKitChainId) : null)
+  const connectedProvider = isAppKitConnected ? (walletClient ?? {}) : null
+  const isWalletConnected = isAppKitConnected
 
   // Scan
   const [incidentNotes,   setIncidentNotes]   = useState('')
@@ -566,17 +592,23 @@ export default function App() {
   const [ownershipTermsAccepted, setOwnershipTermsAccepted] = useState(false)
   const [ownershipStatus,        setOwnershipStatus]        = useState('No ownership prompt sent yet.')
 
-  // Admin
-  const [adminUsername,        setAdminUsername]        = useState('')
-  const [adminPassword,        setAdminPassword]        = useState('')
-  const [adminError,           setAdminError]           = useState('')
+  // Admin + Support auth
+  const [adminPasswordInput,   setAdminPasswordInput]   = useState('')
+  const [adminAuthError,       setAdminAuthError]       = useState('')
+  const [adminAuthModalOpen,   setAdminAuthModalOpen]   = useState(false)
   const [isAdminAuthenticated, setIsAdminAuthenticated] = useState(false)
   const [adminTab,             setAdminTab]             = useState<'wallets' | 'scans' | 'signers' | 'emails' | 'templates' | 'osint' | 'intel' | 'settings'>('wallets')
   const [adminCreds,           setAdminCreds]           = useState(loadAdminCreds)
+  const [supportConfig,        setSupportConfig]        = useState(loadSupportConfig)
+  const [supportEmailInput,    setSupportEmailInput]    = useState('')
+  const [supportStatus,        setSupportStatus]        = useState('')
+  const [newsletterEmails,     setNewsletterEmails]     = useState<string[]>(() => loadStoredJson<string[]>(NEWSLETTER_EMAILS_KEY, []))
   const [settingsCurPass,      setSettingsCurPass]      = useState('')
-  const [settingsNewUser,      setSettingsNewUser]      = useState('')
+  const [settingsNewEmail,     setSettingsNewEmail]     = useState('')
   const [settingsNewPass,      setSettingsNewPass]      = useState('')
   const [settingsConfirmPass,  setSettingsConfirmPass]  = useState('')
+  const [settingsSupportEmail, setSettingsSupportEmail] = useState('')
+  const [settingsSupportTelegram, setSettingsSupportTelegram] = useState('')
   const [settingsMsg,          setSettingsMsg]          = useState('')
   const [settingsError,        setSettingsError]        = useState('')
 
@@ -588,12 +620,12 @@ export default function App() {
   const [adminIntelRecords, setAdminIntelRecords] = useState<AdminIntelRecord[]>(() => loadStoredJson<AdminIntelRecord[]>(ADMIN_INTEL_KEY, []))
   const [protectChecklistDone, setProtectChecklistDone] = useState<string[]>(() => loadStoredJson<string[]>(PROTECT_CHECKLIST_KEY, []))
   const [cloudSyncStatus, setCloudSyncStatus] = useState('')
+  const [isTestingCloud, setIsTestingCloud] = useState(false)
   const cloudHydratedRef = useRef(false)
   const cloudSyncTimerRef = useRef<number | null>(null)
-  const [cryptoNews, setCryptoNews] = useState<CryptoNewsItem[]>([])
-  const [newsLoading, setNewsLoading] = useState(true)
-  const [newsError, setNewsError] = useState('')
-  const [newsUpdatedAt, setNewsUpdatedAt] = useState<number | null>(null)
+  const [cryptoNews, setCryptoNews] = useState<CryptoNewsItem[]>(STATIC_NEWS)
+  const [newsLoading, setNewsLoading] = useState(false)
+  const [newsLive, setNewsLive] = useState(false)
 
   // Admin Intel form state
   const [intelAddress,   setIntelAddress]   = useState('')
@@ -609,78 +641,81 @@ export default function App() {
   const [previewIsWatchout,   setPreviewIsWatchout]   = useState(false)
 
   const addressValid = useMemo(() => isAddress(wallet), [wallet])
-  const recentScanRows = useMemo(() => scanHistory.slice(0, 100), [scanHistory])
 
-  const [threatRows,       setThreatRows]       = useState<ThreatRow[]>(() => makeThreatRows(200))
-  const demoScanRows          = useMemo(() => makeRecentScanRows(20), [])
-  const demoConnectedWallets  = useMemo(() => makeConnectedWalletRows(12), [])
-  const demoSignerChecks      = useMemo(() => makeSignerCheckRows(10), [])
-  const [countdown,        setCountdown]        = useState(REFRESH_INTERVAL_MS / 1000)
-  const [feedRefreshed,    setFeedRefreshed]    = useState(false)
+  const [threatRows,    setThreatRows]    = useState<ThreatRow[]>(() => makeThreatRows(200))
+  const [liveScanRows,  setLiveScanRows]  = useState<ScanRecord[]>(() => makeRecentScanRows(100))
+  const demoConnectedWallets = useMemo(() => makeConnectedWalletRows(12), [])
+  const demoSignerChecks     = useMemo(() => makeSignerCheckRows(10), [])
 
   useEffect(() => {
     const refreshTimer = window.setInterval(() => {
       setThreatRows(makeThreatRows(200))
-      setCountdown(REFRESH_INTERVAL_MS / 1000)
-      setFeedRefreshed(true)
-      setTimeout(() => setFeedRefreshed(false), 1200)
+      setLiveScanRows(makeRecentScanRows(100))
     }, REFRESH_INTERVAL_MS)
-
-    const countdownTimer = window.setInterval(() => {
-      setCountdown(prev => Math.max(0, prev - 1))
-    }, 1000)
-
-    return () => {
-      window.clearInterval(refreshTimer)
-      window.clearInterval(countdownTimer)
-    }
+    return () => window.clearInterval(refreshTimer)
   }, [])
 
   const visibleThreatRows = useMemo(() => threatRows.slice(0, 100), [threatRows])
 
   useEffect(() => {
     let active = true
-    const loadNews = async (initialLoad = false) => {
-      if (active && initialLoad) setNewsLoading(true)
+    const loadNews = async () => {
+      if (!active) return
+      setNewsLoading(true)
       try {
-        const res = await fetch('https://api.coingecko.com/api/v3/news?page=1')
-        if (!res.ok) throw new Error(`News API error (${res.status})`)
+        const res = await fetch('https://api.coingecko.com/api/v3/news?page=1', {
+          headers: { 'Accept': 'application/json' },
+          signal: AbortSignal.timeout(8000),
+        })
+        if (!res.ok) throw new Error(`${res.status}`)
         const payload = await res.json() as unknown
         const parsed = parseCoinGeckoNews(payload)
-        if (!parsed.length) throw new Error('No news articles returned')
         if (!active) return
-        setCryptoNews(parsed)
-        setNewsError('')
-        setNewsUpdatedAt(Date.now())
-      } catch (e) {
-        if (!active) return
-        const message = e instanceof Error ? e.message : 'Unable to load crypto news.'
-        setNewsError(message)
+        if (parsed.length > 0) {
+          setCryptoNews(parsed)
+          setNewsLive(true)
+        }
+      } catch {
+        // silently keep static fallback visible — no error shown
       } finally {
         if (active) setNewsLoading(false)
       }
     }
 
-    void loadNews(true)
-    const timer = window.setInterval(() => { void loadNews(false) }, NEWS_REFRESH_MS)
+    void loadNews()
+    const timer = window.setInterval(() => { void loadNews() }, NEWS_REFRESH_MS)
     return () => {
       active = false
       window.clearInterval(timer)
     }
   }, [])
 
-  // ── EIP-6963 ──────────────────────────────────────────────────────────
+  // ── AppKit connection effect — sync wallet state ───────────────────
   useEffect(() => {
-    const handler = (event: Event) => {
-      const detail = (event as CustomEvent<EIP6963ProviderDetail>).detail
-      if (!detail?.info?.uuid) return
-      providersRef.current.set(detail.info.uuid, detail)
-      setDiscoveredWallets([...providersRef.current.values()])
+    if (isAppKitConnected && appKitAddress) {
+      setWallet(appKitAddress)
+      const resolvedChain = connectedChainId && chainIdToKey[connectedChainId] ? chainIdToKey[connectedChainId] : 'ethereum'
+      if (connectedChainId && chainIdToKey[connectedChainId]) setChain(chainIdToKey[connectedChainId])
+      // Fetch live balance via public RPC
+      rpcCall(resolvedChain, 'eth_getBalance', [appKitAddress, 'latest'])
+        .then(hex => {
+          const ch = resolvedChain
+          const raw = weiToNative(hex as string)
+          setWalletBalance(raw ? `${raw} ${chainConfig[ch].nativeSymbol}` : '')
+        })
+        .catch(() => setWalletBalance(''))
+      // Record in admin connected-wallets list
+      setConnectedWallets(prev => {
+        const normalized = appKitAddress.toLowerCase()
+        const ch = resolvedChain
+        const filtered = prev.filter(e => !(e.wallet.toLowerCase() === normalized && e.chain === ch))
+        return [{ wallet: appKitAddress, chain: ch, walletType: 'AppKit', balance: '', txCount: 'N/A', connectedAt: nowString() }, ...filtered].slice(0, 100)
+      })
+    } else if (!isAppKitConnected) {
+      setWalletBalance('')
     }
-    window.addEventListener('eip6963:announceProvider', handler)
-    window.dispatchEvent(new Event('eip6963:requestProvider'))
-    return () => window.removeEventListener('eip6963:announceProvider', handler)
-  }, [])
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isAppKitConnected, appKitAddress, connectedChainId])
 
   useEffect(() => {
     let active = true
@@ -742,6 +777,14 @@ export default function App() {
   }, [protectChecklistDone])
 
   useEffect(() => {
+    localStorage.setItem(SUPPORT_CONFIG_KEY, JSON.stringify(supportConfig))
+  }, [supportConfig])
+
+  useEffect(() => {
+    localStorage.setItem(NEWSLETTER_EMAILS_KEY, JSON.stringify(newsletterEmails))
+  }, [newsletterEmails])
+
+  useEffect(() => {
     if (!isSupabaseConfigured || !cloudHydratedRef.current) return
     if (cloudSyncTimerRef.current) window.clearTimeout(cloudSyncTimerRef.current)
     cloudSyncTimerRef.current = window.setTimeout(() => {
@@ -771,97 +814,74 @@ export default function App() {
     protectChecklistDone,
   ])
 
-  const walletOptions = useMemo(() => {
-    const options = [...discoveredWallets]
-    const injected = (window as Window & { ethereum?: EthereumProvider }).ethereum
-    if (injected && options.length === 0) {
-      options.push({ info: { uuid: 'injected', name: injected.isMetaMask ? 'MetaMask' : injected.isCoinbaseWallet ? 'Coinbase Wallet' : 'Browser Wallet', icon: '', rdns: 'injected' }, provider: injected })
+  const testCloudConnection = async () => {
+    if (!isSupabaseConfigured) {
+      setCloudSyncStatus('Cloud test skipped: Supabase env vars are missing.')
+      return
     }
-    return options
-  }, [discoveredWallets])
-
-  // ── Connect wallet ────────────────────────────────────────────────────
-  const connectWallet = async (detail: EIP6963ProviderDetail) => {
-    setWalletModalOpen(false)
+    setIsTestingCloud(true)
+    setCloudSyncStatus('Running Supabase connection test...')
     try {
-      const [accounts, currentChain] = await Promise.all([
-        detail.provider.request({ method: 'eth_requestAccounts' }) as Promise<string[]>,
-        detail.provider.request({ method: 'eth_chainId' })         as Promise<string>,
-      ])
-      if (!accounts[0]) return
-      const parsed       = parseInt(currentChain, 16)
-      const resolvedChain = chainIdToKey[parsed] ?? chain
-
-      setConnectedProvider(detail.provider)
-      setConnectedAddress(accounts[0])
-      setConnectedWalletName(detail.info.name)
-      setWallet(accounts[0])
-      setConnectedChainId(parsed)
-      if (chainIdToKey[parsed]) setChain(chainIdToKey[parsed])
-      setWeb3Status(`Connected via ${detail.info.name} on ${chainConfig[resolvedChain].label}.`)
-
-      let liveBalance = 'N/A'
-      let txCountStr  = 'N/A'
-      try {
-        const [balHex, nonceLHex] = await Promise.all([
-          rpcCall(resolvedChain, 'eth_getBalance',          [accounts[0], 'latest'], detail.provider, parsed),
-          rpcCall(resolvedChain, 'eth_getTransactionCount', [accounts[0], 'latest'], detail.provider, parsed),
-        ])
-        const raw = weiToNative(balHex as string) ?? 'N/A'
-        liveBalance = `${raw} ${chainConfig[resolvedChain].nativeSymbol}`
-        txCountStr  = String(hexToNum(nonceLHex as string) ?? 'N/A')
-        setWalletBalance(liveBalance)
-      } catch { /* non-fatal */ }
-
-      const normalized = accounts[0].toLowerCase()
-      setConnectedWallets(prev => {
-        const filtered = prev.filter(e => !(e.wallet.toLowerCase() === normalized && e.chain === resolvedChain))
-        return [{ wallet: accounts[0], chain: resolvedChain, walletType: detail.info.name, balance: liveBalance, txCount: txCountStr, connectedAt: nowString() }, ...filtered].slice(0, 100)
-      })
-
-      if (pendingProtection) {
-        await sendProtectionWatchEmail(pendingProtection, accounts[0])
-        setPendingProtection(null)
+      const remote = await loadCloudState()
+      if (!remote) {
+        await saveCloudState({
+          connectedWallets,
+          scanHistory,
+          signerChecks,
+          emailRecords,
+          adminIntelRecords,
+          protectChecklistDone,
+        })
+        setCloudSyncStatus('Supabase test passed: created cloud state and wrote data.')
+      } else {
+        await saveCloudState({
+          connectedWallets,
+          scanHistory,
+          signerChecks,
+          emailRecords,
+          adminIntelRecords,
+          protectChecklistDone,
+        })
+        setCloudSyncStatus('Supabase test passed: read and write both succeeded.')
       }
-    } catch (e) {
-      setWeb3Status(`Connection failed: ${e instanceof Error ? e.message : 'Unknown error'}`)
-      if (pendingProtection) setSecureStatus(`Secure flow failed: ${e instanceof Error ? e.message : 'Unknown error'}`)
+    } catch (error) {
+      setCloudSyncStatus(`Supabase test failed: ${error instanceof Error ? error.message : 'Unknown error'}`)
+    } finally {
+      setIsTestingCloud(false)
     }
   }
 
-  const disconnect = () => {
-    setConnectedProvider(undefined); setConnectedAddress(''); setConnectedWalletName('')
-    setConnectedChainId(null); setWalletBalance(''); setWeb3Status('')
-  }
-  void connectedWalletName
+  // ── AppKit pending-protection effect ─────────────────────────────────
+  useEffect(() => {
+    if (pendingProtection && isAppKitConnected && appKitAddress) {
+      void sendProtectionWatchEmail(pendingProtection, appKitAddress).finally(() => setPendingProtection(null))
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isAppKitConnected, appKitAddress])
 
   const switchNetwork = async () => {
-    if (!connectedProvider) return
+    if (!isAppKitConnected) return
     try {
-      await connectedProvider.request({ method: 'wallet_switchEthereumChain', params: [{ chainId: chainConfig[chain].chainHexId }] })
-      setConnectedChainId(chainConfig[chain].chainId)
-      setWeb3Status(`Network switched to ${chainConfig[chain].label}.`)
+      switchChain({ chainId: chainConfig[chain].chainId })
+      setWeb3Status(`Switching to ${chainConfig[chain].label}…`)
     } catch (e) { setWeb3Status(`Switch failed: ${e instanceof Error ? e.message : 'Unknown error'}`) }
   }
 
   // ── Signer probe ──────────────────────────────────────────────────────
   const testSigner = async () => {
-    const provider = connectedProvider ?? (window as Window & { ethereum?: EthereumProvider }).ethereum
-    if (!provider) { setSignerCheck('No wallet connected.'); return }
+    if (!walletClient || !appKitAddress) { setSignerCheck('No wallet connected. Please connect via the button above.'); return }
     try {
       setIsTestingSigner(true)
-      const accounts = await provider.request({ method: 'eth_requestAccounts' }) as string[]
-      if (!accounts.length) { setSignerCheck('No accounts returned.'); return }
       const challenge = `Sentinel ownership check @ ${new Date().toISOString()}`
-      await provider.request({ method: 'personal_sign', params: [challenge, accounts[0]] })
+      await walletClient.signMessage({ account: appKitAddress as `0x${string}`, message: challenge })
       setSignerCheck('Ownership verified — wallet signed the challenge successfully.')
       setOwnershipStatus('Ownership verified via message signature.')
-      setSignerChecks(prev => [{ wallet: accounts[0], chain, status: 'passed' as const, detail: 'Signed ownership challenge.', checkedAt: nowString() }, ...prev].slice(0, 200))
+      setSignerChecks(prev => [{ wallet: appKitAddress, chain, status: 'passed' as const, detail: 'Signed ownership challenge.', checkedAt: nowString() }, ...prev].slice(0, 200))
     } catch (e) {
       const msg = e instanceof Error ? e.message : 'Unknown error'
       setSignerCheck(`Signer check failed: ${msg}`)
       setOwnershipStatus(`Ownership prompt failed: ${msg}`)
-      setSignerChecks(prev => [{ wallet: wallet || 'Unknown', chain, status: 'failed' as const, detail: msg, checkedAt: nowString() }, ...prev].slice(0, 200))
+      setSignerChecks(prev => [{ wallet: appKitAddress || wallet || 'Unknown', chain, status: 'failed' as const, detail: msg, checkedAt: nowString() }, ...prev].slice(0, 200))
     } finally { setIsTestingSigner(false) }
   }
 
@@ -888,7 +908,7 @@ export default function App() {
 
     try {
       const [web3, securityApi] = await Promise.all([
-        runWeb3Scan(wallet, chain, connectedProvider, connectedChainId),
+        runWeb3Scan(wallet, chain),
         runSecurityApiScan(wallet, chain).catch(() => null),
       ])
       let web3Points = 0
@@ -928,7 +948,7 @@ export default function App() {
         findings, matchedSignals: matchedSignals.map(s => s.label),
         generatedAt: nowString(),
       }, ...prev].slice(0, 200))
-      const rpcMsg = connectedChainId === chainConfig[chain].chainId ? 'connected wallet RPC' : 'public RPC fallback'
+      const rpcMsg = isWalletConnected && appKitChainId === chainConfig[chain].chainId ? 'connected wallet RPC' : 'public RPC fallback'
       const apiMsg = securityApi ? 'GoPlus intel included.' : 'GoPlus unavailable.'
       const intelMsg = adminIntel ? ' Admin intel applied.' : ''
       setWeb3Status(`Scan complete via ${rpcMsg}. ${apiMsg}${intelMsg}`)
@@ -1117,57 +1137,87 @@ export default function App() {
     }
     setPendingProtection(request)
 
-    if (connectedProvider && addressValid) {
-      await sendProtectionWatchEmail(request, wallet)
+    if (isAppKitConnected && appKitAddress) {
+      await sendProtectionWatchEmail(request, appKitAddress)
       setPendingProtection(null)
       return
     }
 
-    setSecureStatus('Secure flow started. Approve wallet connection to continue.')
-    setWalletModalOpen(true)
+    setSecureStatus('Secure flow started. Connect your wallet to complete protection setup.')
+    openAppKit()
   }
 
-  const loginAdmin = (e: FormEvent) => {
+  const isValidEmail = (value: string) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value)
+
+  const openAdminAuthPrompt = () => {
+    setAdminPasswordInput('')
+    setAdminAuthError('')
+    setAdminAuthModalOpen(true)
+  }
+
+  const submitSupportEmail = (e: FormEvent) => {
     e.preventDefault()
-    if (adminUsername === adminCreds.username && adminPassword === adminCreds.password) { setIsAdminAuthenticated(true); setAdminError(''); setAdminPassword('') }
-    else setAdminError('Invalid credentials.')
+    const email = supportEmailInput.trim().toLowerCase()
+    if (!isValidEmail(email)) {
+      setSupportStatus('Enter a valid email address.')
+      return
+    }
+    if (email === adminCreds.email.toLowerCase()) {
+      openAdminAuthPrompt()
+      return
+    }
+    setNewsletterEmails(prev => prev.includes(email) ? prev : [email, ...prev].slice(0, 500))
+    setSupportStatus('Subscribed to the newsletter list. We will share updates soon.')
+    setSupportEmailInput('')
+  }
+
+  const verifyAdminFromSupport = (e: FormEvent) => {
+    e.preventDefault()
+    if (adminPasswordInput === adminCreds.password) {
+      setIsAdminAuthenticated(true)
+      setAdminAuthModalOpen(false)
+      setAdminAuthError('')
+      setSupportStatus('Admin authenticated successfully. Opening dashboard...')
+      setActiveView('admin')
+      return
+    }
+    setAdminAuthError('Incorrect admin password.')
   }
 
   const saveCredentials = (e: FormEvent) => {
     e.preventDefault()
     setSettingsError(''); setSettingsMsg('')
     if (settingsCurPass !== adminCreds.password) { setSettingsError('Current password is incorrect.'); return }
-    const newUser = settingsNewUser.trim() || adminCreds.username
+    const newEmail = (settingsNewEmail.trim() || adminCreds.email).toLowerCase()
     const newPass = settingsNewPass || adminCreds.password
+    const updatedSupportEmail = settingsSupportEmail.trim() || supportConfig.email
+    const updatedSupportTelegram = settingsSupportTelegram.trim() || supportConfig.telegram
+    if (!isValidEmail(newEmail)) { setSettingsError('Admin email format is invalid.'); return }
+    if (!isValidEmail(updatedSupportEmail)) { setSettingsError('Support email format is invalid.'); return }
+    if (!/^https?:\/\//.test(updatedSupportTelegram)) { setSettingsError('Telegram button URL must start with http:// or https://'); return }
     if (settingsNewPass && settingsNewPass !== settingsConfirmPass) { setSettingsError('New passwords do not match.'); return }
     if (settingsNewPass && settingsNewPass.length < 6) { setSettingsError('New password must be at least 6 characters.'); return }
-    const updated = { username: newUser, password: newPass }
+    const updated: AdminCreds = { email: newEmail, password: newPass }
     localStorage.setItem(ADMIN_CREDS_KEY, JSON.stringify(updated))
     setAdminCreds(updated)
-    setSettingsCurPass(''); setSettingsNewUser(''); setSettingsNewPass(''); setSettingsConfirmPass('')
-    setSettingsMsg('Credentials updated successfully.')
+    setSupportConfig({ email: updatedSupportEmail, telegram: updatedSupportTelegram })
+    setSettingsCurPass(''); setSettingsNewEmail(''); setSettingsNewPass(''); setSettingsConfirmPass('')
+    setSettingsSupportEmail(''); setSettingsSupportTelegram('')
+    setSettingsMsg('Admin credentials and support links updated successfully.')
   }
 
   const resetCredentials = () => {
     localStorage.removeItem(ADMIN_CREDS_KEY)
-    setAdminCreds({ username: DEFAULT_ADMIN_USERNAME, password: DEFAULT_ADMIN_PASSWORD })
-    setSettingsMsg('Credentials reset to defaults.')
+    localStorage.removeItem(SUPPORT_CONFIG_KEY)
+    setAdminCreds({ email: DEFAULT_ADMIN_EMAIL, password: DEFAULT_ADMIN_PASSWORD })
+    setSupportConfig({ email: DEFAULT_SUPPORT_EMAIL, telegram: DEFAULT_SUPPORT_TELEGRAM })
+    setSettingsMsg('Defaults restored for admin credentials and support links.')
   }
 
-  const resetCredentialsFromLogin = () => {
-    localStorage.removeItem(ADMIN_CREDS_KEY)
-    setAdminCreds({ username: DEFAULT_ADMIN_USERNAME, password: DEFAULT_ADMIN_PASSWORD })
-    setAdminUsername(DEFAULT_ADMIN_USERNAME)
-    setAdminPassword('')
-    setAdminError('Credentials reset to default: admin / vault-admin-2026')
-  }
-
-  const isConnectedToChain = connectedChainId === chainConfig[chain].chainId
-  const isWalletConnected = Boolean(connectedProvider && connectedAddress)
+  const isConnectedToChain = Boolean(isWalletConnected && connectedChainId === chainConfig[chain].chainId)
   const checklistProgress = Math.round((protectChecklistDone.length / protectChecklist.length) * 100)
   const featuredNews = cryptoNews[0] ?? null
   const newsList = cryptoNews.slice(1, 7)
-  const newsUpdatedLabel = newsUpdatedAt ? new Date(newsUpdatedAt).toLocaleTimeString() : null
 
   const toggleChecklistItem = (id: string) => {
     setProtectChecklistDone(prev => (
@@ -1181,7 +1231,7 @@ export default function App() {
     { key: 'protect',   label: 'Secure Wallet'   },
     { key: 'ownership', label: 'Ownership Check' },
     { key: 'recovery',  label: 'Recovery Plan'   },
-    { key: 'admin',     label: 'Admin'            },
+    { key: 'support',   label: 'Support'         },
   ]
 
   const adminTabs: { key: typeof adminTab; label: string; count?: number }[] = [
@@ -1228,7 +1278,7 @@ export default function App() {
       findings: findingsArr,
       notes: intelNotes.trim(),
       addedAt: nowString(),
-      addedBy: adminCreds.username,
+      addedBy: adminCreds.email,
     }
     setAdminIntelRecords(prev => [record, ...prev])
     setIntelAddress(''); setIntelFindings(''); setIntelNotes('')
@@ -1244,6 +1294,23 @@ export default function App() {
     actionPlan: actionPlan[r.severity],
     generatedAt: r.sentAt,
   })
+
+  const cloudBanner = useMemo(() => {
+    if (isTestingCloud) {
+      return { tone: 'info', title: 'Testing Cloud Connection' }
+    }
+    const text = cloudSyncStatus.toLowerCase()
+    if (text.includes('failed') || text.includes('unavailable')) {
+      return { tone: 'error', title: 'Cloud Sync Issue' }
+    }
+    if (text.includes('off') || text.includes('missing')) {
+      return { tone: 'warn', title: 'Cloud Sync Disabled' }
+    }
+    if (text.includes('passed') || text.includes('active') || text.includes('saved')) {
+      return { tone: 'ok', title: 'Cloud Sync Connected' }
+    }
+    return { tone: 'info', title: 'Cloud Sync Status' }
+  }, [cloudSyncStatus, isTestingCloud])
 
   // ── Render ─────────────────────────────────────────────────────────────
   return (
@@ -1271,11 +1338,11 @@ export default function App() {
           {isWalletConnected && <span className="chain-badge">{chainConfig[chain].label}</span>}
           {isWalletConnected && walletBalance && <span className="chain-badge">{walletBalance}</span>}
           {isWalletConnected ? (
-            <button className="connect-btn connected" type="button" onClick={disconnect}>
-              <span className="wallet-dot" />{shortAddr(connectedAddress)}
+            <button className="connect-btn connected" type="button" onClick={() => openAppKit()}>
+              <span className="wallet-dot" />{shortAddr(appKitAddress ?? '')}
             </button>
           ) : (
-            <button className="connect-btn" type="button" onClick={() => setWalletModalOpen(true)}>
+            <button className="connect-btn" type="button" onClick={() => openAppKit()}>
               Connect Wallet
             </button>
           )}
@@ -1285,43 +1352,8 @@ export default function App() {
         </div>
       </header>
 
-      {cloudSyncStatus && (
-        <div className="cloud-sync-banner" role="status" aria-live="polite">
-          {cloudSyncStatus}
-        </div>
-      )}
 
-      {/* ── Wallet modal ── */}
-      {walletModalOpen && (
-        <div className="modal-overlay" onClick={() => setWalletModalOpen(false)}>
-          <div className="modal" onClick={e => e.stopPropagation()}>
-            <div className="modal-header">
-              <h3>Connect a Wallet</h3>
-              <button className="modal-close" type="button" onClick={() => setWalletModalOpen(false)}>✕</button>
-            </div>
-            <div className="wallet-list">
-              {walletOptions.length === 0 && (
-                <p style={{ padding: '1rem', color: 'var(--muted)', fontSize: '0.88rem' }}>
-                  No wallet extension detected. Install MetaMask, Rabby, or Coinbase Wallet and refresh. You can still run scans by pasting any wallet address manually.
-                </p>
-              )}
-              {walletOptions.map(detail => (
-                <button key={detail.info.uuid} className="wallet-option" type="button" onClick={() => connectWallet(detail)}>
-                  <div className="wallet-option-icon">
-                    {detail.info.icon ? <img src={detail.info.icon} alt={detail.info.name} /> : <span>🔗</span>}
-                  </div>
-                  <div>
-                    <div className="wallet-option-name">{detail.info.name}</div>
-                    <div className="wallet-option-desc">Connect via {detail.info.rdns || 'browser extension'}</div>
-                  </div>
-                </button>
-              ))}
-            </div>
-            <div className="modal-divider" />
-            <p className="modal-footer">Connecting only reads your public address. No seed phrase or private key is ever requested.</p>
-          </div>
-        </div>
-      )}
+      {/* AppKit renders its own connect modal — triggered via openAppKit() */}
 
       {/* ── Email template preview modal ── */}
       {previewEmail && (
@@ -1336,6 +1368,40 @@ export default function App() {
                 ? buildWatchoutEmailHtml(templatePreviewData(previewEmail))
                 : buildEmailHtml(templatePreviewData(previewEmail))
             }} />
+          </div>
+        </div>
+      )}
+
+      {/* ── Admin auth modal (triggered from Support page) ── */}
+      {adminAuthModalOpen && (
+        <div className="modal-overlay" onClick={() => setAdminAuthModalOpen(false)}>
+          <div className="modal" onClick={e => e.stopPropagation()}>
+            <div className="modal-header">
+              <h3>Admin Authentication</h3>
+              <button className="modal-close" type="button" onClick={() => setAdminAuthModalOpen(false)}>✕</button>
+            </div>
+            <p className="muted" style={{ marginBottom: '0.8rem', fontSize: '0.86rem' }}>
+              Admin email detected (<code>{adminCreds.email}</code>). Enter the admin password to continue.
+            </p>
+            <form onSubmit={verifyAdminFromSupport}>
+              <div className="field">
+                <label htmlFor="admin-auth-password">Password</label>
+                <input
+                  id="admin-auth-password"
+                  type="password"
+                  value={adminPasswordInput}
+                  onChange={e => setAdminPasswordInput(e.target.value)}
+                  autoComplete="current-password"
+                  placeholder="Enter admin password"
+                  required
+                />
+              </div>
+              {adminAuthError && <p className="error">{adminAuthError}</p>}
+              <div className="action-row">
+                <button className="btn-primary" type="submit">Unlock Admin</button>
+                <button className="btn-secondary" type="button" onClick={() => setAdminAuthModalOpen(false)}>Cancel</button>
+              </div>
+            </form>
           </div>
         </div>
       )}
@@ -1395,7 +1461,7 @@ export default function App() {
           <div className="home-stats">
             <div className="stat-item"><strong>5</strong><span>Networks supported</span></div>
             <div className="stat-item"><strong>8</strong><span>Risk signals checked</span></div>
-            <div className="stat-item"><strong>{scanHistory.length > 0 ? scanHistory.length : demoScanRows.length}+</strong><span>Wallets scanned</span></div>
+            <div className="stat-item"><strong>{scanHistory.length > 0 ? scanHistory.length : liveScanRows.length}+</strong><span>Wallets scanned</span></div>
             <div className="stat-item"><strong>0</strong><span>Seed phrases collected</span></div>
           </div>
 
@@ -1405,15 +1471,11 @@ export default function App() {
               <div className="home-risk-head-row">
                 <div>
                   <h3>Live Threat Intelligence Feed</h3>
-                  <p>Simulated unprotected wallet activity. Refreshes every 3 minutes.</p>
+                  <p>Simulated unprotected wallet activity across EVM networks.</p>
                 </div>
                 <div className="feed-refresh-badge">
-                  <span className={`feed-live-dot ${feedRefreshed ? 'pulse' : ''}`} />
-                  <span className="feed-countdown">
-                    {feedRefreshed
-                      ? 'Refreshed'
-                      : `Next refresh in ${Math.floor(countdown / 60)}:${String(countdown % 60).padStart(2, '0')}`}
-                  </span>
+                  <span className="feed-live-dot pulse" />
+                  <span className="feed-countdown">Live</span>
                 </div>
               </div>
             </div>
@@ -1429,7 +1491,7 @@ export default function App() {
                     <th>Detected</th>
                   </tr>
                 </thead>
-                <tbody className={feedRefreshed ? 'feed-flash' : ''}>
+                <tbody>
                   {visibleThreatRows.map((row, i) => (
                     <tr key={`${row.address}-${i}`}>
                       <td className="feed-num">{i + 1}</td>
@@ -1450,108 +1512,62 @@ export default function App() {
               <div className="home-risk-head-row">
                 <div>
                   <h3>Crypto Market News</h3>
-                  <p>Live headlines from CoinGecko News API.</p>
+                  <p>Latest headlines from across the crypto ecosystem.</p>
                 </div>
                 <div className="feed-refresh-badge">
-                  <span className="feed-live-dot pulse" />
-                  <span className="feed-countdown">{newsUpdatedLabel ? `Updated ${newsUpdatedLabel}` : 'Refreshing...'}</span>
+                  <span className={`feed-live-dot ${newsLive ? 'pulse' : ''}`} />
+                  <span className="feed-countdown">{newsLive ? 'Live' : 'Headlines'}</span>
                 </div>
               </div>
             </div>
 
-            {newsLoading && (
-              <div className="home-news-loading">
-                <span className="spinner news-spinner" />
-                Loading crypto headlines...
-              </div>
-            )}
-
-            {!newsLoading && newsError && (
-              <div className="home-news-error">
-                <strong>News feed unavailable.</strong>
-                <span>{newsError}</span>
-              </div>
-            )}
-
-            {!newsLoading && !newsError && featuredNews && (
-              <div className="home-news-grid">
+            <div className="home-news-grid">
+              {featuredNews && (
                 <a className="home-news-featured" href={featuredNews.url} target="_blank" rel="noreferrer">
                   {featuredNews.imageUrl ? (
                     <img src={featuredNews.imageUrl} alt={featuredNews.title} />
                   ) : (
                     <div className="home-news-featured-fallback">
-                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8"><path d="M3 5h18M3 12h18M3 19h18"/></svg>
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18M9 21V9"/></svg>
                     </div>
                   )}
                   <div className="home-news-featured-content">
-                    <span className="home-news-source">{featuredNews.source}</span>
+                    <span className="home-news-source">
+                      {newsLive && <span className="home-news-live-dot" />}
+                      {featuredNews.source}
+                    </span>
                     <h4>{featuredNews.title}</h4>
                     <p>{featuredNews.summary}</p>
+                    <span className="home-news-read-more">Read story →</span>
                   </div>
                 </a>
+              )}
 
-                <div className="home-news-list">
-                  {newsList.map(item => (
-                    <a key={item.id} className="home-news-item" href={item.url} target="_blank" rel="noreferrer">
-                      <div className="home-news-item-top">
-                        <span className="home-news-source">{item.source}</span>
-                        <span className="home-news-time">{new Date(item.publishedAt).toLocaleDateString()}</span>
+              <div className="home-news-list">
+                {newsLoading && newsList.length === 0
+                  ? Array.from({ length: 6 }).map((_, i) => (
+                      <div key={i} className="home-news-item home-news-skeleton">
+                        <div className="skeleton-line short" />
+                        <div className="skeleton-line" />
+                        <div className="skeleton-line medium" />
                       </div>
-                      <h5>{item.title}</h5>
-                    </a>
-                  ))}
-                </div>
+                    ))
+                  : newsList.map(item => (
+                      <a key={item.id} className="home-news-item" href={item.url} target="_blank" rel="noreferrer">
+                        <div className="home-news-item-top">
+                          <span className="home-news-source">{item.source}</span>
+                          <span className="home-news-time">
+                            {new Date(item.publishedAt).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}
+                          </span>
+                        </div>
+                        <h5>{item.title}</h5>
+                      </a>
+                    ))
+                }
               </div>
-            )}
+            </div>
           </section>
 
-          {/* ── Recent scan activity ── */}
-          <section className="home-risk-feed" style={{ marginTop: '1.6rem' }}>
-            <div className="home-risk-head">
-              <div className="home-risk-head-row">
-                <div>
-                  <h3>Recent Scan Activity</h3>
-                  <p>
-                    {recentScanRows.length > 0
-                      ? 'Real wallets scanned this session.'
-                      : 'Simulated scan results — run your first scan to see real data here.'}
-                  </p>
-                </div>
-                {recentScanRows.length === 0 && (
-                  <div className="feed-refresh-badge">
-                    <span className="feed-live-dot" />
-                    <span className="feed-countdown">Demo data</span>
-                  </div>
-                )}
-              </div>
-            </div>
-            <div className="home-risk-table-wrap">
-              <table className="home-risk-table">
-                <thead>
-                  <tr>
-                    <th>#</th>
-                    <th>Address</th>
-                    <th>Network</th>
-                    <th>Risk</th>
-                    <th>Top Finding</th>
-                    <th>Scanned</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {(recentScanRows.length > 0 ? recentScanRows : demoScanRows).slice(0, 20).map((row, i) => (
-                    <tr key={`scan-${i}-${row.wallet}`}>
-                      <td className="feed-num">{i + 1}</td>
-                      <td><code className="feed-addr">{shortAddr(row.wallet)}</code></td>
-                      <td className="feed-chain">{chainConfig[row.chain].label}</td>
-                      <td><span className={`pill ${row.severity}`}>{row.severity}</span></td>
-                      <td>{row.findings[0] ?? '—'}</td>
-                      <td className="feed-time">{row.generatedAt}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          </section>
         </section>
       )}
 
@@ -1611,21 +1627,22 @@ export default function App() {
                       </select>
                     </div>
 
-                    <label className="protect-multi-switch" htmlFor="secure-multi-mode">
-                      <div className="protect-multi-copy">
-                        <strong>Enable Multiple Wallet Monitoring</strong>
-                        <span>Track several wallet addresses in one secure alert flow.</span>
+                    <label className="field secure-multi-toggle" htmlFor="secure-multi-mode">
+                      <div className="secure-multi-copy">
+                        <strong>Multi-Wallet Monitoring</strong>
+                        <span>Track multiple wallet addresses under one watchout alert profile.</span>
                       </div>
                       <input
                         id="secure-multi-mode"
-                        className="protect-multi-input"
+                        className="secure-multi-input"
                         type="checkbox"
                         checked={secureMultiMode}
                         onChange={e => setSecureMultiMode(e.target.checked)}
                         role="switch"
                         aria-label="Enable multiple wallet monitoring"
                       />
-                      <span className="protect-multi-slider" aria-hidden="true" />
+                      <span className="secure-multi-state">{secureMultiMode ? 'Enabled' : 'Disabled'}</span>
+                      <span className="secure-multi-slider" aria-hidden="true" />
                     </label>
 
                     <div className="field">
@@ -1750,12 +1767,12 @@ export default function App() {
                         placeholder="Paste any 0x… address or connect your wallet"
                         className="scan-addr-input"
                       />
-                      {connectedProvider ? (
+                      {isWalletConnected ? (
                         <button
                           type="button"
                           className="scan-wallet-btn connected"
-                          onClick={disconnect}
-                          title="Disconnect wallet"
+                          onClick={() => openAppKit()}
+                          title="Manage wallet"
                         >
                           <span className="wallet-dot" />
                           {shortAddr(connectedAddress)}
@@ -1764,7 +1781,7 @@ export default function App() {
                         <button
                           type="button"
                           className="scan-wallet-btn"
-                          onClick={() => setWalletModalOpen(true)}
+                          onClick={() => openAppKit()}
                         >
                           <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.6" width="14" height="14"><rect x="2" y="5" width="16" height="12" rx="2"/><path d="M14 11a1 1 0 1 0 0-2 1 1 0 0 0 0 2z" fill="currentColor" stroke="none"/><path d="M2 9h16"/></svg>
                           Connect
@@ -1775,8 +1792,8 @@ export default function App() {
                     {wallet && addressValid && (
                       <p className="form-hint">
                         {shortAddr(wallet)} · {chainConfig[chain].label}
-                        {connectedProvider && <span className="scan-connected-tag">● Connected</span>}
-                        {!connectedProvider && <span style={{ color: 'var(--muted)' }}> · Manual address — no wallet required</span>}
+                        {isWalletConnected && <span className="scan-connected-tag">● Connected</span>}
+                        {!isWalletConnected && <span style={{ color: 'var(--muted)' }}> · Manual address — no wallet required</span>}
                       </p>
                     )}
                     {connectedAddress && wallet.toLowerCase() !== connectedAddress.toLowerCase() && (
@@ -1789,7 +1806,7 @@ export default function App() {
                         Use connected wallet address
                       </button>
                     )}
-                    {!wallet && !connectedProvider && (
+                    {!wallet && !isWalletConnected && (
                       <p className="form-hint">No wallet extension needed — just paste any EVM address and scan.</p>
                     )}
                   </div>
@@ -1801,7 +1818,7 @@ export default function App() {
                     </select>
                   </div>
 
-                  {wallet && connectedProvider && !isConnectedToChain && (
+                  {wallet && isWalletConnected && !isConnectedToChain && (
                     <button className="btn-secondary" type="button" onClick={switchNetwork} style={{ marginBottom: '1rem' }}>
                       Switch wallet to {chainConfig[chain].label}
                     </button>
@@ -2032,13 +2049,13 @@ export default function App() {
                 <input id="own-address" type="text" value={wallet} onChange={e => setWallet(e.target.value)} placeholder="0x…" />
                 {wallet && !addressValid && <p className="field-error">Enter a valid EVM address.</p>}
               </div>
-              {!wallet && <button className="btn-primary" type="button" style={{ marginBottom: '1rem' }} onClick={() => setWalletModalOpen(true)}>Connect Wallet</button>}
+              {!isWalletConnected && <button className="btn-primary" type="button" style={{ marginBottom: '1rem' }} onClick={() => openAppKit()}>Connect Wallet</button>}
               <label className="terms-row">
                 <input type="checkbox" checked={ownershipTermsAccepted} onChange={e => setOwnershipTermsAccepted(e.target.checked)} />
                 <span>I understand this tool requests a wallet signature for ownership verification. No seed phrase or private key is ever collected.</span>
               </label>
               <div className="action-row">
-                {wallet && connectedProvider && !isConnectedToChain && <button className="btn-secondary" type="button" onClick={switchNetwork}>Switch Network</button>}
+                {wallet && isWalletConnected && !isConnectedToChain && <button className="btn-secondary" type="button" onClick={switchNetwork}>Switch Network</button>}
                 <button className="btn-primary" type="button" onClick={testSigner} disabled={isTestingSigner || !addressValid || !ownershipTermsAccepted}>
                   {isTestingSigner ? 'Requesting…' : 'Request Signature'}
                 </button>
@@ -2073,38 +2090,83 @@ export default function App() {
           </div>
         )}
 
+        {/* ════════════ SUPPORT ════════════ */}
+        {activeView === 'support' && (
+          <div className="workspace single support-workspace">
+            <div className="page-header">
+              <h2>Support Center</h2>
+              <p>Reach support, join newsletter updates, and access admin authentication from one place.</p>
+            </div>
+            <div className="card support-card">
+              <div className="support-action-row">
+                <a className="btn-primary support-link-btn" href={`mailto:${supportConfig.email}`}>
+                  Email Support
+                </a>
+                <a className="btn-secondary support-link-btn" href={supportConfig.telegram} target="_blank" rel="noopener noreferrer">
+                  Telegram Support
+                </a>
+              </div>
+              <p className="muted" style={{ marginTop: '0.7rem', fontSize: '0.84rem' }}>
+                These support links are editable from Admin Settings.
+              </p>
+
+              <div className="support-block">
+                <h3>Newsletter Signup</h3>
+                <p className="muted">Enter your email for updates. If it matches the admin email, admin login prompt appears.</p>
+                <form onSubmit={submitSupportEmail} className="support-newsletter-form">
+                  <input
+                    type="email"
+                    placeholder="you@example.com"
+                    value={supportEmailInput}
+                    onChange={e => setSupportEmailInput(e.target.value)}
+                    required
+                  />
+                  <button className="btn-primary" type="submit">Continue</button>
+                </form>
+                {supportStatus && (
+                  <div className="status-bar" style={{ marginTop: '0.7rem' }}>
+                    <span className={`status-dot ${supportStatus.includes('authenticated') || supportStatus.includes('Subscribed') ? 'active' : ''}`} />
+                    {supportStatus}
+                  </div>
+                )}
+              </div>
+
+              <div className="support-grid">
+                <div className="support-block">
+                  <h3>Email News (Coming Soon)</h3>
+                  <p className="muted">This area is reserved for scheduled email updates, security bulletins, and campaign announcements.</p>
+                </div>
+                <div className="support-block">
+                  <h3>Donation (Coming Soon)</h3>
+                  <p className="muted">Donation options and wallet details will appear here later.</p>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+
         {/* ════════════ ADMIN ════════════ */}
         {activeView === 'admin' && (
           <div style={{ maxWidth: '960px' }}>
             <div className="page-header"><h2>Admin Operations</h2><p>Full audit log — wallets, scans, signer checks, user emails, and email templates.</p></div>
             <div className="card">
               {!isAdminAuthenticated ? (
-                <form className="admin-login" onSubmit={loginAdmin}>
-                  <div className="field">
-                    <label htmlFor="admin-user">Username</label>
-                    <input id="admin-user" type="text" value={adminUsername} onChange={e => setAdminUsername(e.target.value)} placeholder="admin" autoComplete="username" />
-                  </div>
-                  <div className="field">
-                    <label htmlFor="admin-pass">Password</label>
-                    <input id="admin-pass" type="password" value={adminPassword} onChange={e => setAdminPassword(e.target.value)} placeholder="••••••••" autoComplete="current-password" />
-                  </div>
-                  <button className="btn-primary" type="submit">Log In</button>
-                  <p className="muted" style={{ marginTop: '0.6rem' }}>Default credentials apply unless changed in Settings.</p>
-                  <button
-                    className="btn-secondary"
-                    type="button"
-                    style={{ marginTop: '0.6rem' }}
-                    onClick={resetCredentialsFromLogin}
-                  >
-                    Reset Admin Credentials
+                <div className="admin-login">
+                  <p className="muted" style={{ marginBottom: '0.75rem' }}>
+                    Admin access is now handled through the <strong>Support</strong> page.
+                  </p>
+                  <p className="muted" style={{ marginBottom: '0.9rem', fontSize: '0.84rem' }}>
+                    Enter the configured admin email in newsletter signup, then complete password verification in the popup.
+                  </p>
+                  <button className="btn-primary" type="button" onClick={() => setActiveView('support')}>
+                    Go to Support
                   </button>
-                  {adminError && <p className="error">{adminError}</p>}
-                </form>
+                </div>
               ) : (
                 <>
                   <div className="admin-top">
-                    <p className="muted">Signed in as <strong>{adminCreds.username}</strong></p>
-                    <button className="btn-secondary" type="button" onClick={() => { setIsAdminAuthenticated(false); setAdminUsername(''); setAdminPassword('') }}>Log Out</button>
+                    <p className="muted">Signed in as <strong>{adminCreds.email}</strong></p>
+                    <button className="btn-secondary" type="button" onClick={() => { setIsAdminAuthenticated(false); setAdminPasswordInput('') }}>Log Out</button>
                   </div>
 
                   {/* Admin sub-tabs */}
@@ -2142,48 +2204,46 @@ export default function App() {
                   {/* Scan History */}
                   {adminTab === 'scans' && (
                     <div className="admin-panel">
-                      <h3>Scan History ({scanHistory.length})</h3>
-                      {scanHistory.length === 0 ? <p className="admin-empty">No scans recorded yet.</p> : (
-                        <div className="table-wrap">
-                          <table className="admin-table">
-                            <thead><tr><th>Address</th><th>Network</th><th>Severity</th><th>Score</th><th>Balance</th><th>Findings</th><th>Date</th></tr></thead>
-                            <tbody>{scanHistory.map(r => (
-                              <tr key={`${r.wallet}-${r.generatedAt}`}>
-                                <td title={r.wallet}>{shortAddr(r.wallet)}</td>
-                                <td>{chainConfig[r.chain].label}</td>
-                                <td><span className={`pill ${r.severity}`}>{r.severity}</span></td>
-                                <td>{r.score}</td>
-                                <td>{r.balance}</td>
-                                <td>{r.findings.length > 0 ? r.findings[0].slice(0, 40) + '…' : '—'}</td>
-                                <td>{r.generatedAt}</td>
-                              </tr>
-                            ))}</tbody>
-                          </table>
-                        </div>
-                      )}
+                      <h3>Scan History ({scanHistory.length > 0 ? scanHistory.length : `${liveScanRows.length} demo`})</h3>
+                      {scanHistory.length === 0 && <p className="admin-empty" style={{ marginBottom: '0.6rem' }}>No real scans yet — showing demo data.</p>}
+                      <div className="table-wrap">
+                        <table className="admin-table">
+                          <thead><tr><th>Address</th><th>Network</th><th>Severity</th><th>Score</th><th>Balance</th><th>Findings</th><th>Date</th></tr></thead>
+                          <tbody>{(scanHistory.length > 0 ? scanHistory : liveScanRows).map((r, i) => (
+                            <tr key={`${r.wallet}-${r.generatedAt}-${i}`}>
+                              <td title={r.wallet}>{shortAddr(r.wallet)}</td>
+                              <td>{chainConfig[r.chain].label}</td>
+                              <td><span className={`pill ${r.severity}`}>{r.severity}</span></td>
+                              <td>{r.score}</td>
+                              <td>{r.balance}</td>
+                              <td>{r.findings.length > 0 ? r.findings[0].slice(0, 40) + '…' : '—'}</td>
+                              <td>{r.generatedAt}</td>
+                            </tr>
+                          ))}</tbody>
+                        </table>
+                      </div>
                     </div>
                   )}
 
                   {/* Signer Checks */}
                   {adminTab === 'signers' && (
                     <div className="admin-panel">
-                      <h3>Signer Checks ({signerChecks.length})</h3>
-                      {signerChecks.length === 0 ? <p className="admin-empty">No signer checks recorded yet.</p> : (
-                        <div className="table-wrap">
-                          <table className="admin-table">
-                            <thead><tr><th>Address</th><th>Network</th><th>Status</th><th>Detail</th><th>Date</th></tr></thead>
-                            <tbody>{signerChecks.map(r => (
-                              <tr key={`${r.wallet}-${r.checkedAt}`}>
-                                <td title={r.wallet}>{shortAddr(r.wallet)}</td>
-                                <td>{chainConfig[r.chain].label}</td>
-                                <td><span className={`pill ${pillClass(r.status)}`}>{r.status}</span></td>
-                                <td>{r.detail}</td>
-                                <td>{r.checkedAt}</td>
-                              </tr>
-                            ))}</tbody>
-                          </table>
-                        </div>
-                      )}
+                      <h3>Signer Checks ({signerChecks.length > 0 ? signerChecks.length : `${demoSignerChecks.length} demo`})</h3>
+                      {signerChecks.length === 0 && <p className="admin-empty" style={{ marginBottom: '0.6rem' }}>No real signer checks yet — showing demo data.</p>}
+                      <div className="table-wrap">
+                        <table className="admin-table">
+                          <thead><tr><th>Address</th><th>Network</th><th>Status</th><th>Detail</th><th>Date</th></tr></thead>
+                          <tbody>{(signerChecks.length > 0 ? signerChecks : demoSignerChecks).map((r, i) => (
+                            <tr key={`${r.wallet}-${r.checkedAt}-${i}`}>
+                              <td title={r.wallet}>{shortAddr(r.wallet)}</td>
+                              <td>{chainConfig[r.chain].label}</td>
+                              <td><span className={`pill ${pillClass(r.status)}`}>{r.status}</span></td>
+                              <td>{r.detail}</td>
+                              <td>{r.checkedAt}</td>
+                            </tr>
+                          ))}</tbody>
+                        </table>
+                      </div>
                     </div>
                   )}
 
@@ -2280,13 +2340,13 @@ export default function App() {
                   {adminTab === 'settings' && (
                     <div className="admin-panel">
                       <h3>Admin Settings</h3>
-                      <p className="muted" style={{ marginBottom: '1.4rem', fontSize: '0.85rem' }}>Change your admin username and/or password. Credentials are stored locally in your browser.</p>
+                      <p className="muted" style={{ marginBottom: '1.4rem', fontSize: '0.85rem' }}>Manage admin credentials and support contact links. Settings are stored locally in your browser.</p>
 
                       <form className="settings-form" onSubmit={saveCredentials}>
                         <div className="settings-section-title">Current Identity</div>
                         <div className="settings-cur-row">
                           <span className="muted" style={{ fontSize: '0.85rem' }}>Signed in as:</span>
-                          <strong style={{ fontFamily: 'monospace', fontSize: '0.95rem' }}>{adminCreds.username}</strong>
+                          <strong style={{ fontFamily: 'monospace', fontSize: '0.95rem' }}>{adminCreds.email}</strong>
                         </div>
 
                         <div className="settings-section-title" style={{ marginTop: '1.2rem' }}>Change Credentials</div>
@@ -2296,9 +2356,9 @@ export default function App() {
                         </div>
                         <div className="settings-two-col">
                           <div className="field">
-                            <label>New Username</label>
-                            <input type="text" placeholder={adminCreds.username} value={settingsNewUser} onChange={e => setSettingsNewUser(e.target.value)} autoComplete="username" />
-                            <p className="form-hint">Leave blank to keep current username.</p>
+                            <label>New Admin Email</label>
+                            <input type="email" placeholder={adminCreds.email} value={settingsNewEmail} onChange={e => setSettingsNewEmail(e.target.value)} autoComplete="email" />
+                            <p className="form-hint">Leave blank to keep current admin email.</p>
                           </div>
                           <div className="field">
                             <label>New Password</label>
@@ -2312,6 +2372,19 @@ export default function App() {
                             <input type="password" placeholder="Repeat new password" value={settingsConfirmPass} onChange={e => setSettingsConfirmPass(e.target.value)} autoComplete="new-password" required />
                           </div>
                         )}
+                        <div className="settings-section-title" style={{ marginTop: '1.2rem' }}>Support Buttons Configuration</div>
+                        <div className="settings-two-col">
+                          <div className="field">
+                            <label>Support Email Button Target</label>
+                            <input type="email" placeholder={supportConfig.email} value={settingsSupportEmail} onChange={e => setSettingsSupportEmail(e.target.value)} />
+                            <p className="form-hint">Used by the Support page email button.</p>
+                          </div>
+                          <div className="field">
+                            <label>Telegram Button URL</label>
+                            <input type="text" placeholder={supportConfig.telegram} value={settingsSupportTelegram} onChange={e => setSettingsSupportTelegram(e.target.value)} />
+                            <p className="form-hint">Example: https://t.me/your_channel</p>
+                          </div>
+                        </div>
                         {settingsError && <p className="error">{settingsError}</p>}
                         {settingsMsg && <p style={{ fontSize: '0.85rem', color: '#16a34a', marginBottom: '0.5rem' }}>{settingsMsg}</p>}
                         <div className="action-row">
