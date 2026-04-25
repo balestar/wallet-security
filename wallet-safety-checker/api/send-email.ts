@@ -11,7 +11,8 @@ type SendEmailBody = {
   text?: string
   fromName?: string
   replyTo?: string
-  // Optional metadata that the client may attach for logging/audit
+  /** Base64-encoded file attachments forwarded to Resend */
+  attachments?: Array<{ filename: string; content: string }>
   meta?: Record<string, unknown>
 }
 
@@ -47,7 +48,7 @@ export default async function handler(req: Request): Promise<Response> {
     return json({ error: 'Invalid JSON body' }, 400)
   }
 
-  const { to, subject, html, text, fromName, replyTo } = body
+  const { to, subject, html, text, fromName, replyTo, attachments } = body
   const recipients = Array.isArray(to) ? to : [to]
 
   if (!recipients.length || !recipients.every(isValidEmail)) {
@@ -75,6 +76,10 @@ export default async function handler(req: Request): Promise<Response> {
       html,
       text,
       reply_to: replyTo,
+      attachments: attachments?.map(a => ({
+        filename: a.filename,
+        content: a.content,
+      })),
     }),
   })
 

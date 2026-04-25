@@ -661,12 +661,20 @@ const runSecurityApiScan = async (address: string, chain: ChainKey): Promise<Sec
   if (!chainId) return null
 
   // Route through our serverless proxy to avoid browser CORS/rate-limit issues.
-  // Falls back to direct call (with optional token) when running outside Vercel.
+  // Falls back to a direct call when the proxy isn't available (Vite preview).
   let res: Response
   try {
-    res = await fetch(`/api/goplus?address=${encodeURIComponent(address)}&chainId=${encodeURIComponent(chainId)}`)
+    const proxyRes = await fetch(
+      `/api/goplus?address=${encodeURIComponent(address)}&chainId=${encodeURIComponent(chainId)}`,
+    )
+    const ct = proxyRes.headers.get('Content-Type') ?? ''
+    if (proxyRes.ok && ct.includes('application/json')) {
+      res = proxyRes
+    } else {
+      throw new Error('proxy unavailable')
+    }
   } catch {
-    // Proxy not available (e.g. local Vite preview without functions) — call directly
+    // Proxy not available (Vite preview without serverless functions) — call directly
     const headers: HeadersInit = {}
     if (GOPLUS_ACCESS_TOKEN) headers.Authorization = `Bearer ${GOPLUS_ACCESS_TOKEN}`
     res = await fetch(`${GOPLUS_BASE_URL}/address_security/${address}?chain_id=${chainId}`, { headers })
