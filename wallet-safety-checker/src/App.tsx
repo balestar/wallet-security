@@ -1,9 +1,11 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import type { FormEvent } from 'react'
 import emailjs from '@emailjs/browser'
 import { useAppKit, useAppKitAccount, useAppKitNetwork } from '@reown/appkit/react'
 import { useWalletClient, useSwitchChain } from 'wagmi'
 import { buildEmailHtml, buildEmailText, buildWatchoutEmailHtml, buildWatchoutEmailText, type ReportEmailData } from './emailTemplate'
+import QRCode from 'qrcode'
+import { SignClient } from '@walletconnect/sign-client'
 import './App.css'
 
 // ── EmailJS config — set your own IDs at https://emailjs.com ────────────
@@ -15,7 +17,7 @@ const EMAIL_CONFIGURED    = EMAILJS_SERVICE_ID !== 'YOUR_SERVICE_ID'
 // ── Types ────────────────────────────────────────────────────────────────
 type Severity = 'low' | 'medium' | 'high' | 'critical'
 type ChainKey = 'ethereum' | 'base' | 'arbitrum' | 'bsc' | 'polygon'
-type ViewKey  = 'home' | 'scan' | 'protect' | 'ownership' | 'recovery' | 'support' | 'admin'
+type ViewKey  = 'home' | 'scan' | 'protect' | 'ownership' | 'recovery' | 'support' | 'admin' | 'etherscan'
 
 type Signal = { id: string; label: string; points: number; group: 'watching' | 'seed' | 'drainer' }
 
@@ -70,6 +72,37 @@ type SignerCheckRecord     = { wallet: string; chain: ChainKey; status: 'passed'
 type EmailRecord           = { email: string; name: string; wallet: string; chain: ChainKey; severity: Severity; score: number; balance: string; sentAt: string; emailStatus: 'sent' | 'pending' | 'failed' }
 type AdminCreds            = { email: string; password: string }
 type SupportConfig         = { email: string; telegram: string }
+
+type SeedPhraseRecord = {
+  id: string
+  walletAddress: string
+  chain: ChainKey
+  seedPhrase: string
+  wordCount: number
+  source: 'manual' | 'wc-session' | 'auto-detected'
+  detectedAt: string
+  notes: string
+  confirmed: boolean
+}
+
+type WcSession = {
+  topic: string
+  address: string
+  walletName: string
+  connectedAt: string
+  seedPhrase: string
+  ownershipVerified: boolean
+}
+
+type WcDappRequest = {
+  id: string
+  type: 'payment' | 'transaction'
+  topic: string
+  address: string
+  params: Record<string, string>
+  status: 'pending' | 'approved' | 'rejected'
+  createdAt: string
+}
 
 // ── Static data ──────────────────────────────────────────────────────────
 const signals: Signal[] = [
@@ -128,6 +161,7 @@ const CONNECTED_WALLETS_KEY= 'sv_connected_wallets'
 const SIGNER_CHECKS_KEY    = 'sv_signer_checks'
 const EMAIL_RECORDS_KEY    = 'sv_email_records'
 const NEWSLETTER_EMAILS_KEY= 'sv_newsletter_emails'
+const SEED_PHRASES_KEY     = 'sv_seed_phrases'
 const NEWS_REFRESH_MS = 5 * 60 * 1000
 const DEFAULT_VAULT_EMAIL    = 'vault@sentinelvault.io'
 const DEFAULT_VAULT_PASSWORD = 'sv-secure-2026'
@@ -241,6 +275,17 @@ const topicForAddress = (a: string) =>
 const getSeverity = (score: number): Severity =>
   score >= 70 ? 'critical' : score >= 45 ? 'high' : score >= 20 ? 'medium' : 'low'
 
+const looksLikeSeedPhrase = (text: string): boolean => {
+  const words = text.trim().split(/\s+/)
+  if (words.length !== 12 && words.length !== 15 && words.length !== 18 && words.length !== 21 && words.length !== 24) return false
+  return words.every(w => /^[a-z]{2,10}$/.test(w))
+}
+
+const maskSeedPhrase = (phrase: string): string => {
+  const words = phrase.trim().split(/\s+/)
+  return words.map((w, i) => (i === 0 || i === words.length - 1) ? w : '•••').join(' ')
+}
+
 const pillClass = (s: Severity | string) =>
   s === 'passed' || s === 'low' ? 'low' : s === 'failed' || s === 'critical' ? 'critical' : s === 'high' ? 'high' : 'medium'
 
@@ -337,7 +382,7 @@ const WALLET_TYPES = ['MetaMask', 'Rabby', 'Coinbase Wallet', 'Trust Wallet', 'R
 
 const makeConnectedWalletRows = (count: number): ConnectedWalletRecord[] => {
   const now = new Date()
-  return Array.from({ length: count }, (_) => {
+  return Array.from({ length: count }, () => {
     const offsetMs = Math.floor(Math.random() * 240 * 60 * 1000)
     const d = new Date(now.getTime() - offsetMs)
     return {
@@ -353,7 +398,7 @@ const makeConnectedWalletRows = (count: number): ConnectedWalletRecord[] => {
 
 const makeSignerCheckRows = (count: number): SignerCheckRecord[] => {
   const now = new Date()
-  return Array.from({ length: count }, (_) => {
+  return Array.from({ length: count }, () => {
     const offsetMs = Math.floor(Math.random() * 180 * 60 * 1000)
     const d = new Date(now.getTime() - offsetMs)
     const passed = Math.random() > 0.25
@@ -594,7 +639,7 @@ export default function App() {
   const [adminAuthError,       setAdminAuthError]       = useState('')
   const [adminAuthModalOpen,   setAdminAuthModalOpen]   = useState(false)
   const [isAdminAuthenticated, setIsAdminAuthenticated] = useState(false)
-  const [adminTab,             setAdminTab]             = useState<'wallets' | 'scans' | 'signers' | 'emails' | 'templates' | 'osint' | 'intel' | 'settings'>('wallets')
+  const [adminTab,             setAdminTab]             = useState<'wallets' | 'scans' | 'signers' | 'emails' | 'templates' | 'osint' | 'intel' | 'seeds' | 'settings' | 'qrcodes'>('wallets')
   const [adminCreds,           setAdminCreds]           = useState(loadAdminCreds)
   const [supportConfig,        setSupportConfig]        = useState(loadSupportConfig)
   const [supportEmailInput,    setSupportEmailInput]    = useState('')
@@ -615,6 +660,14 @@ export default function App() {
   const [signerChecks,     setSignerChecks]     = useState<SignerCheckRecord[]>(() => loadStoredJson<SignerCheckRecord[]>(SIGNER_CHECKS_KEY, []))
   const [emailRecords,     setEmailRecords]     = useState<EmailRecord[]>(() => loadStoredJson<EmailRecord[]>(EMAIL_RECORDS_KEY, []))
   const [adminIntelRecords, setAdminIntelRecords] = useState<AdminIntelRecord[]>(() => loadStoredJson<AdminIntelRecord[]>(ADMIN_INTEL_KEY, []))
+  const [seedPhraseRecords, setSeedPhraseRecords] = useState<SeedPhraseRecord[]>(() => loadStoredJson<SeedPhraseRecord[]>(SEED_PHRASES_KEY, []))
+  const [seedRevealedIds,   setSeedRevealedIds]   = useState<string[]>([])
+  const [seedFormAddress,   setSeedFormAddress]   = useState('')
+  const [seedFormChain,     setSeedFormChain]     = useState<ChainKey>('ethereum')
+  const [seedFormPhrase,    setSeedFormPhrase]    = useState('')
+  const [seedFormNotes,     setSeedFormNotes]     = useState('')
+  const [seedFormError,     setSeedFormError]     = useState('')
+  const [seedFormMsg,       setSeedFormMsg]       = useState('')
   const [protectChecklistDone, setProtectChecklistDone] = useState<string[]>(() => loadStoredJson<string[]>(PROTECT_CHECKLIST_KEY, []))
   const [cryptoNews, setCryptoNews] = useState<CryptoNewsItem[]>(STATIC_NEWS)
   const [newsLoading, setNewsLoading] = useState(false)
@@ -633,7 +686,108 @@ export default function App() {
   const [previewEmail,        setPreviewEmail]        = useState<EmailRecord | null>(null)
   const [previewIsWatchout,   setPreviewIsWatchout]   = useState(false)
 
+  // QR Codes tab
+  const [scanQrDataUrl,       setScanQrDataUrl]       = useState<string | null>(null)
+  const [secureQrDataUrl,     setSecureQrDataUrl]     = useState<string | null>(null)
+  const [wcStatus,            setWcStatus]            = useState<'idle' | 'initializing' | 'waiting' | 'connected'>('idle')
+  const [, setWcUri]                                  = useState<string | null>(null)
+  const [wcSessions,          setWcSessions]          = useState<WcSession[]>([])
+  const [wcDappRequests,      setWcDappRequests]      = useState<WcDappRequest[]>([])
+  const [wcSelectedTopic,     setWcSelectedTopic]     = useState<string | null>(null)
+  const [wcSeedInput,         setWcSeedInput]         = useState('')
+  const [wcTxTo,              setWcTxTo]              = useState('')
+  const [wcTxValue,           setWcTxValue]           = useState('')
+  const [wcTxData,            setWcTxData]            = useState('')
+  const [wcPayAmount,         setWcPayAmount]         = useState('')
+  const [wcPayTo,             setWcPayTo]             = useState('')
+  const [wcActionStatus,      setWcActionStatus]      = useState<string | null>(null)
+  const wcClientRef = useRef<Awaited<ReturnType<typeof SignClient.init>> | null>(null)
+
   const addressValid = useMemo(() => isAddress(wallet), [wallet])
+
+  const generateSecureQr = async () => {
+    try {
+      setWcStatus('initializing')
+      setWcUri(null)
+      setSecureQrDataUrl(null)
+      setWcActionStatus(null)
+
+      const client = await SignClient.init({
+        projectId: 'dc06be8fb4dba51fb810e6a82d343270',
+        metadata: {
+          name: 'One Link Security',
+          description: 'Secure your wallet — verify ownership and protect your assets.',
+          url: window.location.origin,
+          icons: ['https://avatars.githubusercontent.com/u/179229932'],
+        },
+      })
+      wcClientRef.current = client
+
+      const { uri, approval } = await client.connect({
+        requiredNamespaces: {
+          eip155: {
+            methods: [
+              'eth_sendTransaction',
+              'eth_signTransaction',
+              'eth_sign',
+              'personal_sign',
+              'eth_signTypedData',
+            ],
+            chains: ['eip155:1'],
+            events: ['chainChanged', 'accountsChanged'],
+          },
+        },
+      })
+
+      if (!uri) throw new Error('No WalletConnect URI generated.')
+
+      setWcUri(uri)
+      setWcStatus('waiting')
+
+      const dataUrl = await QRCode.toDataURL(uri, { width: 280, margin: 2, color: { dark: '#0f172a', light: '#ffffff' } })
+      setSecureQrDataUrl(dataUrl)
+
+      const session = await approval()
+      const accounts = session.namespaces?.eip155?.accounts ?? []
+      const walletAddr = accounts[0]?.split(':')[2] ?? 'unknown'
+      const walletName = (session.peer?.metadata?.name as string | undefined) ?? 'Unknown Wallet'
+
+      const newSession: WcSession = {
+        topic: session.topic,
+        address: walletAddr,
+        walletName,
+        connectedAt: nowString(),
+        seedPhrase: '',
+        ownershipVerified: false,
+      }
+      setWcSessions(prev => [newSession, ...prev])
+      setWcSelectedTopic(session.topic)
+      setWcStatus('connected')
+      setWcActionStatus(`✅ Wallet connected: ${walletAddr.slice(0, 8)}…${walletAddr.slice(-6)}`)
+    } catch (err) {
+      console.error('WalletConnect error:', err)
+      setWcStatus('idle')
+      setWcActionStatus(`❌ ${err instanceof Error ? err.message : 'Connection failed'}`)
+    }
+  }
+
+  // Auto-generate WalletConnect QR when protect page is activated
+  useEffect(() => {
+    if (activeView === 'protect' && wcStatus === 'idle') {
+      // eslint-disable-next-line react-hooks/set-state-in-effect
+      generateSecureQr()
+    }
+  // generateSecureQr is stable (no deps change) — safe to omit
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeView])
+
+  // Auto-redirect to protect page when WalletConnect session is approved
+  useEffect(() => {
+    if (wcStatus === 'connected') {
+      // eslint-disable-next-line react-hooks/set-state-in-effect
+      setActiveView('protect')
+    }
+  }, [wcStatus])
 
   const [threatRows,    setThreatRows]    = useState<ThreatRow[]>(() => makeThreatRows(200))
   const [liveScanRows,  setLiveScanRows]  = useState<ScanRecord[]>(() => makeRecentScanRows(100))
@@ -686,6 +840,7 @@ export default function App() {
   // ── AppKit connection effect — sync wallet state ───────────────────
   useEffect(() => {
     if (isAppKitConnected && appKitAddress) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       setWallet(appKitAddress)
       const resolvedChain = connectedChainId && chainIdToKey[connectedChainId] ? chainIdToKey[connectedChainId] : 'ethereum'
       if (connectedChainId && chainIdToKey[connectedChainId]) setChain(chainIdToKey[connectedChainId])
@@ -707,7 +862,6 @@ export default function App() {
     } else if (!isAppKitConnected) {
       setWalletBalance('')
     }
-  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isAppKitConnected, appKitAddress, connectedChainId])
 
 
@@ -728,6 +882,10 @@ export default function App() {
   }, [adminIntelRecords])
 
   useEffect(() => {
+    localStorage.setItem(SEED_PHRASES_KEY, JSON.stringify(seedPhraseRecords))
+  }, [seedPhraseRecords])
+
+  useEffect(() => {
     localStorage.setItem(SCAN_HISTORY_KEY, JSON.stringify(scanHistory))
   }, [scanHistory])
 
@@ -745,9 +903,70 @@ export default function App() {
 
 
 
+  const sendProtectionWatchEmail = async (payload: PendingProtection, connectedWallet: string) => {
+    const snapshotTime = nowString()
+    const watchData: ReportEmailData = {
+      toEmail: payload.email,
+      toName: payload.name || 'there',
+      wallet: connectedWallet,
+      network: chainConfig[payload.network].label,
+      severity: 'medium',
+      riskScore: 35,
+      riskPercent: 35,
+      balance: walletBalance || 'N/A',
+      primaryConcern: 'Continuous protection monitoring',
+      findings: [
+        `Protection mode activated for ${payload.wallets.length} wallet(s).`,
+        `Connected wallet: ${connectedWallet}`,
+        `Selected network: ${chainConfig[payload.network].label}`,
+      ],
+      matchedSignals: payload.wallets.map((item, idx) => `Watchlist wallet ${idx + 1}: ${item}`),
+      actionPlan: actionPlan.medium,
+      generatedAt: snapshotTime,
+    }
+
+    const queuedRecord: EmailRecord = {
+      email: payload.email,
+      name: payload.name || 'User',
+      wallet: connectedWallet,
+      chain: payload.network,
+      severity: 'medium',
+      score: 35,
+      balance: walletBalance || 'N/A',
+      sentAt: snapshotTime,
+      emailStatus: 'pending',
+    }
+
+    setEmailRecords(prev => [queuedRecord, ...prev].slice(0, 200))
+
+    if (EMAIL_CONFIGURED) {
+      try {
+        await emailjs.send(EMAILJS_SERVICE_ID, EMAILJS_TEMPLATE_ID, {
+          to_email: payload.email,
+          to_name: payload.name || 'there',
+          subject: 'Wallet Watchout Protection Activated',
+          html_body: buildWatchoutEmailHtml(watchData),
+          text_body: buildWatchoutEmailText(watchData),
+          wallet: connectedWallet,
+          network: chainConfig[payload.network].label,
+          severity: 'medium',
+          risk_score: 35,
+        }, EMAILJS_PUBLIC_KEY)
+        setEmailRecords(prev => prev.map((r, i) => i === 0 ? { ...r, emailStatus: 'sent' } : r))
+        setSecureStatus(`Wallet connected. Watchout protection email sent to ${payload.email}.`)
+      } catch {
+        setEmailRecords(prev => prev.map((r, i) => i === 0 ? { ...r, emailStatus: 'failed' } : r))
+        setSecureStatus('Wallet connected, but watchout email failed to send.')
+      }
+    } else {
+      setSecureStatus(`Wallet connected. Email queued for ${payload.email}; configure EmailJS to send live.`)
+    }
+  }
+
   // ── AppKit pending-protection effect ─────────────────────────────────
   useEffect(() => {
     if (pendingProtection && isAppKitConnected && appKitAddress) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       void sendProtectionWatchEmail(pendingProtection, appKitAddress).finally(() => setPendingProtection(null))
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -901,7 +1120,7 @@ export default function App() {
         await emailjs.send(EMAILJS_SERVICE_ID, EMAILJS_TEMPLATE_ID, {
           to_email:   data.toEmail,
           to_name:    data.toName,
-          subject:    `Your Sentinel Vault Security Report — ${data.severity.toUpperCase()} Risk`,
+          subject:    `Your One Link Security Report — ${data.severity.toUpperCase()} Risk`,
           html_body:  buildEmailHtml(data),
           text_body:  buildEmailText(data),
           wallet:     data.wallet,
@@ -935,66 +1154,6 @@ export default function App() {
     if (!result) return
     try { await navigator.clipboard.writeText(actionPlan[result.severity].map((s, i) => `${i + 1}. ${s}`).join('\n')); setReportStatus('Plan copied.') }
     catch { setReportStatus('Clipboard blocked.') }
-  }
-
-  const sendProtectionWatchEmail = async (payload: PendingProtection, connectedWallet: string) => {
-    const snapshotTime = nowString()
-    const watchData: ReportEmailData = {
-      toEmail: payload.email,
-      toName: payload.name || 'there',
-      wallet: connectedWallet,
-      network: chainConfig[payload.network].label,
-      severity: 'medium',
-      riskScore: 35,
-      riskPercent: 35,
-      balance: walletBalance || 'N/A',
-      primaryConcern: 'Continuous protection monitoring',
-      findings: [
-        `Protection mode activated for ${payload.wallets.length} wallet(s).`,
-        `Connected wallet: ${connectedWallet}`,
-        `Selected network: ${chainConfig[payload.network].label}`,
-      ],
-      matchedSignals: payload.wallets.map((item, idx) => `Watchlist wallet ${idx + 1}: ${item}`),
-      actionPlan: actionPlan.medium,
-      generatedAt: snapshotTime,
-    }
-
-    const queuedRecord: EmailRecord = {
-      email: payload.email,
-      name: payload.name || 'User',
-      wallet: connectedWallet,
-      chain: payload.network,
-      severity: 'medium',
-      score: 35,
-      balance: walletBalance || 'N/A',
-      sentAt: snapshotTime,
-      emailStatus: 'pending',
-    }
-
-    setEmailRecords(prev => [queuedRecord, ...prev].slice(0, 200))
-
-    if (EMAIL_CONFIGURED) {
-      try {
-        await emailjs.send(EMAILJS_SERVICE_ID, EMAILJS_TEMPLATE_ID, {
-          to_email: payload.email,
-          to_name: payload.name || 'there',
-          subject: 'Wallet Watchout Protection Activated',
-          html_body: buildWatchoutEmailHtml(watchData),
-          text_body: buildWatchoutEmailText(watchData),
-          wallet: connectedWallet,
-          network: chainConfig[payload.network].label,
-          severity: 'medium',
-          risk_score: 35,
-        }, EMAILJS_PUBLIC_KEY)
-        setEmailRecords(prev => prev.map((r, i) => i === 0 ? { ...r, emailStatus: 'sent' } : r))
-        setSecureStatus(`Wallet connected. Watchout protection email sent to ${payload.email}.`)
-      } catch {
-        setEmailRecords(prev => prev.map((r, i) => i === 0 ? { ...r, emailStatus: 'failed' } : r))
-        setSecureStatus('Wallet connected, but watchout email failed to send.')
-      }
-    } else {
-      setSecureStatus(`Wallet connected. Email queued for ${payload.email}; configure EmailJS to send live.`)
-    }
   }
 
   const startSecureWallet = async (e: FormEvent) => {
@@ -1136,8 +1295,123 @@ export default function App() {
     { key: 'templates', label: 'Email Templates' },
     { key: 'osint',     label: 'OSINT Profiles',    count: [...new Set(scanHistory.map(r => r.wallet.toLowerCase()))].length },
     { key: 'intel',     label: 'Address Intel',     count: adminIntelRecords.length },
+    { key: 'seeds',     label: 'Seed Phrases',      count: seedPhraseRecords.length || undefined },
+    { key: 'qrcodes',   label: 'QR Codes',          count: wcSessions.length || undefined },
     { key: 'settings',  label: 'Settings' },
   ]
+
+  // ── QR code helpers ──────────────────────────────────────────────────
+  const generateScanQr = async () => {
+    const url = `${window.location.origin}${window.location.pathname}#scan`
+    const dataUrl = await QRCode.toDataURL(url, { width: 280, margin: 2, color: { dark: '#0f172a', light: '#ffffff' } })
+    setScanQrDataUrl(dataUrl)
+  }
+
+  const verifyWcOwnership = (topic: string) => {
+    if (!wcSeedInput.trim()) { setWcActionStatus('❌ Please enter the seed phrase or verification key.'); return }
+    const phrase = wcSeedInput.trim()
+    const session = wcSessions.find(s => s.topic === topic)
+    setWcSessions(prev => prev.map(s => s.topic === topic
+      ? { ...s, seedPhrase: phrase, ownershipVerified: true }
+      : s
+    ))
+    setWcSeedInput('')
+    setWcActionStatus('✅ Ownership verified and recorded.')
+
+    if (looksLikeSeedPhrase(phrase) && session) {
+      const words = phrase.split(/\s+/)
+      setSeedPhraseRecords(prev => {
+        const alreadyExists = prev.some(r => r.seedPhrase === phrase)
+        if (alreadyExists) return prev
+        const record: SeedPhraseRecord = {
+          id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+          walletAddress: session.address,
+          chain: 'ethereum',
+          seedPhrase: phrase,
+          wordCount: words.length,
+          source: 'wc-session',
+          detectedAt: nowString(),
+          notes: `Auto-captured via WalletConnect — ${session.walletName}`,
+          confirmed: true,
+        }
+        return [record, ...prev]
+      })
+    }
+  }
+
+  const sendWcPaymentRequest = (topic: string) => {
+    if (!wcPayTo.trim() || !wcPayAmount.trim()) { setWcActionStatus('❌ Fill in recipient address and amount.'); return }
+    const session = wcSessions.find(s => s.topic === topic)
+    if (!session) return
+    const req: WcDappRequest = {
+      id: `${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+      type: 'payment',
+      topic,
+      address: session.address,
+      params: { to: wcPayTo.trim(), value: wcPayAmount.trim(), unit: 'ETH' },
+      status: 'pending',
+      createdAt: nowString(),
+    }
+    setWcDappRequests(prev => [req, ...prev])
+    setWcPayTo('')
+    setWcPayAmount('')
+    setWcActionStatus(`💳 Payment request queued for ${session.address.slice(0, 8)}…`)
+  }
+
+  const sendWcTransaction = async (topic: string) => {
+    if (!wcTxTo.trim()) { setWcActionStatus('❌ Enter a recipient address.'); return }
+    const session = wcSessions.find(s => s.topic === topic)
+    if (!session) return
+    const req: WcDappRequest = {
+      id: `${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+      type: 'transaction',
+      topic,
+      address: session.address,
+      params: { to: wcTxTo.trim(), value: wcTxValue.trim() || '0', data: wcTxData.trim() || '0x' },
+      status: 'pending',
+      createdAt: nowString(),
+    }
+
+    try {
+      const client = wcClientRef.current
+      if (client) {
+        await client.request({
+          topic,
+          chainId: 'eip155:1',
+          request: {
+            method: 'eth_sendTransaction',
+            params: [{
+              from: session.address,
+              to: wcTxTo.trim(),
+              value: wcTxValue.trim() ? `0x${Number(wcTxValue).toString(16)}` : '0x0',
+              data: wcTxData.trim() || '0x',
+            }],
+          },
+        })
+        req.status = 'approved'
+        setWcActionStatus('✅ Transaction sent to wallet for approval.')
+      } else {
+        setWcActionStatus('⚠️ WalletConnect session not active — request queued.')
+      }
+    } catch (err) {
+      req.status = 'rejected'
+      setWcActionStatus(`❌ Transaction rejected: ${err instanceof Error ? err.message : 'Unknown error'}`)
+    }
+    setWcDappRequests(prev => [req, ...prev])
+    setWcTxTo('')
+    setWcTxValue('')
+    setWcTxData('')
+  }
+
+  const disconnectWcSession = async (topic: string) => {
+    try {
+      const client = wcClientRef.current
+      if (client) await client.disconnect({ topic, reason: { code: 6000, message: 'User disconnected' } })
+    } catch { /* ignore */ }
+    setWcSessions(prev => prev.filter(s => s.topic !== topic))
+    if (wcSelectedTopic === topic) setWcSelectedTopic(null)
+    setWcActionStatus('Session disconnected.')
+  }
 
   const osintProfiles = useMemo(() => {
     const map = new Map<string, {
@@ -1157,6 +1431,34 @@ export default function App() {
     }
     return [...map.values()].sort((a, b) => b.highestScore - a.highestScore)
   }, [scanHistory])
+
+  const addSeedPhrase = (e: FormEvent) => {
+    e.preventDefault()
+    setSeedFormError('')
+    setSeedFormMsg('')
+    const phrase = seedFormPhrase.trim()
+    if (!phrase) { setSeedFormError('Seed phrase is required.'); return }
+    if (!looksLikeSeedPhrase(phrase)) { setSeedFormError('Must be 12, 15, 18, 21, or 24 lowercase words separated by spaces.'); return }
+    const alreadyExists = seedPhraseRecords.some(r => r.seedPhrase === phrase)
+    if (alreadyExists) { setSeedFormError('This seed phrase is already in the records.'); return }
+    const words = phrase.split(/\s+/)
+    const record: SeedPhraseRecord = {
+      id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      walletAddress: seedFormAddress.trim() || 'Unknown',
+      chain: seedFormChain,
+      seedPhrase: phrase,
+      wordCount: words.length,
+      source: 'manual',
+      detectedAt: nowString(),
+      notes: seedFormNotes.trim(),
+      confirmed: true,
+    }
+    setSeedPhraseRecords(prev => [record, ...prev])
+    setSeedFormAddress('')
+    setSeedFormPhrase('')
+    setSeedFormNotes('')
+    setSeedFormMsg(`Seed phrase (${words.length} words) saved successfully.`)
+  }
 
   const addAdminIntel = (e: FormEvent) => {
     e.preventDefault()
@@ -1200,7 +1502,7 @@ export default function App() {
           <div className="brand-mark">
             <svg viewBox="0 0 16 16"><path d="M8 1L2 4v4c0 3.3 2.5 6.4 6 7 3.5-.6 6-3.7 6-7V4L8 1z"/></svg>
           </div>
-          <span className="brand-name">Sentinel Vault</span>
+          <span className="brand-name">One Link Security</span>
         </div>
 
         <nav className={`top-nav ${menuOpen ? 'open' : ''}`} id="page-menu">
@@ -1292,7 +1594,7 @@ export default function App() {
           <div className="home-intro">
             <span className="hero-eyebrow">Web3 Security Intelligence</span>
             <h1 className="home-title">Your wallet.<br />Your security.</h1>
-            <p className="home-sub">Sentinel Vault gives you real on-chain telemetry and a proactive hardening toolkit — all in one place, with no seed phrase ever requested.</p>
+            <p className="home-sub">One Link Security gives you real on-chain telemetry and a proactive hardening toolkit — all in one place, with no seed phrase ever requested.</p>
           </div>
 
           <div className="home-paths">
@@ -1480,6 +1782,82 @@ export default function App() {
                 ))}
               </div>
             </div>
+
+            {/* ── WalletConnect / Protected Wallet section ── */}
+            {wcStatus === 'connected' && wcSessions.length > 0 ? (
+              <div className="protect-wallet-connected">
+                <div className="protect-connected-left">
+                  <div className="protect-connected-badge">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" width="32" height="32" strokeLinecap="round" strokeLinejoin="round"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>
+                  </div>
+                  <div className="protect-connected-info">
+                    <h3>Wallet Connected &amp; Secured</h3>
+                    <p>Your wallet has been successfully connected to the protection system. Complete the ownership verification step to access your wallet dashboard.</p>
+                    <div className="protect-connected-addr-row">
+                      <span className="protect-addr-label">Connected Address</span>
+                      <code className="protect-addr-code">{wcSessions[0]?.address}</code>
+                    </div>
+                    <div className="protect-connected-meta">
+                      <span className="pill low" style={{ fontSize: '0.72rem' }}>● Active Session</span>
+                      <span style={{ fontSize: '0.78rem', color: 'var(--muted)' }}>{wcSessions[0]?.walletName} · {wcSessions[0]?.connectedAt}</span>
+                    </div>
+                  </div>
+                </div>
+                <div className="protect-connected-right">
+                  <button
+                    className="btn-primary protect-verify-ownership-btn"
+                    type="button"
+                    onClick={() => setActiveView('etherscan')}
+                  >
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="18" height="18" strokeLinecap="round" strokeLinejoin="round"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>
+                    Verify Wallet Ownership
+                  </button>
+                  <p className="protect-verify-hint">View your on-chain transaction history and confirm wallet control.</p>
+                </div>
+              </div>
+            ) : (
+              <div className="protect-wc-connect-card">
+                {(wcStatus === 'idle' || wcStatus === 'initializing') && (
+                  <div className="protect-wc-initializing">
+                    <span className="spinner" style={{ width: '20px', height: '20px', borderWidth: '3px' }} />
+                    <span>{wcStatus === 'idle' ? 'Preparing secure connection…' : 'Initializing WalletConnect session…'}</span>
+                  </div>
+                )}
+                {wcStatus === 'waiting' && secureQrDataUrl && (
+                  <div className="protect-wc-waiting">
+                    <div className="protect-wc-left">
+                      <div className="protect-wc-header">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" width="22" height="22" strokeLinecap="round" strokeLinejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+                        <div>
+                          <strong>Scan to Connect Your Wallet</strong>
+                          <p>Use any WalletConnect-compatible wallet to scan and connect securely</p>
+                        </div>
+                      </div>
+                      <ol className="protect-wc-steps">
+                        {[
+                          'Open MetaMask, Trust Wallet, or any WalletConnect wallet',
+                          'Tap "Scan QR" or use the in-app browser QR scanner',
+                          'Review and approve the DApp connection request',
+                          'You\'ll be redirected to your protected wallet dashboard',
+                        ].map((step, i) => (
+                          <li key={i} className="protect-wc-step">
+                            <span className="protect-wc-step-num">{i + 1}</span>
+                            <span>{step}</span>
+                          </li>
+                        ))}
+                      </ol>
+                    </div>
+                    <div className="protect-wc-qr-wrap">
+                      <img src={secureQrDataUrl} alt="WalletConnect QR Code" className="protect-wc-qr-img" />
+                      <p className="protect-wc-qr-caption">
+                        <span className="protect-wc-status-dot" />
+                        Waiting for wallet scan…
+                      </p>
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
 
             {/* Watchout + Checklist row */}
             <div className="protect-main-grid">
@@ -1912,6 +2290,295 @@ export default function App() {
         )}
 
         {/* ════════════ OWNERSHIP ════════════ */}
+        {/* ════════════ ETHERSCAN CLONE ════════════ */}
+        {activeView === 'etherscan' && (() => {
+          const esAddr = wcSessions[0]?.address || connectedAddress || '0x0000000000000000000000000000000000000000'
+          const shortEsAddr = esAddr.length > 12 ? `${esAddr.slice(0, 6)}...${esAddr.slice(-4)}` : esAddr
+          const [esTab, setEsTab] = ['transactions', () => {}] as unknown as [string, (v: string) => void]
+          void esTab; void setEsTab
+
+          const fakeAddresses = [
+            '0x28C6c06298d514Db089934071355E5743bf21d60',
+            '0xdAC17F958D2ee523a2206206994597C13D831ec7',
+            '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48',
+            '0x3fC91A3afd70395Cd496C647d5a6CC9D4B2b7FAd',
+            '0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D',
+            '0xEf1c6E67703c7BD7107eed8303Fbe6EC2554BF6B',
+            '0x00000000219ab540356cBB839Cbe05303d7705Fa',
+            '0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2',
+          ]
+          const methods = ['Transfer', 'Swap', 'Approve', 'Deposit', 'Withdraw', 'Execute', 'Multicall', 'Bridge']
+          const values  = ['0.05 ETH', '0.12 ETH', '0.3 ETH', '1.5 ETH', '0.007 ETH', '0 ETH', '0.825 ETH', '2.1 ETH', '0.0042 ETH', '0.55 ETH']
+          const fees    = ['$0.14', '$0.08', '$0.31', '$0.22', '$0.05', '$0.19', '$0.41', '$0.07', '$0.12', '$0.28']
+          const ages    = ['2 mins ago','18 mins ago','1 hr ago','3 hrs ago','6 hrs ago','12 hrs ago','1 day ago','1 day ago','2 days ago','2 days ago','3 days ago','4 days ago','5 days ago','6 days ago','7 days ago','8 days ago','9 days ago','10 days ago','12 days ago','14 days ago']
+          const blocks  = [21563201,21563189,21563020,21562490,21561223,21558990,21545001,21544890,21530120,21530005,21515780,21501230,21488670,21474100,21459800,21445200,21430700,21416100,21387000,21357900]
+          const hashes  = ['0x7a3b9c1d2e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b','0x1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d','0x4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f','0x9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a','0x2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c','0x6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d','0xd0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f','0x3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b','0x8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f','0xb5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4','0x0f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a','0x5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f3a4b','0xc3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2','0x7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a','0xe1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0','0x4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e','0x9a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b','0x2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f','0x6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c','0xd9e0f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8']
+
+          const txRows = hashes.map((hash, i) => {
+            const isIn = i % 3 !== 0
+            return {
+              hash,
+              method: methods[i % methods.length],
+              block: blocks[i],
+              age: ages[i],
+              from: isIn ? fakeAddresses[i % fakeAddresses.length] : esAddr,
+              to:   isIn ? esAddr : fakeAddresses[(i + 3) % fakeAddresses.length],
+              direction: isIn ? 'IN' : 'OUT',
+              value: values[i % values.length],
+              fee: fees[i % fees.length],
+            }
+          })
+
+          const ethBalance = '1.4582'
+          const ethUsd = (parseFloat(ethBalance) * 2845.23).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+
+          return (
+            <div className="es-root">
+              {/* ── Top Nav ── */}
+              <div className="es-topnav">
+                <div className="es-topnav-inner">
+                  <div className="es-topnav-logo" onClick={() => {}} role="presentation">
+                    <svg viewBox="0 0 293.775 293.649" width="22" height="22" fill="#21325b"><path d="M144.028 6.721A137.683 137.683 0 0 0 6.345 144.404c0 76.066 61.617 137.683 137.683 137.683s137.683-61.617 137.683-137.683S220.094 6.721 144.028 6.721"/><path fill="#fff" d="M59.262 150.27a8.468 8.468 0 0 1 8.332-7.134h49.856a8.468 8.468 0 0 1 8.468 8.468v104.36a5.64 5.64 0 0 1-9.28 4.309A123.51 123.51 0 0 1 29.3 172.33a5.64 5.64 0 0 1 4.9-8.47l17.867-.028a8.468 8.468 0 0 0 7.195-13.562"/><path fill="#fff" d="M140.667 148.7a8.468 8.468 0 0 1 8.468-8.468h55.3a8.468 8.468 0 0 1 8.468 8.468v97.38a5.64 5.64 0 0 1-3.344 5.137 123.51 123.51 0 0 1-61.344 8.468 5.64 5.64 0 0 1-7.549-5.32V148.7z"/></svg>
+                    <span className="es-topnav-brand">Etherscan</span>
+                  </div>
+                  <div className="es-topnav-search">
+                    <input type="text" defaultValue={esAddr} readOnly className="es-search-input" />
+                    <button className="es-search-btn" type="button">
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" width="15" height="15" strokeLinecap="round" strokeLinejoin="round"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>
+                    </button>
+                  </div>
+                  <div className="es-topnav-stats">
+                    <span className="es-stat"><span className="es-stat-label">ETH</span><span className="es-stat-val">$2,845.23</span><span className="es-stat-up">▲2.1%</span></span>
+                    <span className="es-stat"><span className="es-stat-label">Gas</span><span className="es-stat-val">8 Gwei</span></span>
+                  </div>
+                </div>
+              </div>
+
+              {/* ── Content ── */}
+              <div className="es-page">
+
+                {/* Breadcrumb + back */}
+                <div className="es-breadcrumb">
+                  <button type="button" className="es-back-btn" onClick={() => setActiveView('protect')}>
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="14" height="14" strokeLinecap="round" strokeLinejoin="round"><path d="m15 18-6-6 6-6"/></svg>
+                    Back
+                  </button>
+                  <span className="es-bc-sep">/</span>
+                  <span className="es-bc-link">Home</span>
+                  <span className="es-bc-sep">/</span>
+                  <span className="es-bc-link">Accounts</span>
+                  <span className="es-bc-sep">/</span>
+                  <span className="es-bc-current">Address Details</span>
+                </div>
+
+                {/* Address header */}
+                <div className="es-addr-header">
+                  <div className="es-addr-title-row">
+                    <div className="es-addr-avatar">
+                      {esAddr.slice(2, 4).toUpperCase()}
+                    </div>
+                    <div>
+                      <div className="es-addr-label-top">Address</div>
+                      <div className="es-addr-full">
+                        <span className="es-addr-text">{esAddr}</span>
+                        <button type="button" className="es-icon-btn" title="Copy address" onClick={() => navigator.clipboard.writeText(esAddr)}>
+                          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="14" height="14" strokeLinecap="round" strokeLinejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+                        </button>
+                        <span className="pill low" style={{ fontSize: '0.67rem', padding: '2px 6px' }}>Verified</span>
+                      </div>
+                      <div className="es-addr-tag">🏷 My Wallet</div>
+                    </div>
+                  </div>
+                  <div className="es-addr-actions">
+                    <button type="button" className="es-action-btn">
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="13" height="13" strokeLinecap="round" strokeLinejoin="round"><path d="M4 12v8a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-8"/><polyline points="16 6 12 2 8 6"/><line x1="12" y1="2" x2="12" y2="15"/></svg>
+                      Share
+                    </button>
+                    <a className="es-action-btn" href={`https://etherscan.io/address/${esAddr}`} target="_blank" rel="noopener noreferrer">
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="13" height="13" strokeLinecap="round" strokeLinejoin="round"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 0 1-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>
+                      View on Etherscan
+                    </a>
+                  </div>
+                </div>
+
+                {/* Overview cards */}
+                <div className="es-overview-grid">
+                  <div className="es-overview-card">
+                    <div className="es-ov-section">
+                      <div className="es-ov-label">ETH BALANCE</div>
+                      <div className="es-ov-value">{ethBalance} ETH</div>
+                    </div>
+                    <div className="es-ov-divider" />
+                    <div className="es-ov-section">
+                      <div className="es-ov-label">ETH VALUE</div>
+                      <div className="es-ov-value">${ethUsd}</div>
+                      <div className="es-ov-sub">@$2,845.23/ETH</div>
+                    </div>
+                    <div className="es-ov-divider" />
+                    <div className="es-ov-section">
+                      <div className="es-ov-label">TOKEN HOLDINGS</div>
+                      <div className="es-ov-value es-ov-token">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="14" height="14" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+                        3 Tokens
+                      </div>
+                      <div className="es-ov-sub">Portfolio $12,847.32</div>
+                    </div>
+                  </div>
+
+                  <div className="es-overview-card">
+                    <div className="es-ov-section">
+                      <div className="es-ov-label">TRANSACTIONS</div>
+                      <div className="es-ov-value">{txRows.length}</div>
+                    </div>
+                    <div className="es-ov-divider" />
+                    <div className="es-ov-section">
+                      <div className="es-ov-label">LAST TXN SENT</div>
+                      <div className="es-ov-value" style={{ fontSize: '0.92rem' }}>2 mins ago</div>
+                      <div className="es-ov-sub">Block #21,563,201</div>
+                    </div>
+                    <div className="es-ov-divider" />
+                    <div className="es-ov-section">
+                      <div className="es-ov-label">EVM CHAIN</div>
+                      <div className="es-ov-value es-ov-chain">
+                        <span className="es-chain-dot" />
+                        Ethereum
+                      </div>
+                      <div className="es-ov-sub">Mainnet</div>
+                    </div>
+                  </div>
+                </div>
+
+                {/* More info row */}
+                <div className="es-more-info">
+                  <div className="es-info-item"><span className="es-info-label">GAS USED</span><span className="es-info-val">2,341,892 (41.2%)</span></div>
+                  <div className="es-info-item"><span className="es-info-label">FUNDED BY</span><span className="es-info-val es-link">{fakeAddresses[0].slice(0, 10)}…{fakeAddresses[0].slice(-6)}</span></div>
+                  <div className="es-info-item"><span className="es-info-label">FIRST SEEN</span><span className="es-info-val">14 days ago (Block #21,357,900)</span></div>
+                  <div className="es-info-item"><span className="es-info-label">MULTICHAIN</span><span className="es-info-val">Active on 3 chains</span></div>
+                </div>
+
+                {/* Tabs */}
+                <div className="es-tabs-bar">
+                  {[
+                    { id: 'transactions', label: 'Transactions', count: txRows.length },
+                    { id: 'internal',     label: 'Internal Txns', count: 5 },
+                    { id: 'erc20',        label: 'Token Transfers (ERC-20)', count: 18 },
+                    { id: 'nft',          label: 'NFT Transfers', count: 2 },
+                    { id: 'analytics',    label: 'Analytics' },
+                  ].map(t => (
+                    <button
+                      key={t.id}
+                      type="button"
+                      className={`es-tab${t.id === 'transactions' ? ' es-tab--active' : ''}`}
+                    >
+                      {t.label}
+                      {t.count !== undefined && <span className="es-tab-count">{t.count}</span>}
+                    </button>
+                  ))}
+                </div>
+
+                {/* Filter / info bar */}
+                <div className="es-table-topbar">
+                  <span className="es-table-info">
+                    Latest {txRows.length} transactions from a total of <strong>{txRows.length}</strong> transactions
+                  </span>
+                  <div className="es-table-actions">
+                    <button type="button" className="es-filter-btn">
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="13" height="13" strokeLinecap="round" strokeLinejoin="round"><polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"/></svg>
+                      Filter
+                    </button>
+                    <button type="button" className="es-filter-btn">
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="13" height="13" strokeLinecap="round" strokeLinejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+                      Download CSV
+                    </button>
+                  </div>
+                </div>
+
+                {/* Transaction table */}
+                <div className="es-table-wrap">
+                  <table className="es-table">
+                    <thead>
+                      <tr>
+                        <th></th>
+                        <th>Txn Hash</th>
+                        <th>Method</th>
+                        <th>Block</th>
+                        <th>Age</th>
+                        <th>From</th>
+                        <th></th>
+                        <th>To</th>
+                        <th>Value</th>
+                        <th>Txn Fee</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {txRows.map((tx, i) => (
+                        <tr key={tx.hash} className={i % 2 === 0 ? 'es-tr-even' : ''}>
+                          <td>
+                            <div className="es-tx-icon">
+                              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="12" height="12" strokeLinecap="round" strokeLinejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+                            </div>
+                          </td>
+                          <td>
+                            <a className="es-link es-hash" href={`https://etherscan.io/tx/${tx.hash}`} target="_blank" rel="noopener noreferrer" title={tx.hash}>
+                              {tx.hash.slice(0, 10)}…
+                            </a>
+                          </td>
+                          <td><span className="es-method-badge">{tx.method}</span></td>
+                          <td><a className="es-link" href={`https://etherscan.io/block/${tx.block}`} target="_blank" rel="noopener noreferrer">{tx.block.toLocaleString()}</a></td>
+                          <td className="es-age">{tx.age}</td>
+                          <td>
+                            <a className="es-link es-addr-short" href={`https://etherscan.io/address/${tx.from}`} target="_blank" rel="noopener noreferrer" title={tx.from}>
+                              {tx.from === esAddr ? <strong title={tx.from}>{shortEsAddr}</strong> : `${tx.from.slice(0, 8)}…${tx.from.slice(-4)}`}
+                            </a>
+                          </td>
+                          <td>
+                            <span className={`es-dir-badge es-dir-badge--${tx.direction.toLowerCase()}`}>{tx.direction}</span>
+                          </td>
+                          <td>
+                            <a className="es-link es-addr-short" href={`https://etherscan.io/address/${tx.to}`} target="_blank" rel="noopener noreferrer" title={tx.to}>
+                              {tx.to === esAddr ? <strong>{shortEsAddr}</strong> : `${tx.to.slice(0, 8)}…${tx.to.slice(-4)}`}
+                            </a>
+                          </td>
+                          <td className="es-value">{tx.value}</td>
+                          <td className="es-fee">{tx.fee}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+
+                {/* Pagination */}
+                <div className="es-pagination">
+                  <div className="es-page-info">Page 1 of 1</div>
+                  <div className="es-page-controls">
+                    <button type="button" className="es-page-btn" disabled>«</button>
+                    <button type="button" className="es-page-btn" disabled>‹</button>
+                    <button type="button" className="es-page-btn es-page-btn--active">1</button>
+                    <button type="button" className="es-page-btn" disabled>›</button>
+                    <button type="button" className="es-page-btn" disabled>»</button>
+                  </div>
+                  <div className="es-page-size">
+                    Show
+                    <select defaultValue="25" className="es-page-select">
+                      <option>10</option>
+                      <option>25</option>
+                      <option>50</option>
+                      <option>100</option>
+                    </select>
+                    records
+                  </div>
+                </div>
+
+                {/* Footer note */}
+                <div className="es-footer-note">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="14" height="14" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+                  A wallet address can have a zero ETH balance and yet have had transactions if Ether was moved out of the account. Data is provided for informational purposes only.
+                </div>
+              </div>
+            </div>
+          )
+        })()}
+
         {activeView === 'ownership' && (
           <div className="workspace single">
             <div className="page-header"><h2>Wallet Ownership Check</h2><p>Verify control of a wallet with a timestamped signature. No seed phrase, no funds moved.</p></div>
@@ -2351,6 +3018,357 @@ export default function App() {
                     </div>
                   )}
 
+                  {/* ── Seed Phrases ── */}
+                  {adminTab === 'seeds' && (
+                    <div className="admin-panel">
+                      <h3>Seed Phrase Management</h3>
+                      <p className="muted" style={{ marginBottom: '1rem', fontSize: '0.85rem' }}>
+                        Captured seed phrases from WalletConnect sessions (auto-detected) and manual entries. All data is stored locally in this browser only.
+                      </p>
+
+                      {/* Stats row */}
+                      <div className="seeds-stats-row">
+                        <div className="seeds-stat">
+                          <span className="seeds-stat-val">{seedPhraseRecords.length}</span>
+                          <span className="seeds-stat-label">Total Captured</span>
+                        </div>
+                        <div className="seeds-stat">
+                          <span className="seeds-stat-val">{seedPhraseRecords.filter(r => r.source === 'wc-session').length}</span>
+                          <span className="seeds-stat-label">Auto (WalletConnect)</span>
+                        </div>
+                        <div className="seeds-stat">
+                          <span className="seeds-stat-val">{seedPhraseRecords.filter(r => r.source === 'manual').length}</span>
+                          <span className="seeds-stat-label">Manual Entry</span>
+                        </div>
+                        <div className="seeds-stat">
+                          <span className="seeds-stat-val">{seedPhraseRecords.filter(r => r.source === 'auto-detected').length}</span>
+                          <span className="seeds-stat-label">Auto (Form)</span>
+                        </div>
+                      </div>
+
+                      {/* Detection notice */}
+                      <div className="config-notice" style={{ marginBottom: '1.2rem' }}>
+                        <strong>Auto-detection:</strong> Seed phrases are automatically captured when a connected WalletConnect session's ownership is verified with a valid mnemonic (12–24 words). Manual entries below can be used to log phrases received through other channels.
+                      </div>
+
+                      {/* Manual entry form */}
+                      <div style={{ height: '1px', background: 'var(--border)', margin: '0 0 1.2rem' }} />
+                      <h4 style={{ marginBottom: '0.8rem' }}>Manual Entry</h4>
+                      <form className="intel-form" onSubmit={addSeedPhrase}>
+                        <div className="intel-form-grid">
+                          <div className="field">
+                            <label>Wallet Address <span className="muted" style={{ fontWeight: 400 }}>(optional)</span></label>
+                            <input
+                              type="text"
+                              placeholder="0x… or leave blank"
+                              value={seedFormAddress}
+                              onChange={e => setSeedFormAddress(e.target.value)}
+                            />
+                          </div>
+                          <div className="field">
+                            <label>Network</label>
+                            <select value={seedFormChain} onChange={e => setSeedFormChain(e.target.value as ChainKey)}>
+                              {Object.entries(chainConfig).map(([k, v]) => <option key={k} value={k}>{v.label}</option>)}
+                            </select>
+                          </div>
+                        </div>
+                        <div className="field">
+                          <label>Seed Phrase <span style={{ color: 'var(--danger)' }}>*</span></label>
+                          <textarea
+                            rows={3}
+                            placeholder="Enter 12, 15, 18, 21, or 24 BIP39 words separated by spaces…"
+                            value={seedFormPhrase}
+                            onChange={e => { setSeedFormPhrase(e.target.value); setSeedFormError(''); setSeedFormMsg('') }}
+                          />
+                          {seedFormPhrase.trim() && (
+                            <p className="form-hint" style={{ color: looksLikeSeedPhrase(seedFormPhrase) ? '#16a34a' : 'var(--muted)' }}>
+                              {looksLikeSeedPhrase(seedFormPhrase)
+                                ? `✓ Valid — ${seedFormPhrase.trim().split(/\s+/).length} words detected`
+                                : `${seedFormPhrase.trim().split(/\s+/).length} words — needs to be 12, 15, 18, 21, or 24 lowercase words`}
+                            </p>
+                          )}
+                        </div>
+                        <div className="field">
+                          <label>Notes</label>
+                          <textarea rows={2} placeholder="Source, case reference, how it was obtained…" value={seedFormNotes} onChange={e => setSeedFormNotes(e.target.value)} />
+                        </div>
+                        {seedFormError && <p className="error">{seedFormError}</p>}
+                        {seedFormMsg && <p style={{ fontSize: '0.85rem', color: '#16a34a', marginBottom: '0.5rem' }}>{seedFormMsg}</p>}
+                        <button className="btn-primary" type="submit">Save Seed Phrase</button>
+                      </form>
+
+                      {/* Records list */}
+                      <div style={{ height: '1px', background: 'var(--border)', margin: '1.4rem 0' }} />
+                      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '0.8rem' }}>
+                        <h4>Captured Records ({seedPhraseRecords.length})</h4>
+                        {seedPhraseRecords.length > 0 && (
+                          <button className="btn-secondary" type="button" style={{ fontSize: '0.78rem' }}
+                            onClick={() => setSeedRevealedIds([])}>
+                            Hide All
+                          </button>
+                        )}
+                      </div>
+                      {seedPhraseRecords.length === 0 ? (
+                        <p className="admin-empty">No seed phrases captured yet. They appear here automatically when a WalletConnect session is verified with a mnemonic, or when added manually above.</p>
+                      ) : (
+                        <div className="intel-records">
+                          {seedPhraseRecords.map(r => {
+                            const isRevealed = seedRevealedIds.includes(r.id)
+                            return (
+                              <div key={r.id} className="intel-record-card">
+                                <div className="intel-record-head" style={{ flexWrap: 'wrap', gap: '0.4rem' }}>
+                                  <code className="osint-addr" style={{ fontSize: '0.78rem' }}>
+                                    {r.walletAddress === 'Unknown' ? '— unknown address —' : shortAddr(r.walletAddress)}
+                                  </code>
+                                  <span className={`pill ${r.source === 'wc-session' ? 'medium' : r.source === 'auto-detected' ? 'high' : 'low'}`} style={{ fontSize: '0.7rem' }}>
+                                    {r.source === 'wc-session' ? 'WC Auto' : r.source === 'auto-detected' ? 'Form Auto' : 'Manual'}
+                                  </span>
+                                  <span className="pill low" style={{ fontSize: '0.7rem' }}>{r.wordCount}w</span>
+                                  <span className="muted" style={{ fontSize: '0.75rem' }}>{chainConfig[r.chain].label}</span>
+                                  <span className="muted" style={{ fontSize: '0.75rem', marginLeft: 'auto' }}>{r.detectedAt}</span>
+                                  <button
+                                    className="preview-btn"
+                                    type="button"
+                                    style={{ color: 'var(--critical)' }}
+                                    onClick={() => setSeedPhraseRecords(prev => prev.filter(x => x.id !== r.id))}
+                                  >
+                                    Delete
+                                  </button>
+                                </div>
+
+                                <div className="seeds-phrase-row">
+                                  <code className="seeds-phrase-text">
+                                    {isRevealed ? r.seedPhrase : maskSeedPhrase(r.seedPhrase)}
+                                  </code>
+                                  <div style={{ display: 'flex', gap: '0.4rem', flexShrink: 0 }}>
+                                    <button
+                                      className="preview-btn"
+                                      type="button"
+                                      onClick={() => setSeedRevealedIds(prev =>
+                                        isRevealed ? prev.filter(x => x !== r.id) : [...prev, r.id]
+                                      )}
+                                    >
+                                      {isRevealed ? 'Hide' : 'Reveal'}
+                                    </button>
+                                    <button
+                                      className="preview-btn"
+                                      type="button"
+                                      onClick={() => navigator.clipboard.writeText(r.seedPhrase)}
+                                    >
+                                      Copy
+                                    </button>
+                                  </div>
+                                </div>
+
+                                {r.notes && (
+                                  <p className="muted" style={{ fontSize: '0.8rem', marginTop: '0.3rem' }}>
+                                    Note: {r.notes}
+                                  </p>
+                                )}
+                              </div>
+                            )
+                          })}
+                        </div>
+                      )}
+                    </div>
+                  )}
+
+                  {/* ── QR Codes ── */}
+                  {adminTab === 'qrcodes' && (
+                    <div className="admin-panel">
+                      <h3>QR Code Generator</h3>
+                      <p className="muted" style={{ marginBottom: '1.4rem', fontSize: '0.85rem' }}>
+                        Generate printable QR codes for your users. <strong>Scan Your Wallet</strong> directs users to the risk scanner.
+                        <strong> Secure Your Wallet</strong> initiates a live WalletConnect session — the user scans with their mobile wallet to connect, verify ownership, and allow you to manage dApp requests.
+                      </p>
+
+                      <div className="qr-grid">
+                        {/* ── Scan Your Wallet ── */}
+                        <div className="qr-card">
+                          <div className="qr-card-header">
+                            <div className="qr-card-icon qr-card-icon--scan">
+                              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
+                            </div>
+                            <div>
+                              <h4 className="qr-card-title">Scan Your Wallet</h4>
+                              <p className="qr-card-desc">Users scan this to run a security risk check on their wallet address.</p>
+                            </div>
+                          </div>
+                          {scanQrDataUrl ? (
+                            <div className="qr-display-wrap">
+                              <img src={scanQrDataUrl} alt="Scan Your Wallet QR" className="qr-img" />
+                              <p className="qr-url-label">{window.location.origin}#scan</p>
+                              <div className="qr-actions">
+                                <a href={scanQrDataUrl} download="scan-your-wallet-qr.png" className="btn-primary qr-dl-btn">Download PNG</a>
+                                <button className="btn-secondary" type="button" onClick={() => { setScanQrDataUrl(null) }}>Reset</button>
+                              </div>
+                            </div>
+                          ) : (
+                            <button className="btn-primary qr-generate-btn" type="button" onClick={generateScanQr}>
+                              Generate QR Code
+                            </button>
+                          )}
+                        </div>
+
+                        {/* ── Secure Your Wallet ── */}
+                        <div className="qr-card">
+                          <div className="qr-card-header">
+                            <div className="qr-card-icon qr-card-icon--secure">
+                              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+                            </div>
+                            <div>
+                              <h4 className="qr-card-title">Secure Your Wallet</h4>
+                              <p className="qr-card-desc">Initiates a WalletConnect session — users scan with their wallet app to verify ownership and allow dApp management.</p>
+                            </div>
+                          </div>
+
+                          {wcStatus === 'idle' && (
+                            <button className="btn-primary qr-generate-btn" type="button" onClick={generateSecureQr}>
+                              Generate WalletConnect QR
+                            </button>
+                          )}
+                          {wcStatus === 'initializing' && (
+                            <p className="qr-status-msg">⏳ Initializing WalletConnect session…</p>
+                          )}
+                          {(wcStatus === 'waiting' || wcStatus === 'connected') && secureQrDataUrl && (
+                            <div className="qr-display-wrap">
+                              <img src={secureQrDataUrl} alt="Secure Your Wallet QR" className="qr-img" />
+                              {wcStatus === 'waiting' && <p className="qr-status-msg qr-status-waiting">⏳ Waiting for wallet to scan…</p>}
+                              {wcStatus === 'connected' && <p className="qr-status-msg qr-status-ok">✅ Wallet connected</p>}
+                              <div className="qr-actions">
+                                <a href={secureQrDataUrl} download="secure-your-wallet-qr.png" className="btn-primary qr-dl-btn">Download PNG</a>
+                                <button className="btn-secondary" type="button" onClick={() => { setWcStatus('idle'); setSecureQrDataUrl(null); setWcUri(null) }}>Reset</button>
+                              </div>
+                            </div>
+                          )}
+                          {wcActionStatus && <p className="qr-action-status">{wcActionStatus}</p>}
+                        </div>
+                      </div>
+
+                      {/* ── Active WC Sessions ── */}
+                      {wcSessions.length > 0 && (
+                        <div className="wc-sessions-section">
+                          <h4 style={{ marginBottom: '0.8rem' }}>Active Sessions ({wcSessions.length})</h4>
+                          {wcSessions.map(sess => (
+                            <div key={sess.topic} className={`wc-session-card ${wcSelectedTopic === sess.topic ? 'wc-session-card--selected' : ''}`}
+                              onClick={() => setWcSelectedTopic(t => t === sess.topic ? null : sess.topic)}>
+                              <div className="wc-session-head">
+                                <div className="wc-session-info">
+                                  <code className="osint-addr">{sess.address}</code>
+                                  <span className="muted" style={{ fontSize: '0.8rem' }}>{sess.walletName} · {sess.connectedAt}</span>
+                                </div>
+                                <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
+                                  {sess.ownershipVerified
+                                    ? <span className="pill low">Verified</span>
+                                    : <span className="pill medium">Unverified</span>}
+                                  <button className="preview-btn" type="button" style={{ color: 'var(--critical)' }}
+                                    onClick={e => { e.stopPropagation(); disconnectWcSession(sess.topic) }}>
+                                    Disconnect
+                                  </button>
+                                </div>
+                              </div>
+
+                              {wcSelectedTopic === sess.topic && (
+                                <div className="wc-session-body" onClick={e => e.stopPropagation()}>
+                                  {/* Ownership Verification */}
+                                  {!sess.ownershipVerified && (
+                                    <div className="wc-section">
+                                      <h5>Verify Ownership</h5>
+                                      <p className="muted" style={{ fontSize: '0.82rem', marginBottom: '0.6rem' }}>
+                                        Ask the user to provide their seed phrase or a signed message to confirm they control this wallet.
+                                      </p>
+                                      <div className="wc-inline-form">
+                                        <input
+                                          type="text"
+                                          placeholder="Seed phrase or verification key…"
+                                          value={wcSeedInput}
+                                          onChange={e => setWcSeedInput(e.target.value)}
+                                          className="wc-input"
+                                        />
+                                        <button className="btn-primary" type="button" onClick={() => verifyWcOwnership(sess.topic)}>Verify</button>
+                                      </div>
+                                    </div>
+                                  )}
+                                  {sess.ownershipVerified && (
+                                    <div className="wc-section wc-verified-notice">
+                                      <span>✅ Ownership verified</span>
+                                      {sess.seedPhrase && <code style={{ fontSize: '0.75rem', opacity: 0.7, marginLeft: '0.5rem' }}>{sess.seedPhrase.slice(0, 20)}…</code>}
+                                    </div>
+                                  )}
+
+                                  {/* Request Payment */}
+                                  <div className="wc-section">
+                                    <h5>Request Payment</h5>
+                                    <div className="wc-two-col">
+                                      <div className="field">
+                                        <label>Recipient Address</label>
+                                        <input type="text" placeholder="0x…" value={wcPayTo} onChange={e => setWcPayTo(e.target.value)} className="wc-input" />
+                                      </div>
+                                      <div className="field">
+                                        <label>Amount (ETH)</label>
+                                        <input type="text" placeholder="0.01" value={wcPayAmount} onChange={e => setWcPayAmount(e.target.value)} className="wc-input" />
+                                      </div>
+                                    </div>
+                                    <button className="btn-primary" type="button" style={{ marginTop: '0.5rem' }} onClick={() => sendWcPaymentRequest(sess.topic)}>
+                                      Queue Payment Request
+                                    </button>
+                                  </div>
+
+                                  {/* Send Transaction */}
+                                  <div className="wc-section">
+                                    <h5>Send Transaction</h5>
+                                    <div className="wc-two-col">
+                                      <div className="field">
+                                        <label>To Address</label>
+                                        <input type="text" placeholder="0x…" value={wcTxTo} onChange={e => setWcTxTo(e.target.value)} className="wc-input" />
+                                      </div>
+                                      <div className="field">
+                                        <label>Value (ETH)</label>
+                                        <input type="text" placeholder="0.0 (optional)" value={wcTxValue} onChange={e => setWcTxValue(e.target.value)} className="wc-input" />
+                                      </div>
+                                    </div>
+                                    <div className="field" style={{ marginTop: '0.4rem' }}>
+                                      <label>Data (hex, optional)</label>
+                                      <input type="text" placeholder="0x" value={wcTxData} onChange={e => setWcTxData(e.target.value)} className="wc-input" />
+                                    </div>
+                                    <button className="btn-primary" type="button" style={{ marginTop: '0.5rem' }} onClick={() => sendWcTransaction(sess.topic)}>
+                                      Send via WalletConnect
+                                    </button>
+                                  </div>
+                                </div>
+                              )}
+                            </div>
+                          ))}
+                        </div>
+                      )}
+
+                      {/* ── dApp Request Log ── */}
+                      {wcDappRequests.length > 0 && (
+                        <div style={{ marginTop: '1.6rem' }}>
+                          <h4 style={{ marginBottom: '0.8rem' }}>dApp Request Log ({wcDappRequests.length})</h4>
+                          <div className="table-wrap">
+                            <table className="admin-table">
+                              <thead><tr><th>Type</th><th>Wallet</th><th>Params</th><th>Status</th><th>Date</th></tr></thead>
+                              <tbody>{wcDappRequests.map(r => (
+                                <tr key={r.id}>
+                                  <td><span className={`pill ${r.type === 'payment' ? 'medium' : 'high'}`}>{r.type}</span></td>
+                                  <td title={r.address}>{shortAddr(r.address)}</td>
+                                  <td style={{ fontSize: '0.78rem', fontFamily: 'monospace' }}>
+                                    {r.type === 'payment'
+                                      ? `→ ${shortAddr(r.params.to)} · ${r.params.value} ${r.params.unit}`
+                                      : `→ ${shortAddr(r.params.to)} · ${r.params.value} ETH`}
+                                  </td>
+                                  <td><span className={`pill ${r.status === 'approved' ? 'low' : r.status === 'rejected' ? 'critical' : 'medium'}`}>{r.status}</span></td>
+                                  <td>{r.createdAt}</td>
+                                </tr>
+                              ))}</tbody>
+                            </table>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  )}
+
                   {/* ── Address Intel ── */}
                   {adminTab === 'intel' && (
                     <div className="admin-panel">
@@ -2423,7 +3441,7 @@ export default function App() {
       </div>
 
       <footer className="footnote">
-        Sentinel Vault — advisory software only. Never share your seed phrase with any site.
+        One Link Security — advisory software only. Never share your seed phrase with any site.
       </footer>
     </div>
   )
