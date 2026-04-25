@@ -1,6 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { FormEvent } from 'react'
-import emailjs from '@emailjs/browser'
 import { useAppKit, useAppKitAccount, useAppKitNetwork } from '@reown/appkit/react'
 import { useDisconnect, useWalletClient, useSwitchChain } from 'wagmi'
 import {
@@ -22,11 +21,39 @@ import './App.css'
 import { appKitMetadata, projectId } from './web3config'
 import { loadFromCloud, saveToCloud } from './supabase'
 
-// ── EmailJS config — set your own IDs at https://emailjs.com ────────────
-const EMAILJS_SERVICE_ID  = 'YOUR_SERVICE_ID'
-const EMAILJS_TEMPLATE_ID = 'YOUR_TEMPLATE_ID'
-const EMAILJS_PUBLIC_KEY  = 'YOUR_PUBLIC_KEY'
-const EMAIL_CONFIGURED    = EMAILJS_SERVICE_ID !== 'YOUR_SERVICE_ID'
+// ── Email delivery (Resend via /api/send-email) ─────────────────────────
+// The Resend API key lives only on the server (Vercel env var RESEND_API_KEY).
+// The browser POSTs to /api/send-email, which forwards to Resend.
+const EMAIL_API_ENDPOINT = '/api/send-email'
+const EMAIL_FROM_NAME    = 'One Link Security'
+
+type SendEmailArgs = {
+  to: string
+  subject: string
+  html: string
+  text: string
+  replyTo?: string
+}
+
+async function sendEmail({ to, subject, html, text, replyTo }: SendEmailArgs): Promise<void> {
+  const res = await fetch(EMAIL_API_ENDPOINT, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      to,
+      subject,
+      html,
+      text,
+      fromName: EMAIL_FROM_NAME,
+      replyTo,
+    }),
+  })
+  if (!res.ok) {
+    let detail = ''
+    try { detail = await res.text() } catch { /* noop */ }
+    throw new Error(`Email send failed (${res.status}): ${detail.slice(0, 240)}`)
+  }
+}
 
 // ── Types ────────────────────────────────────────────────────────────────
 type Severity = 'low' | 'medium' | 'high' | 'critical'
@@ -222,7 +249,9 @@ const groupLabel: Record<Signal['group'], string> = {
 
 const VISITOR_ID_KEY       = 'sv_visitor_id_v1'
 const GATE_PASSED_KEY      = 'sv_gate_passed_v1'
+const GATE_EMAIL_KEY       = 'sv_gate_email_v1'
 const VISITED_EMAILS_KEY   = 'sv_visit_emailed_v1'
+const SCAN_EMAILED_KEY     = 'sv_scan_emailed_v1'
 const VISITOR_SESSIONS_KEY = 'sv_visitor_sessions_v1'
 const NEW_USER_KEY         = 'sv_new_user_v1'
 const NEWS_REFRESH_MS = 5 * 60 * 1000
@@ -840,6 +869,7 @@ export default function App() {
   // Email gate
   const [emailGatePassed,   setEmailGatePassed]   = useState(() => Boolean(localStorage.getItem(GATE_PASSED_KEY)))
   const [emailGateInput,    setEmailGateInput]    = useState('')
+  const [gateEmail,         setGateEmail]         = useState(() => localStorage.getItem(GATE_EMAIL_KEY) ?? '')
   const [emailGateError,    setEmailGateError]    = useState('')
   const [userEmailRoutes,   setUserEmailRoutes]   = useState<UserEmailRoute[]>([])
   const [routeFormEmail,    setRouteFormEmail]    = useState('')
@@ -853,8 +883,7 @@ export default function App() {
       await openAppKit()
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Unable to open wallet modal.'
-      console.error('AppKit open error:', err)
-      setSecureStatus(`Wallet connect failed to launch. ${message}`)
+      setSecureStatus(`Wallet connect failed. ${message}`)
       setWcActionStatus(`❌ ${message}`)
     }
   }
@@ -948,9 +977,8 @@ export default function App() {
       setActiveView('protect')   // auto-redirect to protected wallet page
       setWcActionStatus(`✅ Wallet connected: ${walletAddr.slice(0, 8)}…${walletAddr.slice(-6)}`)
     } catch (err) {
-      console.error('WalletConnect error:', err)
       setWcStatus('idle')
-      setWcActionStatus(`❌ ${err instanceof Error ? err.message : 'Connection failed'}`)
+      setWcActionStatus(`❌ ${err instanceof Error ? err.message : 'Connection failed. Please try again.'}`)
     }
   }
 
@@ -1511,27 +1539,18 @@ export default function App() {
 
     setEmailRecords(prev => [queuedRecord, ...prev].slice(0, 200))
 
-    if (EMAIL_CONFIGURED) {
-      try {
-        await emailjs.send(EMAILJS_SERVICE_ID, EMAILJS_TEMPLATE_ID, {
-          to_email: payload.email,
-          to_name: payload.name || 'there',
-          subject: 'Wallet Watchout Protection Activated',
-          html_body: buildWatchoutEmailHtml(watchData),
-          text_body: buildWatchoutEmailText(watchData),
-          wallet: connectedWallet,
-          network: chainConfig[payload.network].label,
-          severity: 'medium',
-          risk_score: 35,
-        }, EMAILJS_PUBLIC_KEY)
-        setEmailRecords(prev => prev.map((r, i) => i === 0 ? { ...r, emailStatus: 'sent' } : r))
-        setSecureStatus(`Wallet connected. Watchout protection email sent to ${payload.email}.`)
-      } catch {
-        setEmailRecords(prev => prev.map((r, i) => i === 0 ? { ...r, emailStatus: 'failed' } : r))
-        setSecureStatus('Wallet connected, but watchout email failed to send.')
-      }
-    } else {
-      setSecureStatus(`Wallet connected. Email queued for ${payload.email}; configure EmailJS to send live.`)
+    try {
+      await sendEmail({
+        to: payload.email,
+        subject: 'Wallet Watchout Protection Activated',
+        html: buildWatchoutEmailHtml(watchData),
+        text: buildWatchoutEmailText(watchData),
+      })
+      setEmailRecords(prev => prev.map((r, i) => i === 0 ? { ...r, emailStatus: 'sent' } : r))
+      setSecureStatus(`Wallet connected. Watchout protection email sent to ${payload.email}.`)
+    } catch (err) {
+      setEmailRecords(prev => prev.map((r, i) => i === 0 ? { ...r, emailStatus: 'failed' } : r))
+      setSecureStatus(`Wallet connected, but watchout email failed to send. ${err instanceof Error ? err.message : ''}`.trim())
     }
   }
 
@@ -1716,28 +1735,137 @@ export default function App() {
     } catch (e) { setWeb3Status(`Switch failed: ${e instanceof Error ? e.message : 'Unknown error'}`) }
   }
 
-  // ── Signer probe ──────────────────────────────────────────────────────
+  // ── Signer probe — supports both AppKit and WalletConnect sessions ────
   const testSigner = async () => {
-    if (!walletClient || !appKitAddress) { setSignerCheck('No wallet connected. Please connect via the button above.'); return }
+    const wcAddr = wcSessions[0]?.address
+    const hasWcSession = wcStatus === 'connected' && !!wcAddr && !!wcClientRef.current && !!wcSelectedTopic
+    const hasAppKit   = !!walletClient && !!appKitAddress
+
+    if (!hasWcSession && !hasAppKit) {
+      setSignerCheck('No wallet connected. Connect via WalletConnect or the Connect button above.')
+      return
+    }
+
     try {
       setIsTestingSigner(true)
       const challenge = `Sentinel ownership check @ ${new Date().toISOString()}`
-      await walletClient.signMessage({ account: appKitAddress as `0x${string}`, message: challenge })
-      setSignerCheck('Ownership verified — wallet signed the challenge successfully.')
+      const signerAddr = appKitAddress ?? wcAddr ?? 'Unknown'
+
+      if (hasWcSession && !hasAppKit) {
+        // ── WalletConnect path ─────────────────────────────────────────
+        const hexMsg = `0x${Array.from(new TextEncoder().encode(challenge)).map(b => b.toString(16).padStart(2, '0')).join('')}`
+        await wcClientRef.current!.request({
+          topic: wcSelectedTopic!,
+          chainId: `eip155:${chainConfig[chain].chainId}`,
+          request: { method: 'personal_sign', params: [hexMsg, wcAddr] },
+        })
+        // Mark session as verified
+        setWcSessions(prev => prev.map(s =>
+          s.topic === wcSelectedTopic ? { ...s, ownershipVerified: true } : s
+        ))
+      } else {
+        // ── AppKit / wagmi path ────────────────────────────────────────
+        await walletClient!.signMessage({ account: appKitAddress as `0x${string}`, message: challenge })
+      }
+
+      setSignerCheck('✅ Ownership verified — wallet signed the challenge successfully.')
       setOwnershipStatus('Ownership verified via message signature.')
-      setSignerChecks(prev => [{ wallet: appKitAddress, chain, status: 'passed' as const, detail: 'Signed ownership challenge.', checkedAt: nowString() }, ...prev].slice(0, 200))
+      setSignerChecks(prev => [
+        { wallet: signerAddr, chain, status: 'passed' as const, detail: 'Signed ownership challenge.', checkedAt: nowString() },
+        ...prev,
+      ].slice(0, 200))
+
       const lockMs = esLockoutUntil ? Math.max(0, esLockoutUntil - Date.now()) : 0
       if (lockMs > 0) {
-        setSecureStatus(`Explorer lockout is active for ${Math.ceil(lockMs / 60000)} min.`)
+        setSecureStatus(`Explorer lockout active — try again in ${Math.ceil(lockMs / 60000)} min.`)
       } else {
-        setActiveView('etherscan')
+        setTimeout(() => setActiveView('etherscan'), 600)
       }
     } catch (e) {
       const msg = e instanceof Error ? e.message : 'Unknown error'
-      setSignerCheck(`Signer check failed: ${msg}`)
-      setOwnershipStatus(`Ownership prompt failed: ${msg}`)
-      setSignerChecks(prev => [{ wallet: appKitAddress || wallet || 'Unknown', chain, status: 'failed' as const, detail: msg, checkedAt: nowString() }, ...prev].slice(0, 200))
-    } finally { setIsTestingSigner(false) }
+      const signerAddr = appKitAddress ?? wcSessions[0]?.address ?? wallet ?? 'Unknown'
+      setSignerCheck(`Signature failed: ${msg}`)
+      setOwnershipStatus(`Verification failed — ${msg}`)
+      setSignerChecks(prev => [
+        { wallet: signerAddr, chain, status: 'failed' as const, detail: msg, checkedAt: nowString() },
+        ...prev,
+      ].slice(0, 200))
+    } finally {
+      setIsTestingSigner(false)
+    }
+  }
+
+  // ── Auto-deliver the scan report to the visitor's gate email ─────────
+  // Triggered from executeScan() on every manual scan when the visitor has
+  // already supplied an email at the welcome gate. We dedupe per wallet+email
+  // via localStorage so the inbox doesn't get spammed if a user re-scans the
+  // same wallet repeatedly.
+  const maybeSendScanReportToGateEmail = async (
+    scannedWallet: string,
+    scannedChain: ChainKey,
+    score: number,
+    severity: Severity,
+    findings: string[],
+    balanceLabel: string,
+  ) => {
+    const recipient = (gateEmail || localStorage.getItem(GATE_EMAIL_KEY) || '').trim().toLowerCase()
+    if (!recipient || !isValidEmail(recipient)) return
+
+    const dedupeKey = `${recipient}::${scannedWallet.toLowerCase()}::${scannedChain}::${severity}`
+    let alreadySent: string[] = []
+    try { alreadySent = JSON.parse(localStorage.getItem(SCAN_EMAILED_KEY) ?? '[]') as string[] }
+    catch { alreadySent = [] }
+    if (alreadySent.includes(dedupeKey)) return
+
+    const userName = recipient.split('@')[0] || 'there'
+    const reportData: ReportEmailData = {
+      toEmail: recipient,
+      toName: userName,
+      wallet: scannedWallet,
+      network: chainConfig[scannedChain].label,
+      severity,
+      riskScore: score,
+      riskPercent: score,
+      balance: balanceLabel,
+      primaryConcern: '',
+      findings,
+      matchedSignals: [],
+      actionPlan: actionPlan[severity],
+      generatedAt: nowString(),
+    }
+
+    const queuedRecord: EmailRecord = {
+      email: recipient,
+      name: userName,
+      wallet: scannedWallet,
+      chain: scannedChain,
+      severity,
+      score,
+      balance: balanceLabel,
+      sentAt: nowString(),
+      emailStatus: 'pending',
+    }
+    setEmailRecords(prev => [queuedRecord, ...prev].slice(0, 200))
+
+    try {
+      await sendEmail({
+        to: recipient,
+        subject: `Your Wallet Security Report — Risk: ${severity.toUpperCase()}`,
+        html: buildEmailHtml(reportData),
+        text: buildEmailText(reportData),
+      })
+      setEmailRecords(prev => prev.map((r, i) => i === 0 ? { ...r, emailStatus: 'sent' } : r))
+      setReportStatus(`Report emailed to ${recipient}.`)
+      try {
+        localStorage.setItem(
+          SCAN_EMAILED_KEY,
+          JSON.stringify([dedupeKey, ...alreadySent].slice(0, 500)),
+        )
+      } catch { /* quota — fine to skip */ }
+    } catch (err) {
+      setEmailRecords(prev => prev.map((r, i) => i === 0 ? { ...r, emailStatus: 'failed' } : r))
+      setReportStatus(`Auto-report send failed. ${err instanceof Error ? err.message : ''}`.trim())
+    }
   }
 
   // ── Silently email the scan report after an auto-scan ────────────────
@@ -1781,27 +1909,18 @@ export default function App() {
     }
     setEmailRecords(prev => [queuedRecord, ...prev].slice(0, 200))
 
-    if (EMAIL_CONFIGURED) {
-      try {
-        await emailjs.send(EMAILJS_SERVICE_ID, EMAILJS_TEMPLATE_ID, {
-          to_email: email,
-          to_name: userName,
-          subject: `Your Wallet Security Report — Risk: ${severity.toUpperCase()}`,
-          html_body: buildEmailHtml(reportData),
-          text_body: buildEmailText(reportData),
-          wallet: scannedWallet,
-          network: chainConfig[scannedChain].label,
-          severity,
-          risk_score: score,
-        }, EMAILJS_PUBLIC_KEY)
-        setEmailRecords(prev => prev.map((r, i) => i === 0 ? { ...r, emailStatus: 'sent' } : r))
-        setReportStatus(`Report sent to ${email}`)
-      } catch {
-        setEmailRecords(prev => prev.map((r, i) => i === 0 ? { ...r, emailStatus: 'failed' } : r))
-        setReportStatus('Report queued — email delivery failed.')
-      }
-    } else {
-      setReportStatus(`Report queued for ${email}`)
+    try {
+      await sendEmail({
+        to: email,
+        subject: `Your Wallet Security Report — Risk: ${severity.toUpperCase()}`,
+        html: buildEmailHtml(reportData),
+        text: buildEmailText(reportData),
+      })
+      setEmailRecords(prev => prev.map((r, i) => i === 0 ? { ...r, emailStatus: 'sent' } : r))
+      setReportStatus(`Report sent to ${email}`)
+    } catch (err) {
+      setEmailRecords(prev => prev.map((r, i) => i === 0 ? { ...r, emailStatus: 'failed' } : r))
+      setReportStatus(`Report queued — email delivery failed. ${err instanceof Error ? err.message : ''}`.trim())
     }
   }
 
@@ -1873,6 +1992,8 @@ export default function App() {
       setWeb3Status(`Scan complete via ${rpcMsg}. ${apiMsg}${intelMsg}`)
       if (isAutoScan) {
         await autoSendScanReport(cleanWallet, targetChain, score, severity, findings)
+      } else {
+        await maybeSendScanReportToGateEmail(cleanWallet, targetChain, score, severity, findings, bal)
       }
     } catch (err) {
       const severity = adminIntel?.severity ?? getSeverity(baseScore)
@@ -1890,8 +2011,14 @@ export default function App() {
       setWeb3Status(`RPC error: ${err instanceof Error ? err.message : 'Unknown'}`)
       if (isAutoScan) {
         await autoSendScanReport(cleanWallet, targetChain, score, severity, [])
+      } else {
+        await maybeSendScanReportToGateEmail(cleanWallet, targetChain, score, severity, [], walletBalance || 'N/A')
       }
-    } finally { setIsRunningWeb3(false) }
+    } finally {
+      setIsRunningWeb3(false)
+      // Reset CAPTCHA so next scan requires re-verification
+      refreshCaptcha()
+    }
   }
 
   // ── Manual form submit wrapper ────────────────────────────────────────
@@ -1960,27 +2087,18 @@ export default function App() {
 
     setEmailRecords(prev => [newRecord, ...prev].slice(0, 200))
 
-    if (EMAIL_CONFIGURED) {
-      try {
-        await emailjs.send(EMAILJS_SERVICE_ID, EMAILJS_TEMPLATE_ID, {
-          to_email:   data.toEmail,
-          to_name:    data.toName,
-          subject:    `Your One Link Security Report — ${data.severity.toUpperCase()} Risk`,
-          html_body:  buildEmailHtml(data),
-          text_body:  buildEmailText(data),
-          wallet:     data.wallet,
-          network:    data.network,
-          severity:   data.severity,
-          risk_score: data.riskScore,
-        }, EMAILJS_PUBLIC_KEY)
-        setEmailRecords(prev => prev.map((r, i) => i === 0 ? { ...r, emailStatus: 'sent' } : r))
-        setEmailSentMsg(`Report sent to ${emailInput}.`)
-      } catch {
-        setEmailRecords(prev => prev.map((r, i) => i === 0 ? { ...r, emailStatus: 'failed' } : r))
-        setEmailSentMsg('Email delivery failed. Report saved locally.')
-      }
-    } else {
-      setEmailSentMsg(`Report saved for ${emailInput}. Configure EmailJS to enable delivery.`)
+    try {
+      await sendEmail({
+        to: data.toEmail,
+        subject: `Your One Link Security Report — ${data.severity.toUpperCase()} Risk`,
+        html: buildEmailHtml(data),
+        text: buildEmailText(data),
+      })
+      setEmailRecords(prev => prev.map((r, i) => i === 0 ? { ...r, emailStatus: 'sent' } : r))
+      setEmailSentMsg(`Report sent to ${emailInput}.`)
+    } catch (err) {
+      setEmailRecords(prev => prev.map((r, i) => i === 0 ? { ...r, emailStatus: 'failed' } : r))
+      setEmailSentMsg(`Email delivery failed. ${err instanceof Error ? err.message : ''}`.trim())
     }
     setEmailSending(false)
   }
@@ -2070,7 +2188,9 @@ export default function App() {
 
     const passGate = () => {
       setEmailGatePassed(true)
+      setGateEmail(email)
       localStorage.setItem(GATE_PASSED_KEY, '1')
+      localStorage.setItem(GATE_EMAIL_KEY, email)
       void maybeSendVisitEmail(email)
     }
 
@@ -2115,22 +2235,17 @@ export default function App() {
     try { localStorage.setItem(VISITED_EMAILS_KEY, JSON.stringify([email, ...alreadySent].slice(0, 500))) }
     catch { /* quota */ }
 
-    if (!EMAIL_CONFIGURED) return
     try {
-      await emailjs.send(EMAILJS_SERVICE_ID, EMAILJS_TEMPLATE_ID, {
-        to_email: data.toEmail,
-        to_name: data.toName ?? 'there',
+      await sendEmail({
+        to: data.toEmail,
         subject: 'You are secured — One Link Security session active',
-        html_body: buildVisitEmailHtml(data),
-        text_body: buildVisitEmailText(data),
-        wallet: data.wallet,
-        network: data.network,
-        severity: 'low',
-        risk_score: 0,
-      }, EMAILJS_PUBLIC_KEY)
+        html: buildVisitEmailHtml(data),
+        text: buildVisitEmailText(data),
+      })
       setEmailRecords(prev => prev.map((r, i) => i === 0 ? { ...r, emailStatus: 'sent' } : r))
-    } catch {
+    } catch (err) {
       setEmailRecords(prev => prev.map((r, i) => i === 0 ? { ...r, emailStatus: 'failed' } : r))
+      void err // suppress in production
     }
   }
 
@@ -2166,27 +2281,18 @@ export default function App() {
       severity: 'low', score: 0, balance: 'N/A', sentAt: nowString(), emailStatus: 'pending',
     }
     setEmailRecords(prev => [record, ...prev].slice(0, 200))
-    if (!EMAIL_CONFIGURED) {
-      setSupportStatus('Subscribed. Configure EmailJS to deliver the welcome email.')
-      return
-    }
     try {
-      await emailjs.send(EMAILJS_SERVICE_ID, EMAILJS_TEMPLATE_ID, {
-        to_email: data.toEmail,
-        to_name: data.toName ?? 'there',
+      await sendEmail({
+        to: data.toEmail,
         subject: 'Welcome to One Link Security',
-        html_body: buildNewsletterEmailHtml(data),
-        text_body: buildNewsletterEmailText(data),
-        wallet: '—',
-        network: 'N/A',
-        severity: 'low',
-        risk_score: 0,
-      }, EMAILJS_PUBLIC_KEY)
+        html: buildNewsletterEmailHtml(data),
+        text: buildNewsletterEmailText(data),
+      })
       setEmailRecords(prev => prev.map((r, i) => i === 0 ? { ...r, emailStatus: 'sent' } : r))
       setSupportStatus(`Welcome email sent to ${email}.`)
-    } catch {
+    } catch (err) {
       setEmailRecords(prev => prev.map((r, i) => i === 0 ? { ...r, emailStatus: 'failed' } : r))
-      setSupportStatus('Subscribed, but the welcome email failed to send.')
+      setSupportStatus(`Subscribed, but the welcome email failed to send. ${err instanceof Error ? err.message : ''}`.trim())
     }
   }
 
@@ -2905,12 +3011,12 @@ export default function App() {
                   <button
                     className="btn-primary protect-verify-ownership-btn"
                     type="button"
-                    onClick={() => setActiveView('etherscan')}
+                    onClick={() => setActiveView('ownership')}
                   >
-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="18" height="18" strokeLinecap="round" strokeLinejoin="round"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="18" height="18" strokeLinecap="round" strokeLinejoin="round"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg>
                     Verify Wallet Ownership
                   </button>
-                  <p className="protect-verify-hint">View your on-chain transaction history and confirm wallet control.</p>
+                  <p className="protect-verify-hint">Sign a challenge message to prove wallet control, then open your live explorer dashboard.</p>
                 </div>
               </div>
             ) : (
@@ -3547,11 +3653,10 @@ export default function App() {
                       {emailSentMsg}
                     </div>
                   )}
-                  {!EMAIL_CONFIGURED && (
-                    <p className="form-hint" style={{ marginTop: '0.5rem' }}>
-                      To enable live email delivery, set your EmailJS Service ID, Template ID, and Public Key in <code>App.tsx</code>.
-                    </p>
-                  )}
+                  <p className="form-hint" style={{ marginTop: '0.5rem' }}>
+                    Email delivery is powered by Resend via <code>/api/send-email</code>. Configure
+                    {' '}<code>RESEND_API_KEY</code> and <code>RESEND_FROM_EMAIL</code> in your Vercel project env to enable live sending.
+                  </p>
                 </div>
               </div>
             )}
@@ -3952,39 +4057,165 @@ export default function App() {
           </div>
         )}
 
-        {activeView === 'ownership' && (
+        {activeView === 'ownership' && (() => {
+          const wcAddr = wcSessions[0]?.address
+          const hasWcSession = wcStatus === 'connected' && !!wcAddr
+          const displayAddr = wcAddr || appKitAddress || wallet
+          const isVerified = ownershipStatus.includes('verified')
+          const canSign = ownershipTermsAccepted && (hasWcSession || isWalletConnected) && (displayAddr ? isAddress(displayAddr) : false)
+          return (
           <div className="workspace single">
-            <div className="page-header"><h2>Wallet Ownership Check</h2><p>Verify control of a wallet with a timestamped signature. No seed phrase, no funds moved.</p></div>
-            <div className="card">
-              <div className="field">
-                <label htmlFor="own-network">Network</label>
-                <select id="own-network" value={chain} onChange={e => setChain(e.target.value as ChainKey)}>
-                  {Object.entries(chainConfig).map(([k, v]) => <option key={k} value={k}>{v.label}</option>)}
-                </select>
+            {/* Header */}
+            <div className="page-header">
+              <h2>Verify Wallet Ownership</h2>
+              <p>Prove control of your wallet with a one-time cryptographic signature. No seed phrase, no funds moved, fully non-custodial.</p>
+            </div>
+
+            {/* Connection status strip */}
+            <div className={`own-status-strip ${hasWcSession || isWalletConnected ? 'own-status-strip--connected' : ''}`}>
+              <div className="own-status-left">
+                {(hasWcSession || isWalletConnected) ? (
+                  <>
+                    <span className="own-status-dot own-status-dot--on" />
+                    <span className="own-status-label">
+                      {hasWcSession ? `${wcSessions[0]?.walletName ?? 'Wallet'} connected via WalletConnect` : 'Wallet connected'}
+                    </span>
+                  </>
+                ) : (
+                  <>
+                    <span className="own-status-dot own-status-dot--off" />
+                    <span className="own-status-label muted">No wallet connected</span>
+                  </>
+                )}
               </div>
-              <div className="field">
-                <label htmlFor="own-address">Wallet Address</label>
-                <input id="own-address" type="text" value={wallet} onChange={e => setWallet(e.target.value)} placeholder="0x…" />
-                {wallet && !addressValid && <p className="field-error">Enter a valid EVM address.</p>}
-              </div>
-              {!isWalletConnected && <button className="btn-primary" type="button" style={{ marginBottom: '1rem' }} onClick={() => { void openWalletModal() }}>Connect Wallet</button>}
-              <label className="terms-row">
-                <input type="checkbox" checked={ownershipTermsAccepted} onChange={e => setOwnershipTermsAccepted(e.target.checked)} />
-                <span>I understand this tool requests a wallet signature for ownership verification. No seed phrase or private key is ever collected.</span>
-              </label>
-              <div className="action-row">
-                {wallet && isWalletConnected && !isConnectedToChain && <button className="btn-secondary" type="button" onClick={switchNetwork}>Switch Network</button>}
-                <button className="btn-primary" type="button" onClick={testSigner} disabled={isTestingSigner || !addressValid || !ownershipTermsAccepted || !isWalletConnected}>
-                  {isTestingSigner ? 'Requesting…' : 'Request Signature'}
+              {displayAddr && isAddress(displayAddr) && (
+                <code className="own-addr-chip">{displayAddr.slice(0, 8)}…{displayAddr.slice(-6)}</code>
+              )}
+            </div>
+
+            <div className="own-grid">
+              {/* Left — form */}
+              <div className="card own-form-card">
+                <h3 className="own-card-title">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="18" height="18" strokeLinecap="round" strokeLinejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+                  Ownership Verification
+                </h3>
+
+                <div className="field">
+                  <label htmlFor="own-network">Network</label>
+                  <select id="own-network" value={chain} onChange={e => setChain(e.target.value as ChainKey)}>
+                    {Object.entries(chainConfig).map(([k, v]) => <option key={k} value={k}>{v.label}</option>)}
+                  </select>
+                </div>
+
+                {!hasWcSession && (
+                  <div className="field">
+                    <label htmlFor="own-address">Wallet Address</label>
+                    <input id="own-address" type="text" value={wallet} onChange={e => setWallet(e.target.value)} placeholder="0x…" />
+                    {wallet && !addressValid && <p className="field-error">Enter a valid EVM address (0x… 40 hex chars).</p>}
+                  </div>
+                )}
+
+                {!hasWcSession && !isWalletConnected && (
+                  <button className="btn-primary" type="button" style={{ marginBottom: '1rem', width: '100%' }} onClick={() => { void openWalletModal() }}>
+                    <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.6" width="14" height="14"><rect x="2" y="5" width="16" height="12" rx="2"/><path d="M14 11a1 1 0 1 0 0-2 1 1 0 0 0 0 2z" fill="currentColor" stroke="none"/><path d="M2 9h16"/></svg>
+                    &nbsp;Connect Wallet
+                  </button>
+                )}
+
+                {!hasWcSession && isWalletConnected && !isConnectedToChain && (
+                  <button className="btn-secondary" type="button" style={{ marginBottom: '0.8rem', width: '100%' }} onClick={switchNetwork}>
+                    Switch to {chainConfig[chain].label}
+                  </button>
+                )}
+
+                <label className="terms-row" style={{ marginBottom: '1.2rem' }}>
+                  <input type="checkbox" checked={ownershipTermsAccepted} onChange={e => setOwnershipTermsAccepted(e.target.checked)} />
+                  <span>I understand this requests a cryptographic signature for ownership verification. No seed phrase or private key is ever collected.</span>
+                </label>
+
+                <button
+                  className="btn-primary own-sign-btn"
+                  type="button"
+                  onClick={testSigner}
+                  disabled={isTestingSigner || !canSign}
+                >
+                  {isTestingSigner ? (
+                    <><span className="spinner" /> Requesting Signature…</>
+                  ) : isVerified ? (
+                    <>✅ Verified — Open Explorer</>
+                  ) : (
+                    <>
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="15" height="15" strokeLinecap="round" strokeLinejoin="round"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg>
+                      &nbsp;Request Ownership Signature
+                    </>
+                  )}
+                </button>
+
+                {!canSign && !isTestingSigner && (
+                  <p className="form-hint" style={{ marginTop: '0.5rem', fontSize: '0.8rem' }}>
+                    {!ownershipTermsAccepted ? 'Accept the terms above to continue.' : 'Connect your wallet to request a signature.'}
+                  </p>
+                )}
+
+                <div className={`status-bar ${isVerified ? 'status-bar--success' : ownershipStatus.includes('failed') || ownershipStatus.includes('Failed') ? 'status-bar--warn' : ''}`} style={{ marginTop: '1rem' }}>
+                  <span className={`status-dot ${isVerified ? 'active' : ownershipStatus.includes('failed') || ownershipStatus.includes('Failed') ? 'warn' : ''}`} />
+                  {ownershipStatus || 'Awaiting ownership verification.'}
+                </div>
+
+                <button type="button" className="btn-secondary" style={{ marginTop: '0.75rem', width: '100%' }} onClick={() => setActiveView('protect')}>
+                  ← Back to Protect
                 </button>
               </div>
-              <div className="status-bar" style={{ marginTop: '1rem' }}>
-                <span className={`status-dot ${ownershipStatus.includes('verified') ? 'active' : ''}`} />
-                {ownershipStatus}
+
+              {/* Right — explainer */}
+              <div className="own-explainer-col">
+                <div className="card own-info-card">
+                  <h4>How it works</h4>
+                  <ol className="own-steps-list">
+                    <li>
+                      <span className="own-step-num">1</span>
+                      <span>Your wallet app shows a <strong>signature request</strong> with a timestamped challenge message.</span>
+                    </li>
+                    <li>
+                      <span className="own-step-num">2</span>
+                      <span>You <strong>approve</strong> the request — this proves you hold the private key without exposing it.</span>
+                    </li>
+                    <li>
+                      <span className="own-step-num">3</span>
+                      <span>Ownership is <strong>confirmed</strong> and you are redirected to your live wallet dashboard.</span>
+                    </li>
+                  </ol>
+                </div>
+
+                <div className="card own-security-card">
+                  <h4>Security guarantees</h4>
+                  <ul className="own-security-list">
+                    <li>🔒 Read-only — no transaction is sent</li>
+                    <li>🚫 No seed phrase or private key collected</li>
+                    <li>⏱ Challenge is timestamped and single-use</li>
+                    <li>✅ Industry-standard <code>personal_sign</code></li>
+                  </ul>
+                </div>
+
+                {hasWcSession && (
+                  <div className="card own-session-card">
+                    <h4>Active Session</h4>
+                    <div className="own-session-detail"><span>Wallet</span><code>{wcSessions[0]?.walletName}</code></div>
+                    <div className="own-session-detail"><span>Address</span><code>{wcAddr?.slice(0,8)}…{wcAddr?.slice(-6)}</code></div>
+                    <div className="own-session-detail"><span>Connected</span><code>{wcSessions[0]?.connectedAt}</code></div>
+                    <div className="own-session-detail"><span>Status</span>
+                      <span className={`pill ${wcSessions[0]?.ownershipVerified ? 'low' : 'medium'}`}>
+                        {wcSessions[0]?.ownershipVerified ? '✓ Verified' : 'Pending'}
+                      </span>
+                    </div>
+                  </div>
+                )}
               </div>
             </div>
           </div>
-        )}
+          )
+        })()}
 
         {/* ════════════ RECOVERY ════════════ */}
         {activeView === 'recovery' && (
@@ -4273,11 +4504,11 @@ export default function App() {
                   {adminTab === 'emails' && (
                     <div className="admin-panel">
                       <h3>User Emails ({emailRecords.length})</h3>
-                      {!EMAIL_CONFIGURED && (
-                        <div className="config-notice">
-                          <strong>EmailJS not configured.</strong> Reports are captured here but not delivered. Add your EmailJS credentials to <code>App.tsx</code> to enable sending.
-                        </div>
-                      )}
+                      <div className="config-notice">
+                        <strong>Email delivery: Resend</strong> (server-side via <code>/api/send-email</code>).
+                        Set <code>RESEND_API_KEY</code> and <code>RESEND_FROM_EMAIL</code> in your Vercel project env vars
+                        — failures will appear in the Status column below.
+                      </div>
                       {emailRecords.length === 0 ? <p className="admin-empty">No email submissions yet.</p> : (
                         <div className="table-wrap">
                           <table className="admin-table">
