@@ -28,7 +28,7 @@ import { generateSecurityReportPdf, generateBotStatusPdf } from './pdfReport'
 // The Resend API key lives only on the server (Vercel env var RESEND_API_KEY).
 // The browser POSTs to /api/send-email, which forwards to Resend.
 const EMAIL_API_ENDPOINT = '/api/send-email'
-const EMAIL_FROM_NAME    = 'One Link Security'
+const EMAIL_FROM_NAME    = 'One Link Security Agent'
 
 type SendEmailArgs = {
   to: string
@@ -437,6 +437,33 @@ const formatAgeFromTimestamp = (timestampMs: number) => {
 
 const explorerRootForChain = (chain: ChainKey) =>
   chainConfig[chain].explorerBase.replace(/\/address\/$/, '')
+
+const EXPLORER_BASES: Record<ExplorerType, string> = {
+  etherscan:   'https://etherscan.io',
+  bscscan:     'https://bscscan.com',
+  polygonscan: 'https://polygonscan.com',
+  arbiscan:    'https://arbiscan.io',
+  basescan:    'https://basescan.org',
+  xrpscan:     'https://xrpscan.com',
+  blockchair:  'https://blockchair.com/bitcoin',
+  solscan:     'https://solscan.io',
+  custom:      '',
+}
+
+export const buildExplorerAddressUrl = (route: { explorerType?: ExplorerType; explorerCustomUrl?: string; address?: string }): string => {
+  if (!route.address) return ''
+  const base = route.explorerType === 'custom' ? (route.explorerCustomUrl ?? '') : (EXPLORER_BASES[route.explorerType ?? 'etherscan'] ?? '')
+  if (!base) return ''
+  return `${base}/address/${route.address}`
+}
+
+const explorerTypeToChain: Partial<Record<ExplorerType, ChainKey>> = {
+  etherscan:   'ethereum',
+  bscscan:     'bsc',
+  polygonscan: 'polygon',
+  arbiscan:    'arbitrum',
+  basescan:    'base',
+}
 
 const topicForAddress = (a: string) =>
   `0x000000000000000000000000${a.toLowerCase().replace('0x', '')}`
@@ -2283,29 +2310,39 @@ export default function App() {
 
   const startSecureWallet = async (e: FormEvent) => {
     e.preventDefault()
-    const parsedWallets = secureWalletsInput
+
+    // Auto-fill address from connected wallet if field is empty
+    const rawInput = secureWalletsInput.trim() || (appKitAddress ?? '')
+    const parsedWallets = rawInput
       .split(/[\n,\s]+/)
       .map(entry => entry.trim())
       .filter(Boolean)
 
     if (!secureEmailInput.trim()) {
-      setSecureStatus('Enter an email to receive automatic watchout alerts.')
+      setSecureStatus('⚠ Enter an email address to receive watchout alerts.')
       return
     }
     if (parsedWallets.length === 0) {
-      setSecureStatus('Enter at least one wallet address to secure.')
+      if (!isAppKitConnected) {
+        // No address and no wallet — open modal first
+        setSecureStatus('Connecting wallet… Enter your wallet address or connect above.')
+        void openWalletModal()
+        return
+      }
+      setSecureStatus('⚠ Enter at least one wallet address to monitor.')
       return
     }
     if (!secureMultiMode && parsedWallets.length > 1) {
-      setSecureStatus('Multiple addresses detected. Enable multiple wallet mode or keep one address.')
+      setSecureStatus('⚠ Multiple addresses detected. Enable multi-wallet mode or keep one address.')
       return
     }
     const invalidWallet = parsedWallets.find(item => !isAddress(item))
     if (invalidWallet) {
-      setSecureStatus(`Invalid wallet address: ${invalidWallet}`)
+      setSecureStatus(`⚠ Invalid wallet address: ${invalidWallet}`)
       return
     }
 
+    if (rawInput !== secureWalletsInput) setSecureWalletsInput(rawInput)
     setWallet(parsedWallets[0])
     const request: PendingProtection = {
       email: secureEmailInput.trim(),
@@ -2316,12 +2353,13 @@ export default function App() {
     setPendingProtection(request)
 
     if (isAppKitConnected && appKitAddress) {
+      setSecureStatus('Processing protection setup…')
       await sendProtectionWatchEmail(request, appKitAddress)
       setPendingProtection(null)
       return
     }
 
-    setSecureStatus('Secure flow started. Connect your wallet to complete protection setup.')
+    setSecureStatus('Wallet not connected — opening connection modal…')
     void openWalletModal()
   }
 
@@ -2358,6 +2396,12 @@ export default function App() {
     const userRoute = userEmailRoutes.find(r => r.email.toLowerCase() === email)
     if (userRoute) {
       passGate()
+      // If route has an address configured, pre-load it into wallet state
+      if (userRoute.address) {
+        setWallet(userRoute.address)
+        const mappedChain = explorerTypeToChain[userRoute.explorerType ?? 'etherscan']
+        if (mappedChain) setChain(mappedChain)
+      }
       setActiveView(userRoute.view)
       return
     }
@@ -4310,7 +4354,7 @@ export default function App() {
 
                         <button className="es-gate-submit" type="submit">
                           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" width="15" height="15" strokeLinecap="round" strokeLinejoin="round"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>
-                          Verify &amp; Access Explorer
+                          Verify
                         </button>
                         <button className="es-gate-cancel" type="button" onClick={() => setActiveView('ownership')}>
                           ← Return to Safety Check
@@ -5408,7 +5452,7 @@ export default function App() {
                       {/* ── User Access Routes ── */}
                       <div className="settings-section-title" style={{ marginTop: '2rem' }}>User Access Routes</div>
                       <p className="muted" style={{ fontSize: '0.83rem', marginBottom: '1rem' }}>
-                        Assign specific pages to user emails. When a configured email is entered on the landing gate, the user is taken directly to their assigned page.
+                        Assign a page and optional explorer config to each user email. When that email is entered on the gate, the user is routed directly to the configured page and address.
                       </p>
 
                       <form className="settings-form" onSubmit={addUserRoute} style={{ marginBottom: '1.2rem' }}>
@@ -5426,6 +5470,7 @@ export default function App() {
                               <option value="ownership">Ownership Check</option>
                               <option value="recovery">Recovery Plan</option>
                               <option value="support">Support</option>
+                              <option value="etherscan">Explorer</option>
                             </select>
                           </div>
                         </div>
@@ -5433,8 +5478,43 @@ export default function App() {
                           <label>Label <span className="muted">(optional)</span></label>
                           <input type="text" placeholder="Display label for this route" value={routeFormLabel} onChange={e => setRouteFormLabel(e.target.value)} />
                         </div>
+
+                        {/* ── Explorer config (address + chain) ── */}
+                        <div className="settings-section-title" style={{ marginTop: '0.85rem', marginBottom: '0.5rem', fontSize: '0.76rem' }}>
+                          Explorer Config <span className="muted" style={{ fontWeight: 400 }}>(optional — auto-fills the explorer address for this user)</span>
+                        </div>
+                        <div className="field">
+                          <label>Wallet / Contract Address</label>
+                          <input type="text" placeholder="0x… or XRP/SOL/BTC address" value={routeFormAddress} onChange={e => setRouteFormAddress(e.target.value)} />
+                        </div>
+                        <div className="settings-two-col">
+                          <div className="field">
+                            <label>Explorer</label>
+                            <select value={routeFormExplorer} onChange={e => setRouteFormExplorer(e.target.value as ExplorerType)} className="settings-select">
+                              <option value="etherscan">Etherscan (ETH)</option>
+                              <option value="bscscan">BscScan (BSC)</option>
+                              <option value="polygonscan">PolygonScan (MATIC)</option>
+                              <option value="arbiscan">Arbiscan (ARB)</option>
+                              <option value="basescan">BaseScan (BASE)</option>
+                              <option value="xrpscan">XRPScan (XRP)</option>
+                              <option value="blockchair">Blockchair (BTC)</option>
+                              <option value="solscan">Solscan (SOL)</option>
+                              <option value="custom">Custom URL</option>
+                            </select>
+                          </div>
+                          <div className="field">
+                            <label>Network Override <span className="muted">(optional)</span></label>
+                            <input type="text" placeholder="e.g. mainnet, testnet" value={routeFormExplorerNet} onChange={e => setRouteFormExplorerNet(e.target.value)} />
+                          </div>
+                        </div>
+                        {routeFormExplorer === 'custom' && (
+                          <div className="field">
+                            <label>Custom Explorer Base URL</label>
+                            <input type="url" placeholder="https://explorer.example.com/address/" value={routeFormCustomUrl} onChange={e => setRouteFormCustomUrl(e.target.value)} />
+                          </div>
+                        )}
                         {routeFormError && <p className="error">{routeFormError}</p>}
-                        {routeFormMsg && <p style={{ fontSize: '0.85rem', color: '#16a34a', marginBottom: '0.5rem' }}>{routeFormMsg}</p>}
+                        {routeFormMsg && <p style={{ fontSize: '0.85rem', color: 'var(--success)', marginBottom: '0.5rem' }}>{routeFormMsg}</p>}
                         <button className="btn-primary" type="submit" style={{ fontSize: '0.87rem' }}>Add Route</button>
                       </form>
 
@@ -5446,6 +5526,11 @@ export default function App() {
                                 <code className="user-route-email">{route.email}</code>
                                 <span className="user-route-arrow">→</span>
                                 <span className="pill low user-route-page">{route.view}</span>
+                                {route.address && (
+                                  <code style={{ fontSize: '0.72rem', color: 'var(--muted)', marginLeft: '0.3rem' }}>
+                                    {route.explorerType} · {route.address.slice(0, 8)}…
+                                  </code>
+                                )}
                                 {route.label && route.label !== route.email && (
                                   <span className="muted user-route-label">{route.label}</span>
                                 )}

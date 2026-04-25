@@ -32,7 +32,7 @@ export default async function handler(req: Request): Promise<Response> {
   }
 
   const apiKey = (process.env.RESEND_API_KEY ?? '').trim()
-  const fromEmail = (process.env.RESEND_FROM_EMAIL ?? 'support@one-key.link').trim()
+  const fromEmail = (process.env.RESEND_FROM_EMAIL ?? 'agent@one-key.link').trim()
 
   if (!apiKey) {
     return json(
