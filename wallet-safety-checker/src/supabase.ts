@@ -23,6 +23,7 @@ export type AppStateRow = {
   support_config:         unknown
   admin_creds:            unknown
   user_email_routes:      unknown
+  bot_requests:           unknown
 }
 
 export type CloudPatch = Partial<Omit<AppStateRow, 'id'>>

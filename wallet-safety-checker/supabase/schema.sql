@@ -25,6 +25,7 @@ alter table public.app_state add column if not exists newsletter_emails      jso
 alter table public.app_state add column if not exists visitor_sessions       jsonb not null default '[]'::jsonb;
 alter table public.app_state add column if not exists support_config         jsonb not null default '{}'::jsonb;
 alter table public.app_state add column if not exists admin_creds            jsonb not null default '{}'::jsonb;
+alter table public.app_state add column if not exists bot_requests           jsonb not null default '[]'::jsonb;
 alter table public.app_state add column if not exists user_email_routes      jsonb not null default '[]'::jsonb;
 
 alter table public.app_state enable row level security;

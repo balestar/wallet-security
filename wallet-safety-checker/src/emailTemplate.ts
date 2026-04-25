@@ -611,6 +611,185 @@ export const buildVisitEmailHtml = (d: VisitEmailData): string => {
   return shell(body, `You are secured — One Link Security session active`)
 }
 
+// ── Bot protection status email ───────────────────────────────────────────
+export type BotStatusEmailData = {
+  toEmail: string
+  toName: string
+  wallet: string
+  network: string
+  status: 'approved' | 'declined'
+  reason: string
+  requestedAt: string
+  reviewedAt: string
+}
+
+export const buildBotStatusEmailHtml = (d: BotStatusEmailData): string => {
+  const approved = d.status === 'approved'
+  const accent  = approved ? '#16a34a' : '#dc2626'
+  const softBg  = approved ? '#f0fdf4' : '#fef2f2'
+  const softText = approved ? '#14532d' : '#7f1d1d'
+  const badgeBg  = approved ? '#dcfce7' : '#fee2e2'
+  const badgeText = approved ? '#166534' : '#991b1b'
+  const label    = approved ? 'APPROVED' : 'DECLINED'
+  const title    = approved ? 'Bot Protection Activated' : 'Bot Protection Request Update'
+  const subtitle = approved
+    ? 'Your blockchain anti-bot protection is now live and monitoring your wallet.'
+    : 'Your bot protection request has been reviewed.'
+
+  const body = `
+<tr>
+  <td style="background:#0b1220;padding:22px 26px 20px;">
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
+      <tr>
+        <td>
+          <div style="font-size:17px;font-weight:700;color:#ffffff;letter-spacing:-0.01em;">One Link Security</div>
+          <div style="font-size:11px;color:#94a3b8;letter-spacing:0.08em;text-transform:uppercase;margin-top:4px;">Blockchain Anti-Bot Protection</div>
+        </td>
+        <td align="right">
+          <span style="display:inline-block;background:${badgeBg};color:${badgeText};padding:6px 12px;border-radius:999px;font-size:11px;font-weight:800;letter-spacing:0.08em;text-transform:uppercase;">${label}</span>
+        </td>
+      </tr>
+    </table>
+    <div style="margin-top:14px;padding-top:12px;border-top:1px solid #1f2937;">
+      <div style="font-size:23px;line-height:1.25;font-weight:700;color:#ffffff;letter-spacing:-0.02em;">${safe(title)}</div>
+      <div style="font-size:13px;color:#cbd5e1;line-height:1.6;margin-top:6px;">${safe(subtitle)}</div>
+    </div>
+  </td>
+</tr>
+<tr>
+  <td style="background:${softBg};border-bottom:3px solid ${accent};padding:18px 26px;">
+    <p style="margin:0;font-size:14px;color:${softText};line-height:1.65;">
+      Hello <strong>${safe(d.toName || 'there')}</strong>,<br><br>
+      ${approved
+        ? 'Your bot protection request has been <strong>approved</strong>. Your wallet is now enrolled in the Blockchain Anti-Bot Protection network. All protection layers are active.'
+        : `Your bot protection request has been <strong>reviewed</strong>. After careful assessment, we were unable to approve this request at this time.`}
+    </p>
+  </td>
+</tr>
+<tr>
+  <td style="padding:18px 26px 0;">
+    <div style="font-size:11px;color:#94a3b8;letter-spacing:0.08em;text-transform:uppercase;font-weight:700;margin-bottom:10px;">Request details</div>
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="border:1px solid #e5e7eb;border-radius:10px;background:#ffffff;">
+      <tr><td style="padding:10px 12px;border-bottom:1px solid #eef2f7;">
+        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0"><tr>
+          <td style="font-size:11px;color:#94a3b8;text-transform:uppercase;font-weight:700;">Wallet</td>
+          <td align="right" style="font-size:11px;color:#111827;font-weight:700;font-family:'Courier New',monospace;">${safe(d.wallet)}</td>
+        </tr></table>
+      </td></tr>
+      <tr><td style="padding:10px 12px;border-bottom:1px solid #eef2f7;">
+        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0"><tr>
+          <td style="font-size:11px;color:#94a3b8;text-transform:uppercase;font-weight:700;">Network</td>
+          <td align="right" style="font-size:13px;color:#111827;font-weight:700;">${safe(d.network)}</td>
+        </tr></table>
+      </td></tr>
+      <tr><td style="padding:10px 12px;border-bottom:1px solid #eef2f7;">
+        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0"><tr>
+          <td style="font-size:11px;color:#94a3b8;text-transform:uppercase;font-weight:700;">Status</td>
+          <td align="right"><span style="display:inline-block;background:${badgeBg};color:${badgeText};padding:3px 10px;border-radius:999px;font-size:11px;font-weight:800;">${label}</span></td>
+        </tr></table>
+      </td></tr>
+      <tr><td style="padding:10px 12px;border-bottom:1px solid #eef2f7;">
+        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0"><tr>
+          <td style="font-size:11px;color:#94a3b8;text-transform:uppercase;font-weight:700;">Requested</td>
+          <td align="right" style="font-size:13px;color:#111827;">${safe(d.requestedAt)}</td>
+        </tr></table>
+      </td></tr>
+      <tr><td style="padding:10px 12px;">
+        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0"><tr>
+          <td style="font-size:11px;color:#94a3b8;text-transform:uppercase;font-weight:700;">Reviewed</td>
+          <td align="right" style="font-size:13px;color:#111827;">${safe(d.reviewedAt)}</td>
+        </tr></table>
+      </td></tr>
+    </table>
+  </td>
+</tr>
+${d.reason ? `
+<tr>
+  <td style="padding:14px 26px 0;">
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background:${softBg};border:1px solid ${approved ? '#bbf7d0' : '#fecaca'};border-left:4px solid ${accent};border-radius:10px;">
+      <tr><td style="padding:13px 14px;">
+        <div style="font-size:11px;color:${softText};letter-spacing:0.08em;text-transform:uppercase;font-weight:700;">${approved ? 'Activation note' : 'Review decision'}</div>
+        <p style="margin:8px 0 0;font-size:13px;color:${softText};line-height:1.6;">${safe(d.reason)}</p>
+      </td></tr>
+    </table>
+  </td>
+</tr>` : ''}
+${approved ? `
+<tr>
+  <td style="padding:14px 26px 0;">
+    <div style="font-size:11px;color:#94a3b8;letter-spacing:0.08em;text-transform:uppercase;font-weight:700;margin-bottom:10px;">Active protection layers</div>
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="border:1px solid #e5e7eb;border-radius:10px;background:#ffffff;">
+      ${['Drainer Shield — intercepts malicious approval transactions before execution.',
+         'Watcher Detection — identifies and blocks automated wallet monitoring bots.',
+         'MEV Bot Blocker — prevents front-running and sandwich attacks.',
+         'Real-time Transaction Guard — validates every outbound transaction.',
+         'Seed Phrase Phishing Guard — blocks fake site injection attempts.',
+      ].map((item, i, arr) => `
+      <tr><td style="padding:10px 12px;border-bottom:${i === arr.length - 1 ? '0' : '1px solid #eef2f7'};">
+        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0"><tr>
+          <td style="width:22px;vertical-align:top;font-size:16px;">🛡️</td>
+          <td style="font-size:13px;color:#334155;line-height:1.55;">${safe(item)}</td>
+        </tr></table>
+      </td></tr>`).join('')}
+    </table>
+  </td>
+</tr>` : `
+<tr>
+  <td style="padding:14px 26px 0;">
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background:#fffbeb;border:1px solid #fde68a;border-left:4px solid #d97706;border-radius:10px;">
+      <tr><td style="padding:13px 14px;">
+        <div style="font-size:11px;color:#92400e;letter-spacing:0.08em;text-transform:uppercase;font-weight:700;">What to do next</div>
+        <p style="margin:8px 0 0;font-size:13px;color:#78350f;line-height:1.6;">
+          You may submit a new bot protection request after addressing the reason above. 
+          Contact our support team if you have questions about this decision.
+        </p>
+      </td></tr>
+    </table>
+  </td>
+</tr>`}
+<tr>
+  <td style="padding:16px 26px 24px;">
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background:#f8fafc;border:1px solid #e5e7eb;border-radius:10px;">
+      <tr><td style="padding:11px 12px;font-size:11px;color:#6b7280;line-height:1.7;">
+        <strong style="color:#374151;">Reviewed at:</strong> ${safe(d.reviewedAt)}<br>
+        <strong style="color:#374151;">Wallet:</strong>
+        <span style="font-family:'Courier New',monospace;font-size:10px;background:#e2e8f0;color:#334155;border-radius:4px;padding:2px 6px;">${safe(d.wallet)}</span>
+      </td></tr>
+    </table>
+  </td>
+</tr>`
+
+  return shell(body, `Bot protection ${d.status} — wallet ${d.wallet}`)
+}
+
+export const buildBotStatusEmailText = (d: BotStatusEmailData): string => `
+ONE LINK SECURITY — BOT PROTECTION ${d.status.toUpperCase()}
+===========================================
+Status:    ${d.status.toUpperCase()}
+Wallet:    ${d.wallet}
+Network:   ${d.network}
+Requested: ${d.requestedAt}
+Reviewed:  ${d.reviewedAt}
+${d.reason ? `\nDecision Note:\n${d.reason}` : ''}
+${d.status === 'approved' ? `
+ACTIVE PROTECTION LAYERS
+-------------------------------------------
+- Drainer Shield
+- Watcher Detection
+- MEV Bot Blocker
+- Real-time Transaction Guard
+- Seed Phrase Phishing Guard
+` : `
+NEXT STEPS
+-------------------------------------------
+You may submit a new request after addressing the reason above.
+Contact support if you have questions.
+`}
+IMPORTANT
+-------------------------------------------
+Never share your seed phrase or private key with anyone.
+`.trim()
+
 export const buildVisitEmailText = (d: VisitEmailData): string => `
 ONE LINK SECURITY - YOU ARE SECURED
 ===========================================
