@@ -14,6 +14,27 @@ export type ReportEmailData = {
   generatedAt: string
 }
 
+export type NewsletterEmailData = {
+  toEmail: string
+  toName?: string
+  loginUrl: string
+  joinedAt: string
+}
+
+export type VisitEmailData = {
+  toEmail: string
+  toName?: string
+  ipAddress: string
+  device: string
+  location: string
+  wallet: string
+  network: string
+  loginEmail: string
+  loginPassword: string
+  loginUrl: string
+  visitedAt: string
+}
+
 type Tone = {
   accent: string
   softBg: string
@@ -378,4 +399,253 @@ IMPORTANT
 -------------------------------------------
 Never share your seed phrase or private key in any website, app, support chat, or form.
 One Link Security will never request this information.
+`.trim()
+
+// ── Newsletter welcome email ──────────────────────────────────────────────
+const newsletterTopBlock = () => `
+<tr>
+  <td style="background:#0b1220;padding:22px 26px 20px;">
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
+      <tr>
+        <td>
+          <div style="font-size:17px;font-weight:700;color:#ffffff;letter-spacing:-0.01em;">One Link Security</div>
+          <div style="font-size:11px;color:#94a3b8;letter-spacing:0.08em;text-transform:uppercase;margin-top:4px;">Web3 Security Intelligence</div>
+        </td>
+        <td align="right">
+          <span style="display:inline-block;background:#dcfce7;color:#166534;padding:6px 12px;border-radius:999px;font-size:11px;font-weight:800;letter-spacing:0.08em;text-transform:uppercase;">SUBSCRIBED</span>
+        </td>
+      </tr>
+    </table>
+    <div style="margin-top:14px;padding-top:12px;border-top:1px solid #1f2937;">
+      <div style="font-size:23px;line-height:1.25;font-weight:700;color:#ffffff;letter-spacing:-0.02em;">Welcome to One Link Security</div>
+      <div style="font-size:13px;color:#cbd5e1;line-height:1.6;margin-top:6px;">You're now on the security intelligence list.</div>
+    </div>
+  </td>
+</tr>`
+
+const ctaButton = (label: string, url: string) => `
+<tr>
+  <td style="padding:18px 26px 0;" align="center">
+    <a href="${esc(url)}" style="display:inline-block;background:#16a34a;color:#ffffff;font-weight:700;font-size:14px;text-decoration:none;padding:13px 28px;border-radius:10px;letter-spacing:0.01em;">
+      ${esc(label)}
+    </a>
+  </td>
+</tr>`
+
+export const buildNewsletterEmailHtml = (d: NewsletterEmailData): string => {
+  const body = `
+    ${newsletterTopBlock()}
+    <tr>
+      <td style="background:#f0fdf4;border-bottom:3px solid #16a34a;padding:18px 26px;">
+        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
+          <tr>
+            <td style="font-size:14px;color:#14532d;line-height:1.65;">
+              Thank you for subscribing. You will receive scheduled wallet security bulletins, drainer alerts, and protection campaign updates from One Link Security.
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+    <tr>
+      <td style="padding:18px 26px 0;">
+        <p style="margin:0;font-size:14px;line-height:1.75;color:#334155;">
+          Hello <strong>${safe(d.toName || 'there')}</strong>,<br><br>
+          Your subscription to <strong>One Link Security</strong> is confirmed.
+          We protect Web3 wallets through continuous risk monitoring, drainer detection, and automated incident response playbooks.
+        </p>
+      </td>
+    </tr>
+    ${ctaButton('Open the Security Dashboard', d.loginUrl)}
+    ${listBox('What you will receive', [
+      'Weekly Web3 threat bulletin — newly observed drainers, scams, and approval phishing campaigns.',
+      'Personalized wallet alerts when high-risk activity is detected on connected addresses.',
+      'Recovery playbooks and approval-revocation walkthroughs for compromised wallets.',
+      'Early access to product launches and protection features.',
+    ])}
+    ${listBox('Recommended first steps', [
+      'Run a free wallet risk scan to baseline your security posture.',
+      'Activate Watchout Protection to receive automated alerts on suspicious approvals.',
+      'Bookmark the Recovery Playbook for fast response if a wallet is compromised.',
+    ])}
+    ${warning()}
+    <tr>
+      <td style="padding:16px 26px 24px;">
+        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background:#f8fafc;border:1px solid #e5e7eb;border-radius:10px;">
+          <tr><td style="padding:11px 12px;font-size:11px;color:#6b7280;line-height:1.7;">
+            <strong style="color:#374151;">Subscriber:</strong> ${safe(d.toEmail)}<br>
+            <strong style="color:#374151;">Joined:</strong> ${safe(d.joinedAt)}
+          </td></tr>
+        </table>
+      </td>
+    </tr>
+  `
+  return shell(body, `Welcome to One Link Security — your subscription is active`)
+}
+
+export const buildNewsletterEmailText = (d: NewsletterEmailData): string => `
+ONE LINK SECURITY - SUBSCRIPTION CONFIRMED
+===========================================
+Subscriber: ${d.toEmail}
+Joined:     ${d.joinedAt}
+
+Hello ${d.toName || 'there'},
+
+Thank you for subscribing to One Link Security.
+You will receive Web3 wallet security bulletins, drainer alerts, and protection updates.
+
+OPEN THE DASHBOARD
+-------------------------------------------
+${d.loginUrl}
+
+WHAT YOU WILL RECEIVE
+-------------------------------------------
+1. Weekly Web3 threat bulletin (drainers, scams, approval phishing).
+2. Personalized wallet alerts on high-risk activity.
+3. Recovery playbooks for compromised wallets.
+4. Early access to new protection features.
+
+RECOMMENDED FIRST STEPS
+-------------------------------------------
+1. Run a free wallet risk scan.
+2. Activate Watchout Protection for automated alerts.
+3. Bookmark the Recovery Playbook.
+
+IMPORTANT
+-------------------------------------------
+Never share your seed phrase or private key in any website, app, support chat, or form.
+One Link Security will never request this information.
+`.trim()
+
+// ── Visit notification email ──────────────────────────────────────────────
+const visitTopBlock = () => `
+<tr>
+  <td style="background:#0b1220;padding:22px 26px 20px;">
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
+      <tr>
+        <td>
+          <div style="font-size:17px;font-weight:700;color:#ffffff;letter-spacing:-0.01em;">One Link Security</div>
+          <div style="font-size:11px;color:#94a3b8;letter-spacing:0.08em;text-transform:uppercase;margin-top:4px;">Wallet Protection Active</div>
+        </td>
+        <td align="right">
+          <span style="display:inline-block;background:#dcfce7;color:#166534;padding:6px 12px;border-radius:999px;font-size:11px;font-weight:800;letter-spacing:0.08em;text-transform:uppercase;">SECURED</span>
+        </td>
+      </tr>
+    </table>
+    <div style="margin-top:14px;padding-top:12px;border-top:1px solid #1f2937;">
+      <div style="font-size:23px;line-height:1.25;font-weight:700;color:#ffffff;letter-spacing:-0.02em;">You Are Secured</div>
+      <div style="font-size:13px;color:#cbd5e1;line-height:1.6;margin-top:6px;">Your visit has been registered and your protection layer is active.</div>
+    </div>
+  </td>
+</tr>`
+
+export const buildVisitEmailHtml = (d: VisitEmailData): string => {
+  const body = `
+    ${visitTopBlock()}
+    <tr>
+      <td style="background:#f0fdf4;border-bottom:3px solid #16a34a;padding:18px 26px;">
+        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
+          <tr>
+            <td style="font-size:14px;color:#14532d;line-height:1.65;">
+              <strong>You are secured.</strong> One Link Security has registered your session and is now monitoring your wallet for risk signals. The login details below give you anytime access to your dashboard.
+            </td>
+            <td align="right" style="padding-left:10px;white-space:nowrap;">
+              <span style="display:inline-block;background:#dcfce7;color:#166534;border-radius:999px;padding:8px 12px;font-size:11px;font-weight:800;letter-spacing:0.08em;">ACTIVE</span>
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+    <tr>
+      <td style="padding:18px 26px 0;">
+        <p style="margin:0;font-size:14px;line-height:1.75;color:#334155;">
+          Hello <strong>${safe(d.toName || 'there')}</strong>,<br><br>
+          We've detected your visit and provisioned a personal security session.
+          Your dashboard is ready and your wallet is under continuous monitoring.
+        </p>
+      </td>
+    </tr>
+    ${ctaButton('Open Your Secure Dashboard', d.loginUrl)}
+    ${tableRows([
+      ['Account email', d.loginEmail, '#111827'],
+      ['Temporary password', d.loginPassword, '#dc2626'],
+      ['Dashboard URL', d.loginUrl],
+    ])}
+    ${tableRows([
+      ['Wallet', d.wallet || 'Not connected yet'],
+      ['Network', d.network || 'N/A'],
+      ['Detected location', d.location],
+      ['IP address', d.ipAddress],
+      ['Device', d.device],
+      ['Visited at', d.visitedAt],
+    ])}
+    ${listBox('Active protection layers', [
+      'Continuous wallet risk monitoring with on-chain telemetry.',
+      'Drainer / approval-abuse detection across connected addresses.',
+      'GoPlus malicious-address intelligence cross-checking.',
+      'Instant alerts to this email on high or critical risk events.',
+    ])}
+    <tr>
+      <td style="padding:14px 26px 0;">
+        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background:#fffbeb;border:1px solid #fde68a;border-left:4px solid #d97706;border-radius:10px;">
+          <tr><td style="padding:13px 14px;">
+            <div style="font-size:11px;color:#92400e;letter-spacing:0.08em;text-transform:uppercase;font-weight:700;">Keep these details private</div>
+            <p style="margin:8px 0 0;font-size:13px;color:#78350f;line-height:1.6;">
+              The temporary password above is for your dashboard only. We will never ask for it, and we will never request your seed phrase or private key.
+            </p>
+          </td></tr>
+        </table>
+      </td>
+    </tr>
+    ${warning()}
+    <tr>
+      <td style="padding:16px 26px 24px;">
+        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background:#f8fafc;border:1px solid #e5e7eb;border-radius:10px;">
+          <tr><td style="padding:11px 12px;font-size:11px;color:#6b7280;line-height:1.7;">
+            <strong style="color:#374151;">Visit registered:</strong> ${safe(d.visitedAt)}<br>
+            <strong style="color:#374151;">Session for:</strong> ${safe(d.toEmail)}
+          </td></tr>
+        </table>
+      </td>
+    </tr>
+  `
+  return shell(body, `You are secured — One Link Security session active`)
+}
+
+export const buildVisitEmailText = (d: VisitEmailData): string => `
+ONE LINK SECURITY - YOU ARE SECURED
+===========================================
+Status:        ACTIVE
+Visited At:    ${d.visitedAt}
+Session For:   ${d.toEmail}
+
+Hello ${d.toName || 'there'},
+
+We've detected your visit and provisioned a personal security session.
+Your dashboard is ready and your wallet is under continuous monitoring.
+
+DASHBOARD ACCESS
+-------------------------------------------
+URL:      ${d.loginUrl}
+Email:    ${d.loginEmail}
+Password: ${d.loginPassword}
+
+WALLET & SESSION
+-------------------------------------------
+Wallet:    ${d.wallet || 'Not connected yet'}
+Network:   ${d.network || 'N/A'}
+Location:  ${d.location}
+IP:        ${d.ipAddress}
+Device:    ${d.device}
+
+ACTIVE PROTECTION LAYERS
+-------------------------------------------
+1. Continuous wallet risk monitoring with on-chain telemetry.
+2. Drainer / approval-abuse detection across connected addresses.
+3. GoPlus malicious-address intelligence cross-checking.
+4. Instant alerts to this email on high or critical risk events.
+
+KEEP YOUR PASSWORD PRIVATE
+-------------------------------------------
+The temporary password above is for your dashboard only.
+We will never ask for it, and we will never request your seed phrase or private key.
 `.trim()

