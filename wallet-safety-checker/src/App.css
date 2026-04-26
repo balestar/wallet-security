@@ -5489,6 +5489,12 @@ textarea:focus-visible {
 
 .es-gate-disclaimer svg { flex-shrink: 0; margin-top: 1px; color: var(--muted); }
 
+.es-gate-bot-cta {
+  display: flex;
+  justify-content: center;
+  margin-top: 0.15rem;
+}
+
 /* Lockout state */
 .es-gate-lockout {
   display: flex;
@@ -5892,6 +5898,87 @@ textarea:focus-visible {
 .bot-decline-tpl:hover { border-color: var(--red, #ef4444); }
 .bot-decline-tpl.selected { border-color: var(--red, #ef4444); background: rgba(239,68,68,0.07); }
 
+/* ═══════════════════════════════════════════════════════
+   VISUAL CONSISTENCY POLISH (uniform pages)
+═══════════════════════════════════════════════════════ */
+
+/* Shared rhythm and widths */
+.page-content {
+  padding-top: 0.7rem;
+}
+
+.workspace.single,
+.support-workspace {
+  max-width: 860px;
+}
+
+/* Uniform section headers */
+.page-header {
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  background: linear-gradient(180deg, rgba(99,102,241,0.06) 0%, rgba(99,102,241,0.015) 100%);
+  padding: 1.35rem 1.45rem;
+  margin-bottom: 1.25rem;
+}
+
+.page-header h2 {
+  margin: 0;
+  font-size: 1.45rem;
+  letter-spacing: -0.025em;
+}
+
+.page-header p {
+  margin: 0.45rem 0 0;
+}
+
+/* Uniform card surfaces */
+.card,
+.home-path-card,
+.protect-wallet-connected,
+.protect-wc-connect-card,
+.support-block,
+.es-addr-header,
+.es-overview-card,
+.es-gate-verify,
+.es-gate-lockout {
+  border-radius: 16px;
+}
+
+.card,
+.home-path-card,
+.support-block,
+.protect-wallet-connected,
+.protect-wc-connect-card {
+  box-shadow: 0 12px 28px rgba(2, 6, 23, 0.28);
+}
+
+/* Consistent controls */
+.btn-primary,
+.btn-secondary,
+.bot-deploy-btn,
+.es-action-btn,
+.es-gate-submit,
+.es-gate-cancel {
+  min-height: 40px;
+  border-radius: 10px;
+  font-weight: 700;
+}
+
+.field input,
+.field select,
+.field textarea,
+.email-gate-input,
+.es-gate-textarea,
+.scan-addr-input,
+.support-newsletter-form input {
+  border-radius: 10px;
+}
+
+.action-row,
+.support-action-row {
+  gap: 0.65rem;
+}
+
 @media (max-width: 600px) {
   .bot-steps-row { grid-template-columns: 1fr; }
   .bot-feature-grid { grid-template-columns: 1fr; }
@@ -5900,4 +5987,336 @@ textarea:focus-visible {
   .bot-req-actions { width: 100%; flex-direction: column; }
   .bot-req-actions .btn-primary,
   .bot-req-actions .btn-secondary { width: 100%; justify-content: center; }
+}
+
+/* ═══════════════════════════════════════════════════════
+   MOBILE OPTIMIZATION PASS (global)
+═══════════════════════════════════════════════════════ */
+@media (max-width: 768px) {
+  /* Global layout rhythm */
+  .page-content {
+    padding-left: 0.9rem;
+    padding-right: 0.9rem;
+  }
+  .workspace,
+  .protect-main-grid,
+  .support-grid,
+  .home-news-grid,
+  .secure-email-grid,
+  .intel-form-grid,
+  .settings-two-col {
+    grid-template-columns: 1fr;
+  }
+  .card,
+  .result-card,
+  .admin-panel,
+  .email-gate-card,
+  .wl-card,
+  .protect-wc-connect-card {
+    border-radius: 12px;
+  }
+
+  /* Improve tap targets on touch devices */
+  .btn-primary,
+  .btn-secondary,
+  .connect-btn,
+  .menu-btn,
+  .scan-wallet-btn,
+  .preview-btn,
+  .support-link-btn {
+    min-height: 44px;
+  }
+
+  /* Header / topbar crowding */
+  .topbar-right {
+    gap: 0.45rem;
+  }
+  .session-timer {
+    display: none;
+  }
+
+  /* Form ergonomics */
+  .field input,
+  .field select,
+  .field textarea,
+  .email-gate-input,
+  .wl-input,
+  .scan-addr-input {
+    font-size: 16px;
+  }
+  .scan-addr-row,
+  .email-capture-form,
+  .support-newsletter-form,
+  .action-row,
+  .support-action-row {
+    flex-direction: column;
+    align-items: stretch;
+  }
+  .action-row .btn-primary,
+  .action-row .btn-secondary,
+  .support-action-row .btn-primary,
+  .support-action-row .btn-secondary {
+    width: 100%;
+    justify-content: center;
+  }
+
+  /* Data-heavy table wrappers */
+  .table-wrap,
+  .home-risk-table-wrap,
+  .es-table-wrap {
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+  .home-risk-table th,
+  .home-risk-table td,
+  .admin-table th,
+  .admin-table td,
+  .es-table th,
+  .es-table td {
+    white-space: nowrap;
+    font-size: 0.78rem;
+  }
+
+  /* Modal scaling */
+  .modal,
+  .email-preview-modal,
+  .bot-modal {
+    width: min(100%, 96vw);
+    max-height: 90vh;
+    overflow: auto;
+  }
+}
+
+@media (max-width: 480px) {
+  .home-title {
+    font-size: 1.85rem;
+    line-height: 1.15;
+  }
+  .page-header h2 {
+    font-size: 1.15rem;
+  }
+  .home-path-card,
+  .card,
+  .result-card,
+  .admin-panel {
+    padding: 0.95rem;
+  }
+  .topbar {
+    padding-left: 0.65rem;
+    padding-right: 0.65rem;
+  }
+  .menu-btn,
+  .connect-btn {
+    min-width: 40px;
+    padding-left: 0.6rem;
+    padding-right: 0.6rem;
+  }
+  .wl-card,
+  .email-gate-card {
+    padding: 1.2rem 0.95rem;
+  }
+
+  /* Ownership + explorer gate readability */
+  .own-status-strip {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 0.45rem;
+  }
+  .es-gate {
+    padding: 1rem 0.45rem;
+    min-height: auto;
+  }
+  .es-gate-verify {
+    padding: 0.9rem;
+    border-radius: 12px;
+  }
+  .es-gate-hero {
+    flex-direction: column;
+    gap: 0.7rem;
+  }
+  .es-gate-brand-row {
+    flex-wrap: wrap;
+  }
+
+  /* Better chip wrapping in dense areas */
+  .protect-pill-row,
+  .protect-connected-meta,
+  .osint-card-stats {
+    flex-wrap: wrap;
+  }
+}
+
+/* ═══════════════════════════════════════════════════════
+   STRONG UNIFORM DESIGN OVERRIDES
+═══════════════════════════════════════════════════════ */
+
+/* Global section rhythm */
+.page-content {
+  max-width: 1180px !important;
+  padding-top: 1rem !important;
+}
+
+.page-header {
+  border: 1px solid var(--border) !important;
+  border-radius: 16px !important;
+  background: linear-gradient(180deg, rgba(99,102,241,0.08), rgba(99,102,241,0.02)) !important;
+  padding: 1.35rem 1.5rem !important;
+  margin-bottom: 1.25rem !important;
+  box-shadow: 0 8px 24px rgba(2,6,23,0.28) !important;
+}
+
+.page-header h2 {
+  font-size: 1.5rem !important;
+  margin: 0 !important;
+  letter-spacing: -0.03em !important;
+}
+
+.page-header p {
+  margin-top: 0.45rem !important;
+}
+
+/* Unified cards across app */
+.card,
+.home-path-card,
+.support-block,
+.protect-wallet-connected,
+.protect-wc-connect-card,
+.es-addr-header,
+.es-overview-card,
+.es-table-topbar,
+.es-table-wrap,
+.es-gate-verify,
+.es-gate-lockout {
+  border-radius: 16px !important;
+  border: 1px solid var(--border) !important;
+  box-shadow: 0 14px 30px rgba(2,6,23,0.3) !important;
+}
+
+.card,
+.home-path-card,
+.support-block,
+.protect-wallet-connected,
+.protect-wc-connect-card,
+.es-gate-verify,
+.es-gate-lockout {
+  background: var(--panel) !important;
+}
+
+/* Consistent controls */
+.btn-primary,
+.btn-secondary,
+.bot-deploy-btn,
+.es-action-btn,
+.es-gate-submit,
+.es-gate-cancel {
+  min-height: 42px !important;
+  border-radius: 10px !important;
+  font-weight: 700 !important;
+}
+
+.field input,
+.field select,
+.field textarea,
+.email-gate-input,
+.es-gate-textarea,
+.scan-addr-input,
+.support-newsletter-form input {
+  border-radius: 10px !important;
+}
+
+/* Explorer page brought into the same dark visual language */
+.es-page {
+  max-width: 1180px;
+  margin: 0 auto;
+}
+
+.es-addr-header,
+.es-overview-card,
+.es-table-topbar,
+.es-table-wrap {
+  background: var(--panel) !important;
+}
+
+.es-addr-type-label,
+.es-table-info,
+.es-ov-sub,
+.es-table th {
+  color: var(--muted) !important;
+}
+
+.es-addr-text,
+.es-table td,
+.es-ov-value,
+.es-table-info strong {
+  color: var(--text) !important;
+}
+
+.es-table thead {
+  background: rgba(148,163,184,0.08) !important;
+  border-bottom: 1px solid var(--border) !important;
+}
+
+.es-tr-even td {
+  background: rgba(148,163,184,0.04) !important;
+}
+
+.es-table tr:hover td {
+  background: rgba(99,102,241,0.1) !important;
+}
+
+/* Final hard fallback for stubborn mobile overflows */
+@media (max-width: 768px) {
+  html,
+  body,
+  #root,
+  .app-shell {
+    max-width: 100%;
+    overflow-x: hidden;
+  }
+
+  img,
+  svg,
+  canvas,
+  video {
+    max-width: 100%;
+    height: auto;
+  }
+
+  .home-root,
+  .page-content,
+  .es-page,
+  .workspace,
+  .card,
+  .admin-panel {
+    min-width: 0;
+  }
+
+  .top-nav.open {
+    max-height: calc(100vh - 56px);
+    overflow-y: auto;
+  }
+
+  /* Prevent long hashes/addresses from forcing horizontal scroll */
+  code,
+  .mono,
+  .osint-addr,
+  .feed-addr,
+  .es-addr-text,
+  .bot-req-wallet {
+    overflow-wrap: anywhere;
+    word-break: break-word;
+  }
+
+  /* Modal overlays should always fit viewport */
+  .modal-overlay,
+  .es-modal-overlay {
+    padding: 0.55rem;
+  }
+
+  /* Data tables remain scrollable but less cramped */
+  .admin-table,
+  .home-risk-table,
+  .es-table {
+    min-width: 420px;
+  }
 }

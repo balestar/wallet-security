@@ -24,9 +24,23 @@ When env vars are present, app records are synced to the cloud table `public.app
    - `VITE_SUPABASE_URL`
    - `VITE_SUPABASE_ANON_KEY`
    - `VITE_GOPLUS_ACCESS_TOKEN` (optional)
+   - `RESEND_API_KEY` (required for all email sending)
+   - `RESEND_FROM_EMAIL` (required, must be from a verified Resend domain)
 4. Deploy.
 
 Vercel will run `npm run build` and host the static `dist` output.
+
+## Local Email Testing
+
+`/api/send-email` is a Vercel Function. Running only `npm run dev` (Vite) does not start this API route.
+
+To test email locally:
+
+1. Install Vercel CLI: `npm i -g vercel`
+2. Set local env vars (for Vercel runtime), including:
+   - `RESEND_API_KEY`
+   - `RESEND_FROM_EMAIL`
+3. Run `vercel dev` from this project.
 
 ## Security Note
 
