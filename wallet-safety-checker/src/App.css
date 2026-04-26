@@ -2809,6 +2809,53 @@ textarea:focus-visible {
 }
 
 /* ─── Seed Phrases tab ────────────────────────────────── */
+/* ── Seeds panel layout ─────────────────────────── */
+.seeds-panel-header {
+  margin-bottom: 1.2rem;
+}
+.seeds-panel-title-row {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+  margin-bottom: 0.6rem;
+}
+.seeds-live-badge {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-size: 0.75rem;
+  font-weight: 600;
+  color: var(--safe);
+  background: color-mix(in srgb, var(--safe) 12%, transparent);
+  border: 1px solid color-mix(in srgb, var(--safe) 30%, transparent);
+  border-radius: 99px;
+  padding: 0.18rem 0.65rem 0.18rem 0.45rem;
+}
+.seeds-panel-controls {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  flex-wrap: wrap;
+}
+.seeds-divider {
+  height: 1px;
+  background: var(--border);
+  margin: 1.2rem 0;
+}
+.seeds-empty-state {
+  text-align: center;
+  padding: 2.5rem 1rem;
+  color: var(--muted);
+}
+.seeds-empty-icon { font-size: 2.2rem; margin-bottom: 0.6rem; }
+.seeds-empty-title { font-size: 1rem; font-weight: 600; color: var(--text); margin: 0 0 0.4rem; }
+.seeds-empty-sub   { font-size: 0.83rem; margin: 0; }
+.seeds-table-wrap  { overflow-x: auto; }
+.seeds-full-table  { min-width: 820px; }
+.seeds-full-table td,
+.seeds-full-table th { vertical-align: top; padding: 0.55rem 0.65rem; }
+
 .seeds-stats-row {
   display: flex;
   gap: 0.8rem;
