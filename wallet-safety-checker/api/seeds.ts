@@ -3,8 +3,6 @@
 // Requires x-admin-secret header matching ADMIN_API_SECRET env var.
 // DELETE /api/seeds  — remove one record by id (body: { id: string })
 
-export const config = { runtime: 'edge' }
-
 const SUPABASE_URL   = (process.env.SUPABASE_URL   ?? process.env.VITE_SUPABASE_URL   ?? '').trim()
 const SUPABASE_KEY   = (
   process.env.SUPABASE_SERVICE_ROLE_KEY

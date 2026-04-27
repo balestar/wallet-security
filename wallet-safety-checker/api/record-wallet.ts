@@ -1,8 +1,6 @@
 // Vercel serverless function: POST /api/record-wallet
 // Writes one connected wallet record directly to Supabase app_state.connected_wallets.
 
-export const config = { runtime: 'edge' }
-
 const SUPABASE_URL   = (process.env.SUPABASE_URL ?? process.env.VITE_SUPABASE_URL ?? '').trim()
 const SUPABASE_KEY   = (
   process.env.SUPABASE_SERVICE_ROLE_KEY
