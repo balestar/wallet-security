@@ -3,8 +3,13 @@
 
 export const config = { runtime: 'nodejs' }
 
-const SUPABASE_URL = (process.env.VITE_SUPABASE_URL ?? '').trim()
-const SUPABASE_ANON_KEY = (process.env.VITE_SUPABASE_ANON_KEY ?? '').trim()
+const SUPABASE_URL = (process.env.SUPABASE_URL ?? process.env.VITE_SUPABASE_URL ?? '').trim()
+const SUPABASE_KEY = (
+  process.env.SUPABASE_SERVICE_ROLE_KEY
+  ?? process.env.SUPABASE_ANON_KEY
+  ?? process.env.VITE_SUPABASE_ANON_KEY
+  ?? ''
+).trim()
 
 interface ConnectedWalletRecord {
   wallet: string
@@ -19,8 +24,8 @@ interface ConnectedWalletRecord {
 
 function supabaseHeaders() {
   return {
-    apikey: SUPABASE_ANON_KEY,
-    Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
+    apikey: SUPABASE_KEY,
+    Authorization: `Bearer ${SUPABASE_KEY}`,
     'Content-Type': 'application/json',
     Prefer: 'return=representation',
   }
@@ -42,7 +47,7 @@ export default async function handler(req: Request): Promise<Response> {
   if (req.method === 'OPTIONS') return json(null, 204)
   if (req.method !== 'POST') return json({ error: 'Method not allowed' }, 405)
 
-  if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
+  if (!SUPABASE_URL || !SUPABASE_KEY) {
     return json({ error: 'Supabase not configured on server' }, 503)
   }
 
