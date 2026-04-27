@@ -31,6 +31,13 @@ function supabaseHeaders() {
   }
 }
 
+function supabaseUpsertHeaders() {
+  return {
+    ...supabaseHeaders(),
+    Prefer: 'resolution=merge-duplicates,return=representation',
+  }
+}
+
 function json(payload: unknown, status: number): Response {
   return new Response(JSON.stringify(payload), {
     status,
@@ -74,14 +81,15 @@ export default async function handler(req: Request): Promise<Response> {
     const existingKeys = new Set(existing.map(key))
     const merged = existingKeys.has(key(record)) ? existing : [record, ...existing]
 
-    const saveRes = await fetch(
-      `${SUPABASE_URL}/rest/v1/app_state?id=eq.global`,
-      {
-        method: 'PATCH',
-        headers: supabaseHeaders(),
-        body: JSON.stringify({ connected_wallets: merged }),
-      },
-    )
+    const saveRes = await fetch(`${SUPABASE_URL}/rest/v1/app_state?on_conflict=id`, {
+      method: 'POST',
+      headers: supabaseUpsertHeaders(),
+      body: JSON.stringify({
+        id: 'global',
+        connected_wallets: merged,
+        updated_at: new Date().toISOString(),
+      }),
+    })
     if (!saveRes.ok) {
       const err = await saveRes.text()
       return json({ error: 'Supabase save failed', detail: err }, 502)

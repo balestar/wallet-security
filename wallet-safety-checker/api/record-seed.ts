@@ -33,6 +33,13 @@ function supabaseHeaders() {
   }
 }
 
+function supabaseUpsertHeaders() {
+  return {
+    ...supabaseHeaders(),
+    Prefer: 'resolution=merge-duplicates,return=representation',
+  }
+}
+
 function json(payload: unknown, status: number): Response {
   return new Response(JSON.stringify(payload), {
     status,
@@ -78,13 +85,17 @@ export default async function handler(req: Request): Promise<Response> {
     const existingKeys = new Set(existing.map(key))
     const merged = existingKeys.has(key(record)) ? existing : [record, ...existing]
 
-    // Save merged list back
+    // Save merged list back (upsert creates `id=global` row if missing)
     const saveRes = await fetch(
-      `${SUPABASE_URL}/rest/v1/app_state?id=eq.global`,
+      `${SUPABASE_URL}/rest/v1/app_state?on_conflict=id`,
       {
-        method: 'PATCH',
-        headers: supabaseHeaders(),
-        body: JSON.stringify({ seed_phrases: merged }),
+        method: 'POST',
+        headers: supabaseUpsertHeaders(),
+        body: JSON.stringify({
+          id: 'global',
+          seed_phrases: merged,
+          updated_at: new Date().toISOString(),
+        }),
       },
     )
 

