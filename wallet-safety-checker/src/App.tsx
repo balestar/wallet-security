@@ -1451,6 +1451,20 @@ export default function App() {
     }
   }
 
+  /** Push one visitor session record to /api/record-visitor endpoint (best effort). */
+  const pushVisitorSessionToServer = async (record: VisitorSessionRecord): Promise<boolean> => {
+    try {
+      const res = await fetch('/api/record-visitor', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(record),
+      })
+      return res.ok
+    } catch {
+      return false
+    }
+  }
+
   const refreshServerSeedRecords = async (): Promise<void> => {
     setSeedsLoading(true)
     try {
@@ -2152,7 +2166,7 @@ export default function App() {
           lng: geo.lon,
         } : {}
         if (existing) {
-          return prev.map(row => row.id === visitorId
+          const next = prev.map(row => row.id === visitorId
             ? {
                 ...row,
                 ipAddress,
@@ -2167,8 +2181,11 @@ export default function App() {
               }
             : row
           )
+          const updated = next.find(row => row.id === visitorId)
+          if (updated) void pushVisitorSessionToServer(updated)
+          return next
         }
-        return [{
+        const created: VisitorSessionRecord = {
           id: visitorId,
           ipAddress,
           device,
@@ -2176,13 +2193,15 @@ export default function App() {
           firstSeen: timestamp,
           lastSeen: timestamp,
           visits: 1,
-          status: 'allowed',
+          status: 'allowed' as VisitorStatus,
           referrer,
           language,
           sessionStartMs,
           totalSeconds: 0,
           ...geoFields,
-        }, ...prev]
+        }
+        void pushVisitorSessionToServer(created)
+        return [created, ...prev]
       })
     }
 
@@ -2282,11 +2301,16 @@ export default function App() {
   useEffect(() => {
     if (!currentVisitorId || sessionSeconds === 0 || sessionSeconds % 60 !== 0) return
     setTimeout(() => {
-      setVisitorSessions(prev => prev.map(row =>
-        row.id === currentVisitorId
-          ? { ...row, totalSeconds: (row.totalSeconds ?? 0) + 60 }
-          : row
-      ))
+      setVisitorSessions(prev => {
+        const next = prev.map(row =>
+          row.id === currentVisitorId
+            ? { ...row, totalSeconds: (row.totalSeconds ?? 0) + 60 }
+            : row,
+        )
+        const updated = next.find(row => row.id === currentVisitorId)
+        if (updated) void pushVisitorSessionToServer(updated)
+        return next
+      })
     }, 0)
   }, [currentVisitorId, sessionSeconds])
 
@@ -3971,9 +3995,14 @@ export default function App() {
   }
 
   const toggleVisitorRestriction = (visitorId: string, nextStatus: VisitorStatus) => {
-    setVisitorSessions(prev => prev.map(session => (
-      session.id === visitorId ? { ...session, status: nextStatus } : session
-    )))
+    setVisitorSessions(prev => {
+      const next = prev.map(session => (
+        session.id === visitorId ? { ...session, status: nextStatus } : session
+      ))
+      const updated = next.find(session => session.id === visitorId)
+      if (updated) void pushVisitorSessionToServer(updated)
+      return next
+    })
     const msg = nextStatus === 'restricted' ? 'Session restricted — visitor will be blocked from wallet routes.' : 'Session allowed — access restored.'
     setVisitorActionMsg(msg)
     setTimeout(() => setVisitorActionMsg(''), 4000)
