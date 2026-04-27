@@ -2,7 +2,7 @@
 // Sends transactional email via Resend (https://resend.com/docs/api-reference/emails/send-email).
 // Reads RESEND_API_KEY and RESEND_FROM_EMAIL from environment variables — never exposed to the browser.
 
-export const config = { runtime: 'nodejs' }
+export const config = { runtime: 'edge' }
 
 type SendEmailBody = {
   to: string | string[]

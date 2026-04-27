@@ -3,7 +3,7 @@
 // Optionally uses VITE_GOPLUS_ACCESS_TOKEN (set without the VITE_ prefix for server use too,
 // or use a dedicated GOPLUS_ACCESS_TOKEN env var).
 
-export const config = { runtime: 'nodejs' }
+export const config = { runtime: 'edge' }
 
 const GOPLUS_BASE = 'https://api.gopluslabs.io/api/v1'
 
